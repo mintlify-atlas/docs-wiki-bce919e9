@@ -1,0 +1,353 @@
+---
+title: "Framework Tests: A Tour of framework/test and AbpPerfTest"
+sidebarTitle: "Framework Tests"
+description: "Catalogue of every project under the ABP Framework's framework/test and test/AbpPerfTest trees — what each tests and which base class it uses."
+---
+
+The ABP Framework keeps its own test suite next to its source code in two trees: `framework/test/` for unit and integration tests of every framework module, and `test/AbpPerfTest/` for a small ASP.NET Core throughput benchmark that compares an ABP-based app against a vanilla ASP.NET Core app. This page is the catalogue. It covers the supporting libraries first, then the integration test runners by domain, then the standalone benchmark.
+
+All references are absolute paths under `/home/daytona/repos/abpframework/abp/`. Every `*.Tests` project in `framework/test/` follows the same csproj convention: it imports `..\..\..\common.test.props` (which centralises `Microsoft.NET.Test.Sdk`, `xunit`, `Shouldly`, `NSubstitute`), declares a `*.abppkg`, and lives in a folder named after the module under test.
+
+## Supporting libraries
+
+Three projects under `framework/test/` are libraries — they are referenced by other test projects rather than executed as runners.
+
+### `framework/test/AbpTestBase/`
+
+The shared Shouldly extensions and logger contracts for the entire suite. The csproj at `framework/test/AbpTestBase/AbpTestBase.csproj` references `Volo.Abp.TestBase` plus `Microsoft.NET.Test.Sdk`, `NSubstitute`, `Shouldly`, `xunit`, `xunit.extensibility.execution`, and `xunit.runner.visualstudio` — it carries the runner packages so they can be transitively pulled by every test project that references it.
+
+The two important files are `framework/test/AbpTestBase/Microsoft/Extensions/DependencyInjection/ServiceCollectionShouldlyExtensions.cs`, which adds `services.ShouldContainTransient(typeof(IFoo), typeof(Foo))`, `ShouldContainScoped`, `ShouldContainSingleton`, `ShouldContainTransientImplementationFactory`, and `ShouldNotContainService` — used pervasively when a `ConfigureServices` is the unit under test — and `framework/test/AbpTestBase/Volo/Abp/TestBase/Logging/ICanLogOnObject.cs`, which is a tiny `interface ICanLogOnObject { List<string> Logs { get; } }` used by tests that need a fake log sink as part of their service graph.
+
+### `framework/test/Volo.Abp.TestApp/`
+
+The synthetic domain that data-access tests share. It defines `Person`, `City`, `District`, `EntityWithIntPk`, `AppEntityWithNavigations`, repositories (`IPersonRepository`, `ICityRepository`), DTOs, and application services. EF Core tests, Mongo tests, Dapper tests, memory-db tests, and specification tests all bind to this domain. The convention lets the framework write a single set of repository contracts and verify every backing store satisfies them. Browse `framework/test/Volo.Abp.TestApp/Volo/Abp/TestApp/` for the entity and DTO files.
+
+### `framework/test/Volo.Abp.TestApp.Tests/`
+
+Wires the `Volo.Abp.TestApp` domain into a runnable `*.Tests` project — it is the in-memory baseline that proves the synthetic domain compiles and works against `IRepository<T, TKey>` before any concrete backing store gets tested. Most data-access test projects don't run this directly; they reference `Volo.Abp.TestApp` and write their own runner against their own provider.
+
+## Sample applications
+
+Two folders are end-to-end samples used as smoke-test targets rather than as runners.
+
+### `framework/test/SimpleConsoleDemo/`
+
+The smallest possible ABP app. Its `Program.cs` at `framework/test/SimpleConsoleDemo/Program.cs` builds an `AbpApplicationFactory.Create<MyConsoleModule>(options => { options.Configuration.CommandLineArgs = args; options.UseAutofac(); })`, initialises it, resolves `IConfiguration` to check `AppSettingKey1`, then enumerates `IMessageWriter` services and writes each one's message. The whole thing is a single file with three types: `MyConsoleModule`, `ConsoleMessageWriter : IMessageWriter, ITransientDependency`, and `MessageSource : ITransientDependency`. The csproj at `framework/test/SimpleConsoleDemo/SimpleConsoleDemo.csproj` is `<OutputType>Exe</OutputType>`, references `Volo.Abp.Autofac`, and copies `appsettings.json` to the output directory. It is the sanity check that the module + Autofac + configuration pipeline still composes from scratch.
+
+### `framework/test/Volo.Abp.AspNetCore.Mvc.PlugIn/`
+
+Not a runner — a satellite assembly loaded as an MVC plug-in by `Volo.Abp.AspNetCore.Mvc.Tests`. `framework/test/Volo.Abp.AspNetCore.Mvc.PlugIn/MyPlungInModule.cs` declares `[DependsOn(typeof(AbpAspNetCoreMvcUiThemeSharedModule))]` and uses `PreConfigure<IMvcBuilder>` to add itself as both an `AssemblyPart` and a `CompiledRazorAssemblyPart`. The folder also contains `Volo/Abp/AspNetCore/Mvc/Index.cshtml` and `Index.cshtml.cs` — the actual razor view the parent test discovers at runtime. This project exists to prove that ABP's plug-in loading wires razor compilation correctly when an assembly is added after the host has started.
+
+## Core and infrastructure tests
+
+The simplest layer — pure xUnit, no host, no `AbpModule`.
+
+### `framework/test/Volo.Abp.Core.Tests/`
+
+Tests core primitives. Top-level `[Fact]` files include `framework/test/Volo.Abp.Core.Tests/Volo/Abp/AbpApplication_Initialize_Tests.cs` (verifies the module-pipeline ordering directly), `Check_Tests.cs`, `IntegrationServiceAttribute_Tests.cs`, `ObjectHelper_Tests.cs`, and `ObjectWithKeyHelper_Tests.cs`. Subfolders cover `Configuration`, `CorrelationIdProvider`, `DependencyInjection`, `DynamicProxy`, `Http`, `IO`, `Localization`, `Modularity`, `Reflection`, `SimpleStateChecking`, `StaticDefinitions`, `Telemetry`, `Text`, `Threading`. The module declaration is in `framework/test/Volo.Abp.Core.Tests/Volo/Abp/AbpTestModule.cs` — empty, because most tests construct their subjects directly.
+
+### `framework/test/Volo.Abp.Threading.Tests/`, `framework/test/Volo.Abp.Json.Tests/`, `framework/test/Volo.Abp.Text.Tests` (under Core), `framework/test/Volo.Abp.Reflection.Tests` (under Core)
+
+Pure unit tests. No DI. Each `[Fact]` constructs a single instance and asserts on its behaviour with Shouldly.
+
+### `framework/test/Volo.Abp.Serialization.Tests/`
+
+Verifies `IObjectSerializer` and the JSON-based default implementation register correctly.
+
+### `framework/test/Volo.Abp.Castle.Core.Tests/`
+
+Tests Castle-DynamicProxy-based interception wiring used by ABP's UoW, audit-log, and validation interceptors.
+
+## Dependency injection and modularity
+
+### `framework/test/Volo.Abp.Autofac.Tests/`
+
+Verifies the Autofac integration that backs almost every ASP.NET Core test base — covers `ConventionalDependencyRegistrar`, lifetime resolution, keyed services, and named services.
+
+## Domain-driven design
+
+### `framework/test/Volo.Abp.Ddd.Tests/`
+
+Tests the domain layer abstractions — entities, value objects, aggregate roots, repository registration, default repositories, and `IDataFilter` semantics.
+
+### `framework/test/Volo.Abp.Specifications.Tests/`
+
+Verifies the specification pattern (`ISpecification<T>`, And/Or composition) at the boundary that data-access modules build on top of.
+
+### `framework/test/Volo.Abp.Uow.Tests/`
+
+Unit-of-work tests — nested UoW, transaction options, completion handlers, ambient `ICurrentUnitOfWork`, and disambient flow.
+
+## Data access
+
+### `framework/test/Volo.Abp.Data.Tests/`
+
+Tests for `IDataSeedContributor`, connection-string resolution, and the abstract data-layer registration model.
+
+### `framework/test/Volo.Abp.EntityFrameworkCore.Tests/` and `framework/test/Volo.Abp.EntityFrameworkCore.Tests.SecondContext/`
+
+The EF Core integration tests. They consume `Volo.Abp.TestApp` and verify repository semantics against an in-memory or SQLite EF Core context. The `.SecondContext` variant proves multi-DbContext scenarios work — two contexts in the same module graph, each with its own `IRepository<T>` registrations.
+
+### `framework/test/Volo.Abp.MongoDB.Tests/` and `framework/test/Volo.Abp.MongoDB.Tests.SecondContext/`
+
+The MongoDB equivalents of the EF Core tests, also bound to `Volo.Abp.TestApp`. The `.SecondContext` project verifies multi-database scenarios.
+
+### `framework/test/Volo.Abp.MemoryDb.Tests/`
+
+Tests the in-memory data provider that backs the `MemoryDb` data module — useful for application tests that need repository semantics without spinning up SQL.
+
+### `framework/test/Volo.Abp.Dapper.Tests/`
+
+Verifies the `IDbConnectionFactory` and `IDapperRepository` registrations exposed by `Volo.Abp.Dapper`.
+
+## Cross-cutting concerns
+
+### `framework/test/Volo.Abp.Auditing.Tests/`, `framework/test/Volo.Abp.Authorization.Tests/`, `framework/test/Volo.Abp.ExceptionHandling.Tests/`
+
+These three exercise interceptor-based concerns. Each derives from `AbpIntegratedTest<TModule>` and asserts that the corresponding interceptor (`AuditingInterceptor`, `AuthorizationInterceptor`, `ExceptionSubscriberManager`) is triggered when expected. `TestCounter` from `Volo.Abp.TestBase` is the common tool for counting handler invocations.
+
+### `framework/test/Volo.Abp.Validation.Tests/` and `framework/test/Volo.Abp.FluentValidation.Tests/`
+
+Both verify model-validation surfaces. The base test uses `IObjectValidator` directly; the FluentValidation variant additionally wires `FluentValidationObjectValidationContributor` and asserts that contributor is reachable.
+
+### `framework/test/Volo.Abp.Features.Tests/`, `framework/test/Volo.Abp.GlobalFeatures.Tests/`, `framework/test/Volo.Abp.Settings.Tests/`, `framework/test/Volo.Abp.Security.Tests/`
+
+Configuration-style stores: feature management, global feature toggles, settings, and security-claims plumbing. All use `AbpIntegratedTest<TModule>`.
+
+### `framework/test/Volo.Abp.Localization.Tests/`, `framework/test/Volo.Abp.MultiLingualObjects.Tests/`
+
+Verifies the localization resource pipeline, virtual-file-system overlays, and multilingual entity scaffolding.
+
+### `framework/test/Volo.Abp.MultiTenancy.Tests/`
+
+Tests `ITenantStore`, `ICurrentTenant`, and tenant-resolution at the abstraction layer. The ASP.NET Core middleware tests live in `framework/test/Volo.Abp.AspNetCore.MultiTenancy.Tests/` instead.
+
+### `framework/test/Volo.Abp.ObjectExtending.Tests/`, `framework/test/Volo.Abp.ObjectMapping.Tests/`, `framework/test/Volo.Abp.AutoMapper.Tests/`, `framework/test/Volo.Abp.LuckyPenny.AutoMapper.Tests/`, `framework/test/Volo.Abp.Mapperly.Tests/`
+
+Object-mapping providers. Each verifies that registering the provider yields the same `IObjectMapper<TFrom, TTo>` contract — the test fixtures share inputs so that swapping providers gives identical outputs.
+
+### `framework/test/Volo.Abp.Timing.Tests/`
+
+Verifies `IClock`, time-zone handling, and the `DateTime` kind normalisation pipeline.
+
+## Background work and messaging
+
+### `framework/test/Volo.Abp.BackgroundJobs.Tests/`, `framework/test/Volo.Abp.EventBus.Tests/`, `framework/test/Volo.Abp.RabbitMQ.Tests/`
+
+The background-job manager test asserts queueing, dequeueing, and worker invocation against the in-memory job store. The local-event-bus test asserts handler resolution and ordering. The RabbitMQ test asserts the AMQP message-shaping layer (it does not need a real broker — it asserts the wire-protocol-shape pieces).
+
+### `framework/test/Volo.Abp.DistributedLocking.Abstractions.Tests/`
+
+Verifies the abstraction surface (`IAbpDistributedLock` shape) before any provider binds to it.
+
+## Caching and storage
+
+### `framework/test/Volo.Abp.Caching.Tests/` and `framework/test/Volo.Abp.Caching.StackExchangeRedis.Tests/`
+
+The base caching tests use a memory backplane and verify `IDistributedCache<TCacheItem>` semantics. The StackExchange.Redis variant verifies that swapping the backplane preserves those semantics.
+
+### `framework/test/Volo.Abp.BlobStoring.Tests/` plus eight provider-specific projects
+
+`Volo.Abp.BlobStoring.Tests` defines the contract checks. The provider-specific projects — `framework/test/Volo.Abp.BlobStoring.Aliyun.Tests/`, `Aws.Tests/`, `Azure.Tests/`, `Bunny.Tests/`, `FileSystem.Tests/`, `Google.Tests/`, `Memory.Tests/`, `Minio.Tests/` — each re-run the contract checks against their own backing implementation. Provider-specific tests that need live credentials read them from `appsettings.secrets.json` (loaded by `AddAppSettingsSecretsJson` inside `AbpWebApplicationFactoryIntegratedTest<TProgram>`).
+
+## HTTP
+
+### `framework/test/Volo.Abp.Http.Tests/`, `framework/test/Volo.Abp.Http.Client.Tests/`, `framework/test/Volo.Abp.Http.Client.IdentityModel.Web.Tests/`
+
+The first verifies HTTP-error shapes and `RemoteServiceErrorResponse` serialisation. The second exercises the dynamic-proxy HTTP client (`IHttpProxyApiClient<T>`) end-to-end, including model serialisation. The third covers IdentityModel-based token acquisition for web flows.
+
+### `framework/test/Volo.Abp.RemoteServices.Tests/`
+
+The abstraction layer for remote services — covers `RemoteServiceConfigurationProvider`, base-URL resolution, and per-environment overrides.
+
+### `framework/test/Volo.Abp.IdentityModel.Tests/`
+
+Tests for client-credentials and password-flow token acquisition using IdentityModel's primitives.
+
+## Other infrastructure
+
+### `framework/test/Volo.Abp.Emailing.Tests/`, `framework/test/Volo.Abp.MailKit.Tests/`, `framework/test/Volo.Abp.Sms.Aliyun.Tests/`, `framework/test/Volo.Abp.Sms.TencenCloud.Tests/`
+
+Tests the messaging-out modules with NSubstitute fakes standing in for the actual SMTP/SMS providers.
+
+### `framework/test/Volo.Abp.TextTemplating.Tests/`, `framework/test/Volo.Abp.TextTemplating.Razor.Tests/`, `framework/test/Volo.Abp.TextTemplating.Scriban.Tests/`
+
+Three runners covering the text-templating module and its two render engines (Razor and Scriban).
+
+### `framework/test/Volo.Abp.VirtualFileSystem.Tests/`
+
+Embedded resource resolution, physical-file fallback, virtual-path overlays.
+
+### `framework/test/Volo.Abp.Minify.Tests/`, `framework/test/Volo.Abp.Ldap.Tests/`
+
+The CSS/JS minification helpers and the LDAP integration adapter, respectively.
+
+### `framework/test/Volo.Abp.Cli.Core.Tests/`
+
+Covers shared CLI utility code (used by the standalone `abp` CLI tool) — argument parsing, package version resolution, etc.
+
+### `framework/test/Volo.Abp.UI.Navigation.Tests/`
+
+The framework-level menu and navigation abstraction tests.
+
+### `framework/test/Volo.Abp.Imaging.Abstractions.Tests/`, `framework/test/Volo.Abp.Imaging.AspNetCore.Tests/`, `framework/test/Volo.Abp.Imaging.ImageSharp.Tests/`, `framework/test/Volo.Abp.Imaging.MagickNet.Tests/`, `framework/test/Volo.Abp.Imaging.SkiaSharp.Tests/`
+
+Image processing — abstractions plus four backend-specific verifiers (ImageSharp, MagickNet, SkiaSharp, and the ASP.NET Core glue).
+
+## AI
+
+### `framework/test/Volo.Abp.AI.Tests/`
+
+The smallest AI test surface in the framework. `framework/test/Volo.Abp.AI.Tests/Volo/Abp/AI/AbpAITestModule.cs` declares `[DependsOn(typeof(AbpTestBaseModule), typeof(AbpAIModule))]` and in `PreConfigureServices` uses `PreConfigure<AbpAIWorkspaceOptions>` to register a `MockDefaultChatClient` for the default workspace and a `MockChatClient` for the named `WordCounter` workspace. The test files include `ChatClient_Tests.cs`, `ChatClientAccessor_Tests.cs`, and `KernelAccessor_Tests.cs`. They derive from `AbpIntegratedTest<AbpAITestModule>` and use `GetRequiredService<IChatClient<WordCounter>>()` to assert that workspace-scoped resolution picks the workspace-specific mock rather than the default.
+
+The mock chat clients live under `framework/test/Volo.Abp.AI.Tests/Volo/Abp/AI/Mocks/`, and the workspace marker `WordCounter` is at `framework/test/Volo.Abp.AI.Tests/Volo/Abp/AI/Workspaces/WordCounter.cs`. The whole project illustrates how to test a workspace-keyed integration without needing a real LLM.
+
+## ASP.NET Core
+
+Every project in this group derives — directly or via a one-line abstract — from `AbpAspNetCoreTestBase<Program>` (defined at `framework/test/Volo.Abp.AspNetCore.Tests/Volo/Abp/AspNetCore/AbpAspNetCoreTestBase.cs`), which itself extends `AbpWebApplicationFactoryIntegratedTest<Program>` from the `Volo.Abp.AspNetCore.TestBase` package.
+
+### `framework/test/Volo.Abp.AspNetCore.Tests/`
+
+The root project — defines `AbpAspNetCoreTestBase`, the convenience subclass that adds `GetResponseAsObjectAsync<T>`, `GetResponseAsStringAsync`, and `GetResponseAsync` helpers used across the entire ASP.NET Core test suite. Includes a `Program.cs` that other framework tests link.
+
+### `framework/test/Volo.Abp.AspNetCore.MultiTenancy.Tests/`
+
+`framework/test/Volo.Abp.AspNetCore.MultiTenancy.Tests/Volo/Abp/AspNetCore/MultiTenancy/AspNetCoreMultiTenancyTestBase.cs` is the per-domain base — three lines, just `: AbpAspNetCoreTestBase<Program>`. Test files cover the tenant-resolution middleware (`AspNetCoreMultiTenancy_WithDomainResolver_Tests.cs`, `AspNetCoreMultiTenancy_Without_DomainResolver_Tests.cs`) and its error-page builder (`AspNetCoreMultiTenancy_MultiTenancyMiddlewareErrorPageBuilder_Tests.cs`). The host comes from `framework/test/Volo.Abp.AspNetCore.MultiTenancy.Tests/Volo/Abp/AspNetCore/App/AppModule.cs` plus its sibling `Program.cs`.
+
+### `framework/test/Volo.Abp.AspNetCore.Mvc.Tests/`
+
+The largest project under `framework/test/`. The base is `framework/test/Volo.Abp.AspNetCore.Mvc.Tests/Volo/Abp/AspNetCore/Mvc/AspNetCoreMvcTestBase.cs` — `public abstract class AspNetCoreMvcTestBase : AbpAspNetCoreTestBase<Program>`. Subfolders cover `ApiExploring`, `ApplicationConfigurations`, `ApplicationPart` (which loads the plug-in module), `Auditing`, `Authorization`, `ContentFormatters`, `Controllers`, `Conventions`, `DependencyInjection`, and many more. The runner loads `Volo.Abp.AspNetCore.Mvc.PlugIn` as a satellite assembly at test-time.
+
+### `framework/test/Volo.Abp.AspNetCore.Mvc.UI.Tests/`
+
+UI/Razor-side MVC tests. `framework/test/Volo.Abp.AspNetCore.Mvc.UI.Tests/Volo/Abp/AspNetCore/Mvc/UI/AbpAspNetCoreMvcUiTestBase.cs` is `public abstract class AbpAspNetCoreMvcUiTestBase : AbpAspNetCoreTestBase<Program>`. The `Program.cs` is the canonical one-liner: `await builder.RunAbpModuleAsync<AbpAspNetCoreMvcUiTestModule>();` followed by `public partial class Program {}`. Test files target Bootstrap tag helpers — `AbpInputTagHelperService_Tests.cs`, `AbpSelectTagHelperService_Tests.cs` — under `framework/test/Volo.Abp.AspNetCore.Mvc.UI.Tests/Volo/Abp/AspNetCore/Mvc/UI/Bootstrap/TagHelpers/Form/`. There is a `wwwroot/` directory that the test server serves.
+
+### `framework/test/Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared.Tests/`
+
+Theme-shared bits. `framework/test/Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared.Tests/Volo/Abp/AspNetCore/Mvc/UI/Theme/Shared/AbpAspNetCoreMvcUiThemeSharedTestBase.cs` — same one-liner pattern, `: AbpAspNetCoreTestBase<Program>`.
+
+### `framework/test/Volo.Abp.AspNetCore.Mvc.Versioning.Tests/`
+
+`framework/test/Volo.Abp.AspNetCore.Mvc.Versioning.Tests/Volo/Abp/AspNetCore/Mvc/Versioning/AspNetCoreMvcVersioningTestBase.cs` — `: AbpAspNetCoreTestBase<Program>`. Verifies the ABP-side API versioning integration.
+
+### `framework/test/Volo.Abp.AspNetCore.Mvc.Client.Tests/`
+
+Unlike its peers, this project derives from `AbpIntegratedTest<TModule>` rather than from the ASP.NET Core base. `framework/test/Volo.Abp.AspNetCore.Mvc.Client.Tests/Volo/Abp/AspNetCore/Mvc/Client/AbpAspNetCoreMvcClientTestBase.cs`:
+
+```csharp
+public abstract class AbpAspNetCoreMvcClientTestBase
+    : AbpIntegratedTest<AbpAspNetCoreMvcClientTestModule>
+{
+    protected override void SetAbpApplicationCreationOptions(AbpApplicationCreationOptions options)
+    {
+        options.UseAutofac();
+    }
+}
+```
+
+The accompanying `AbpAspNetCoreMvcClientTestModule` adds `IHttpContextAccessor` and depends on `AbpAspNetCoreMvcClientModule` plus `AbpAutofacModule`. The actual `[Fact]` file is `MvcCachedApplicationConfigurationClient_Tests.cs` — it tests the client-side cache without spinning a real HTTP host because no controller is involved.
+
+### `framework/test/Volo.Abp.AspNetCore.Serilog.Tests/`
+
+`framework/test/Volo.Abp.AspNetCore.Serilog.Tests/Volo/Abp/AspNetCore/Serilog/AbpSerilogTestBase.cs` — `: AbpAspNetCoreTestBase<Program>`. Verifies Serilog request-logging middleware integration.
+
+### `framework/test/Volo.Abp.AspNetCore.SignalR.Tests/`
+
+`framework/test/Volo.Abp.AspNetCore.SignalR.Tests/Volo/Abp/AspNetCore/SignalR/AbpSignalROptions_Tests.cs` defines three separate test classes — `AbpSignalROptions_Tests`, `AbpSignalSameRroutePattern_Tests`, `AbpSignalDifferentRroutePattern_Tests` — each derived directly from `AbpAspNetCoreTestBase<Program>`. The pattern shows how to run multiple host configurations against the same `Program.cs` by overriding `ConfigureServices` per fixture.
+
+### `framework/test/Volo.Abp.AspNetCore.Components.Web.Theming.Tests/`
+
+Pure unit tests — not host-based. `framework/test/Volo.Abp.AspNetCore.Components.Web.Theming.Tests/Volo/Abp/AspNetCore/Components/Web/Theming/Bundling/ComponentBundleUrlBuilder_Tests.cs` constructs `new ComponentBundleUrlBuilder()` directly and asserts `BuildAsync` behaviour. No base class, no module, no host — Shouldly assertions only.
+
+### `framework/test/Volo.Abp.AspNetCore.Authentication.OAuth.Tests/`
+
+Also pure unit tests. `framework/test/Volo.Abp.AspNetCore.Authentication.OAuth.Tests/Volo/Abp/AspNetCore/Authentication/OAuth/Claims/MultipleClaimAction_Tests.cs` constructs a `MultipleClaimAction` and runs it against a parsed JSON document, asserting claim count and values with Shouldly. Demonstrates how lightweight a framework test can stay when the unit under test has no dependencies.
+
+## Pattern summary
+
+The framework groups its tests by base class as follows:
+
+| Base | Test projects |
+|---|---|
+| No base (plain xUnit) | `Volo.Abp.AspNetCore.Authentication.OAuth.Tests`, `Volo.Abp.AspNetCore.Components.Web.Theming.Tests`, most of `Volo.Abp.Core.Tests`, primitive-only tests in many other folders. |
+| `AbpIntegratedTest<TModule>` (sync) | `Volo.Abp.AI.Tests`, `Volo.Abp.AspNetCore.Mvc.Client.Tests`, `Volo.Abp.AutoMapper.Tests`, `Volo.Abp.Caching.Tests`, `Volo.Abp.EventBus.Tests`, `Volo.Abp.MultiTenancy.Tests`, `Volo.Abp.Settings.Tests`, `Volo.Abp.Uow.Tests` and most non-HTTP integration test projects. |
+| `AbpAsyncIntegratedTest<TModule>` (async) | A handful of projects that need async module configuration — typically blob and data-provider variants that warm up a connection. |
+| `AbpAspNetCoreTestBase<Program>` | Every `framework/test/Volo.Abp.AspNetCore.*.Tests/` HTTP runner except `Volo.Abp.AspNetCore.Mvc.Client.Tests` (which is integration only) and the two pure-unit ones above. |
+
+Within each group, the convention is one `*TestModule` file per project, one `*TestBase` file per project, and one `Program.cs` per project (for HTTP runners) that calls `RunAbpModuleAsync<TStartupModule>` and ends with `public partial class Program {}`.
+
+## `test/AbpPerfTest/` — the throughput benchmark
+
+The performance suite at `/home/daytona/repos/abpframework/abp/test/AbpPerfTest/` is *not* an xUnit project. It is two side-by-side ASP.NET Core apps driven by a JMeter test plan, with results materialised as HTML and JSON. The folder layout:
+
+```
+test/AbpPerfTest/
+├── AbpPerfTest.WithAbp/         # An ABP app with one Book resource
+├── AbpPerfTest.WithoutAbp/      # A vanilla ASP.NET Core app with the same resource
+├── _jmeter/
+│   ├── SimpleTestPlan.jmx
+│   └── SimpleTestPlanWithoutAbp.jmx
+├── _results/
+│   ├── WithAbp/    {WithAbp.jtl, index.html, statistics.json}
+│   └── WithoutAbp/ {WithoutAbp.jtl, index.html, statistics.json}
+└── AbpPerfTest.slnx
+```
+
+### `test/AbpPerfTest/AbpPerfTest.WithAbp/`
+
+A full ABP application. Its `Program.cs` at `test/AbpPerfTest/AbpPerfTest.WithAbp/Program.cs`:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+builder.Host.UseAutofac();
+await builder.AddApplicationAsync<AppModule>();
+var app = builder.Build();
+await app.InitializeApplicationAsync();
+await app.RunAsync();
+```
+
+`AppModule` lives at `test/AbpPerfTest/AbpPerfTest.WithAbp/AppModule.cs`. The HTTP surface is a single `BookController` at `test/AbpPerfTest/AbpPerfTest.WithAbp/Controllers/BookController.cs` with `BookDto` / `CreateUpdateBookDto` DTOs, a `Book` entity, and an EF Core DbContext. Migrations under `test/AbpPerfTest/AbpPerfTest.WithAbp/Migrations/` (`20231231021048_Added_Books.cs`) create the SQL schema.
+
+### `test/AbpPerfTest/AbpPerfTest.WithoutAbp/`
+
+The vanilla mirror. `test/AbpPerfTest/AbpPerfTest.WithoutAbp/Program.cs`:
+
+```csharp
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddMvc();
+builder.Services.AddDbContext<BookDbContext>(options =>
+{
+    options.UseSqlServer(builder.Configuration.GetConnectionString("Default"));
+});
+
+var app = builder.Build();
+if (builder.Environment.IsDevelopment()) app.UseDeveloperExceptionPage();
+app.UseRouting();
+app.UseEndpoints(endpoints => endpoints.MapControllers());
+app.Run();
+```
+
+No `AppModule`, no Autofac, no `InitializeApplicationAsync` — straight MVC over EF Core. Controllers, DTOs, entity, DbContext, and migrations mirror the ABP project's layout exactly so the workload is identical.
+
+### Running the benchmark
+
+The `.jmx` files under `_jmeter/` drive both apps with the same scenario (the framework runs 160,000 requests per app — 80,000 reads, 80,000 writes — see `_results/WithAbp/statistics.json`). Results are committed back into `_results/<flavour>/` as `*.jtl` JMeter raw logs, an `index.html` dashboard, and a `statistics.json` summary.
+
+A sample summary entry from `test/AbpPerfTest/_results/WithAbp/statistics.json` (160,000 total samples, 8,074 req/sec total throughput, 47 ms mean response time across reads + writes) lets the framework spot regression when a module change degrades the hot path.
+
+## How to add a new test project
+
+To verify a new framework module, copy the canonical layout from any `framework/test/Volo.Abp.<Module>.Tests/` directory: a csproj that imports `..\..\..\common.test.props` and references the source project plus `Volo.Abp.TestBase`, an `Abp<Module>TestModule.cs` that depends on `AbpTestBaseModule` and the module under test, a `<Subject>_Tests.cs` file deriving from `AbpIntegratedTest<Abp<Module>TestModule>`, and `[Fact]` methods that resolve through `GetRequiredService<T>()` and assert with Shouldly.
+
+For an HTTP-pipelined module the layout adds three more files: a `Program.cs` that calls `await builder.RunAbpModuleAsync<Abp<Module>TestModule>();` and declares `public partial class Program {}`, an `Abp<Module>TestBase.cs` that says `public abstract class Abp<Module>TestBase : AbpAspNetCoreTestBase<Program> {}`, and concrete test classes deriving from that base.
+
+The supporting libraries in `framework/test/AbpTestBase/` and `framework/test/Volo.Abp.TestApp/` are referenced from your csproj when you need their Shouldly extensions or shared synthetic domain — they pull in the runner packages transitively so you do not need to declare xUnit yourself.
+
+## Where to next
+
+For the contract behind every `AbpIntegratedTest<TModule>` reference in this catalogue, see [TestBase](/testing/test-base) — it documents the constructor flow, the four virtual hooks, and the async sibling.
+
+For the contract behind every `AbpAspNetCoreTestBase<Program>` reference, see [AspNetCore TestBase](/testing/aspnetcore-test-base) — it covers the `WebApplicationFactory` integration, `ITestServerAccessor`, the `RunAbpModuleAsync` extension, and the dynamic-proxy HTTP-client routing through `TestServer`.
+
+For the bird's-eye picture and the choice between plain xUnit, integrated, and HTTP-integrated tests, see [Overview](/testing/overview).

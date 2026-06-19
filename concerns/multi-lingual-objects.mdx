@@ -1,0 +1,388 @@
+---
+title: "ABP Multi-Lingual Objects: Translatable Aggregates"
+sidebarTitle: "Multi-Lingual"
+description: "Add per-culture translations to aggregates using IMultiLingualObject<TTranslation>, IObjectTranslation, and the MultiLingualObjectManager fallback chain."
+---
+
+<Note>
+  In the current source tree the package is named
+  `framework/src/Volo.Abp.MultiLingualObjects/` (note the plural).
+  The brief referenced `Volo.Abp.MultiLingualObject` and a
+  `MultiLingualMapHelper` type — neither name exists. This page documents the
+  actual contracts (`IMultiLingualObject<TTranslation>`,
+  `IObjectTranslation`, `IMultiLingualObjectManager`, `MultiLingualObjectManager`)
+  shipped today.
+</Note>
+
+## Overview
+
+The ABP Framework models translatable aggregates with a small,
+relationship-oriented contract: the *main* entity exposes a collection of
+*translation* sub-entities, one row per culture. The contracts live in
+`framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/`.
+A single manager — `MultiLingualObjectManager` — picks the right translation
+for a given culture, with a recursive parent-culture fallback and a final
+fallback to the configured default language setting.
+
+This approach keeps the database schema simple (one main table + one
+translation table per aggregate) while letting the domain layer keep its
+existing identifiers and invariants on the main aggregate. Translations carry
+only the localised text fields and the `Language` discriminator.
+
+## The translation contract: `IObjectTranslation`
+
+The marker interface in
+`framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/IObjectTranslation.cs`
+is intentionally minimal:
+
+```csharp framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/IObjectTranslation.cs
+public interface IObjectTranslation
+{
+    string Language { get; set; }
+}
+```
+
+Each translation row needs only a `Language` discriminator — typically a
+culture name like `"en"`, `"en-GB"`, or `"tr"` matching the
+`CultureInfo.Name` values used elsewhere in the framework. Concrete
+translation classes add their own translatable fields (e.g. `Title`,
+`Description`) on top of this contract.
+
+## The aggregate contract: `IMultiLingualObject<TTranslation>`
+
+The translatable aggregate exposes its translations collection via
+`framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/IMultiLingualObject.cs`:
+
+```csharp framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/IMultiLingualObject.cs
+public interface IMultiLingualObject<TTranslation>
+    where TTranslation : class, IObjectTranslation
+{
+    ICollection<TTranslation> Translations { get; set; }
+}
+```
+
+The generic parameter `TTranslation` is constrained to
+`class, IObjectTranslation`, which keeps the manager type-safe (it always
+knows which concrete translation type it is dealing with) while letting each
+aggregate have its own translation shape.
+
+## The manager interface
+
+`framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/IMultiLingualObjectManager.cs`
+is the public surface the application layer consumes:
+
+```csharp framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/IMultiLingualObjectManager.cs
+public interface IMultiLingualObjectManager
+{
+    Task<TTranslation?> GetTranslationAsync<TMultiLingual, TTranslation>(
+        TMultiLingual multiLingual,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TMultiLingual : IMultiLingualObject<TTranslation>
+        where TTranslation : class, IObjectTranslation;
+
+    Task<TTranslation?> GetTranslationAsync<TTranslation>(
+        IEnumerable<TTranslation> translations,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TTranslation : class, IObjectTranslation;
+
+    Task<List<TTranslation?>> GetBulkTranslationsAsync<TTranslation>(
+        IEnumerable<IEnumerable<TTranslation>> translationsCombined,
+        string? culture = null,
+        bool fallbackToParentCultures = true)
+        where TTranslation : class, IObjectTranslation;
+
+    Task<List<(TMultiLingual entity, TTranslation? translation)>>
+        GetBulkTranslationsAsync<TMultiLingual, TTranslation>(
+            IEnumerable<TMultiLingual> multiLinguals,
+            string? culture = null,
+            bool fallbackToParentCultures = true)
+        where TMultiLingual : IMultiLingualObject<TTranslation>
+        where TTranslation : class, IObjectTranslation;
+}
+```
+
+Four overloads, but they all reduce to the same primitive — pick a
+translation from a collection, applying a fallback chain. Two come in single
+form and two in bulk form, so callers loading many aggregates at once (for
+example, paged list endpoints) can resolve translations in one trip instead
+of one per row.
+
+## The implementation: `MultiLingualObjectManager`
+
+`framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/MultiLingualObjectManager.cs`
+is the registered implementation. It is annotated with
+`ITransientDependency`, so any service can request `IMultiLingualObjectManager`
+through constructor injection. The manager depends on `ISettingProvider` to
+read the configured default language and exposes a `MaxCultureFallbackDepth`
+constant of `5`.
+
+### Single-translation resolution
+
+The core algorithm is in `GetTranslationAsync<TTranslation>(IEnumerable<TTranslation>?, string?, bool)`:
+
+```csharp framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/MultiLingualObjectManager.cs
+culture ??= CultureInfo.CurrentUICulture.Name;
+
+if (translations == null || !translations.Any())
+{
+    return null;
+}
+
+var translation = translations.FirstOrDefault(pt => pt.Language == culture);
+if (translation != null)
+{
+    return translation;
+}
+
+if (fallbackToParentCultures)
+{
+    translation = GetTranslationBasedOnCulturalRecursive(
+        CultureInfo.CurrentUICulture.Parent,
+        translations,
+        0);
+
+    if (translation != null)
+    {
+        return translation;
+    }
+}
+
+var defaultLanguage = await SettingProvider
+    .GetOrNullAsync(LocalizationSettingNames.DefaultLanguage);
+
+translation = translations.FirstOrDefault(pt => pt.Language == defaultLanguage);
+if (translation != null)
+{
+    return translation;
+}
+
+return translations.FirstOrDefault();
+```
+
+Five fallback steps, in order:
+
+1. **No collection / empty.** Return `null` immediately.
+2. **Exact culture match.** If a translation row has
+   `Language == culture`, return it.
+3. **Parent-culture recursion** (only when `fallbackToParentCultures` is
+   `true`). Walk up `CultureInfo.CurrentUICulture.Parent` chain, capped at
+   `MaxCultureFallbackDepth = 5`. So a request for `"en-GB"` falls back to
+   `"en"` and then to the invariant culture.
+4. **Default language setting.** Read
+   `LocalizationSettingNames.DefaultLanguage` via `ISettingProvider` and
+   match the first translation in that language.
+5. **First-available fallback.** Return whatever the collection contains
+   first — a non-null translation is better than `null`.
+
+### Parent-culture recursion
+
+`GetTranslationBasedOnCulturalRecursive<TTranslation>` walks the parent chain
+with case-insensitive comparison:
+
+```csharp framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/MultiLingualObjectManager.cs
+protected virtual TTranslation? GetTranslationBasedOnCulturalRecursive<TTranslation>(
+    CultureInfo? culture,
+    IEnumerable<TTranslation>? translations,
+    int currentDepth)
+    where TTranslation : class, IObjectTranslation
+{
+    if (culture == null ||
+        culture.Name.IsNullOrWhiteSpace() ||
+        translations == null || !translations.Any() ||
+        currentDepth > MaxCultureFallbackDepth)
+    {
+        return null;
+    }
+
+    var translation = translations.FirstOrDefault(
+        pt => pt.Language.Equals(culture.Name, StringComparison.OrdinalIgnoreCase));
+
+    return translation
+        ?? GetTranslationBasedOnCulturalRecursive(culture.Parent, translations, currentDepth + 1);
+}
+```
+
+The base case unifies four termination conditions: null culture, empty
+culture name (the invariant culture), no translations to search, and
+recursion depth exceeded. The depth cap guards against unusual
+`CultureInfo` graphs and bounds the worst-case lookup cost.
+
+### Entity-aware overload
+
+The other single-translation overload simply unpacks
+`multiLingual.Translations` and forwards to the collection-based method:
+
+```csharp framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/MultiLingualObjectManager.cs
+public virtual Task<TTranslation?> GetTranslationAsync<TMultiLingual, TTranslation>(
+    TMultiLingual multiLingual,
+    string? culture = null,
+    bool fallbackToParentCultures = true)
+    where TMultiLingual : IMultiLingualObject<TTranslation>
+    where TTranslation : class, IObjectTranslation
+{
+    return GetTranslationAsync(multiLingual.Translations,
+        culture: culture,
+        fallbackToParentCultures: fallbackToParentCultures);
+}
+```
+
+This is the overload most application services call directly: pass the loaded
+entity, get the translation for the active UI culture.
+
+### Bulk resolution
+
+For list endpoints,
+`GetBulkTranslationsAsync<TTranslation>(IEnumerable<IEnumerable<TTranslation>>?, string?, bool)`
+in `MultiLingualObjectManager.cs` resolves many translation lists in one pass.
+The optimisation is that the **default-language setting is read only once**,
+not once per aggregate:
+
+```csharp framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/MultiLingualObjectManager.cs
+foreach (var translations in translationsCombined)
+{
+    if (!translations.Any()) { res.Add(null); continue; }
+
+    var translation = translations.FirstOrDefault(pt => pt.Language == culture);
+    if (translation != null) { res.Add(translation); }
+    else if (fallbackToParentCultures)
+    {
+        translation = GetTranslationBasedOnCulturalRecursive(
+            CultureInfo.CurrentUICulture.Parent, translations, 0);
+        if (translation != null) { res.Add(translation); }
+        else { res.Add(null); someHaveNoTranslations = true; }
+    }
+    else { res.Add(null); someHaveNoTranslations = true; }
+}
+```
+
+After the first pass, if `someHaveNoTranslations` is `true`, the manager
+fetches the default language once with
+`await SettingProvider.GetOrNullAsync(LocalizationSettingNames.DefaultLanguage)`
+and back-fills the missing slots — first trying the default language, then
+falling back to the first available translation in the row.
+
+The entity-aware bulk overload `GetBulkTranslationsAsync<TMultiLingual, TTranslation>(IEnumerable<TMultiLingual>, ...)`
+projects each entity to its `Translations` collection, calls the
+collection-based bulk method, and re-pairs the entities with their resolved
+translations as a `List<(TMultiLingual entity, TTranslation? translation)>`.
+
+## Module wiring
+
+`framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/AbpMultiLingualObjectsModule.cs`
+is the module entry point and depends on `AbpLocalizationModule`:
+
+```csharp framework/src/Volo.Abp.MultiLingualObjects/Volo/Abp/MultiLingualObjects/AbpMultiLingualObjectsModule.cs
+[DependsOn(typeof(AbpLocalizationModule))]
+public class AbpMultiLingualObjectsModule : AbpModule
+{
+}
+```
+
+The dependency on `AbpLocalizationModule` is what makes
+`LocalizationSettingNames.DefaultLanguage` and the `ISettingProvider`
+resolution work — that's the same setting key used by the rest of the ABP
+localisation stack.
+
+## Defining a translatable aggregate
+
+```csharp
+public class Book : AggregateRoot<Guid>, IMultiLingualObject<BookTranslation>
+{
+    public string AuthorName { get; set; }
+    public DateTime PublishDate { get; set; }
+    public ICollection<BookTranslation> Translations { get; set; } = new List<BookTranslation>();
+}
+
+public class BookTranslation : IObjectTranslation
+{
+    public string Language { get; set; }
+    public string Title { get; set; }
+    public string Description { get; set; }
+}
+```
+
+The aggregate keeps invariant attributes (`AuthorName`, `PublishDate`) on the
+main entity and pushes per-language text into `BookTranslation`. The
+`Language` discriminator on `BookTranslation` carries values like `"en"` or
+`"en-GB"` — exactly the format `CultureInfo.Name` produces, which is what
+`MultiLingualObjectManager.GetTranslationBasedOnCulturalRecursive` compares
+against (via `OrdinalIgnoreCase`).
+
+## Reading translations from an application service
+
+```csharp
+public class BookAppService : ApplicationService
+{
+    private readonly IRepository<Book, Guid> _bookRepository;
+    private readonly IMultiLingualObjectManager _multiLingualObjectManager;
+
+    public async Task<BookDto> GetAsync(Guid id)
+    {
+        var book = await _bookRepository.GetAsync(id);
+
+        var translation = await _multiLingualObjectManager
+            .GetTranslationAsync<Book, BookTranslation>(book);
+
+        return new BookDto
+        {
+            AuthorName = book.AuthorName,
+            Title = translation?.Title,
+            Description = translation?.Description
+        };
+    }
+}
+```
+
+Calling the `(TMultiLingual, string?, bool)` overload from
+`IMultiLingualObjectManager` keeps the app service ignorant of the fallback
+chain — the manager applies it automatically based on
+`CultureInfo.CurrentUICulture`.
+
+## Bulk reading
+
+```csharp
+var books = await _bookRepository.GetListAsync();
+
+var paired = await _multiLingualObjectManager
+    .GetBulkTranslationsAsync<Book, BookTranslation>(books);
+
+var dtos = paired.Select(p => new BookDto
+{
+    AuthorName = p.entity.AuthorName,
+    Title = p.translation?.Title,
+    Description = p.translation?.Description
+}).ToList();
+```
+
+By using `GetBulkTranslationsAsync<TMultiLingual, TTranslation>`, the
+`ISettingProvider.GetOrNullAsync` call for `DefaultLanguage` runs at most
+once for the entire list — that's the key performance difference from calling
+the single-entity overload in a loop.
+
+## Behaviour summary
+
+| Scenario                              | Resolved translation                                                |
+| ------------------------------------- | ------------------------------------------------------------------- |
+| Exact match for `culture`             | The matching `TTranslation`                                         |
+| Parent culture matches (e.g. en-GB→en)| The parent culture's `TTranslation`                                 |
+| Recursion depth > 5                   | Skip to default-language fallback                                   |
+| Default language matches              | The `TTranslation` for the configured `DefaultLanguage` setting     |
+| Nothing matches                       | `translations.FirstOrDefault()` — any translation is better than none |
+| `Translations` collection is empty    | `null`                                                              |
+
+## Related concerns
+
+<CardGroup cols={2}>
+  <Card title="Localization" icon="globe">
+    `LocalizationSettingNames.DefaultLanguage` (from
+    `framework/src/Volo.Abp.Localization/`) is the key
+    `MultiLingualObjectManager` reads through `ISettingProvider`.
+  </Card>
+  <Card title="Settings" icon="sliders">
+    `ISettingProvider` and the abstractions in
+    `framework/src/Volo.Abp.Settings/` are the mechanism for the
+    default-language fallback.
+  </Card>
+</CardGroup>

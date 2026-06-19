@@ -1,0 +1,519 @@
+---
+title: "Client Simulation: Load-Generating Scenarios for ABP Hosts"
+sidebarTitle: "Client Simulation"
+description: "ABP Framework Client Simulation module: a thread-per-client load tester that drives scripted Scenario / ScenarioStep flows against HTTP API endpoints."
+---
+
+Client Simulation is the ABP Framework's in-process load testing harness. Rather than shelling out to k6 or JMeter, it lets you write **typed C# scenarios** that exercise the same `IHttpApi`-style proxies your real clients use — and then spawn N parallel `Client` threads, each cycling through that scenario forever, while a snapshot API streams aggregated counters and durations to a Razor Pages dashboard.
+
+The module ships as two projects under `modules/client-simulation/src/`:
+
+- `Volo.ClientSimulation/` — the runtime: `Simulation`, `Client`, `Scenario`, `ScenarioStep`, snapshot DTOs, options.
+- `Volo.ClientSimulation.Web/` — the Razor Pages UI at `/ClientSimulation` plus an `ajax`-polling `SimulationArea` partial.
+
+## Module wiring
+
+`modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/ClientSimulationModule.cs` is intentionally tiny — it depends only on `AbpHttpClientIdentityModelModule` so that scenarios can authenticate against an OIDC server through `IdentityModel`:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/ClientSimulationModule.cs
+[DependsOn(typeof(AbpHttpClientIdentityModelModule))]
+public class ClientSimulationModule : AbpModule { }
+```
+
+The web module at `modules/client-simulation/src/Volo.ClientSimulation.Web/ClientSimulationWebModule.cs` adds the Razor Pages assembly, the HTTP-side IdentityModel client (`AbpHttpClientIdentityModelWebModule` — needed because scenarios go through a Web HTTP client pipeline), and the standard ABP theme. It also embeds the page assets:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation.Web/ClientSimulationWebModule.cs
+[DependsOn(typeof(ClientSimulationModule),
+           typeof(AbpHttpClientIdentityModelWebModule),
+           typeof(AbpAspNetCoreMvcUiThemeSharedModule))]
+public class ClientSimulationWebModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<ClientSimulationWebModule>("Volo.ClientSimulation");
+        });
+    }
+}
+```
+
+## Options: `ClientSimulationOptions`
+
+The only configuration surface is the scenario list. `modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/ClientSimulationOptions.cs`:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/ClientSimulationOptions.cs
+public class ClientSimulationOptions
+{
+    public List<ScenarioConfiguration> Scenarios { get; }
+    public ClientSimulationOptions() { Scenarios = new List<ScenarioConfiguration>(); }
+}
+```
+
+Each entry is a `ScenarioConfiguration` (`modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/ScenarioConfiguration.cs`) — a `Type` and a `ClientCount`:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/ScenarioConfiguration.cs
+public class ScenarioConfiguration
+{
+    public Type ScenarioType { get; }
+    public int ClientCount { get; }
+
+    public ScenarioConfiguration(Type scenarioType, int clientCount = 1)
+    {
+        ScenarioType = scenarioType;
+        ClientCount = clientCount;
+    }
+}
+```
+
+A host configures the simulation like this:
+
+```csharp
+Configure<ClientSimulationOptions>(options =>
+{
+    options.Scenarios.Add(new ScenarioConfiguration(typeof(BookCrudScenario), clientCount: 25));
+    options.Scenarios.Add(new ScenarioConfiguration(typeof(IdentityLoginScenario), clientCount: 10));
+});
+```
+
+When `Simulation.Start()` runs, it expands each row to `ClientCount` clients, instantiates one `Scenario` instance per client through DI, and binds the two together.
+
+## The `Scenario` abstraction
+
+Scenarios are the scriptable unit. `modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Scenarios/Scenario.cs` declares the abstract base:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Scenarios/Scenario.cs
+public abstract class Scenario : ITransientDependency
+{
+    protected List<ScenarioStep> Steps { get; }
+    protected ScenarioStep CurrentStep => Steps[CurrentStepIndex];
+    protected int CurrentStepIndex { get; set; }
+    protected ScenarioExecutionContext ExecutionContext { get; }
+
+    protected Scenario(IServiceProvider serviceProvider)
+    {
+        ExecutionContext = new ScenarioExecutionContext(serviceProvider);
+        Steps = new List<ScenarioStep>();
+    }
+
+    public virtual async Task ProceedAsync()
+    {
+        CheckStepCount();
+        await Steps[CurrentStepIndex].RunAsync(ExecutionContext);
+        CurrentStepIndex++;
+        if (CurrentStepIndex >= Steps.Count) CurrentStepIndex = 0;
+    }
+    // ... GetDisplayText, Reset, CreateSnapshot, AddStep ...
+}
+```
+
+Subclasses register steps with `AddStep(ScenarioStep)`. Each call to `ProceedAsync()` runs the next step and wraps the index around at the end — every client runs in a permanent loop. The display name comes from `[DisplayName("…")]` on the scenario type or falls back to the type name minus the `Scenario` suffix.
+
+<Note>
+Because `Scenario` is `ITransientDependency`, each *client* gets its own instance per simulation run, and so each client tracks its step pointer independently. Per-client state (auth tokens, "the last entity I created") lives on `ScenarioExecutionContext.Properties`, isolated to that client.
+</Note>
+
+### `ScenarioExecutionContext`
+
+`modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Scenarios/ScenarioExecutionContext.cs` is a per-client scratchpad plus a service-provider handle. Steps resolve their dependencies (HTTP clients, IdentityModel token services, repositories) through `context.ServiceProvider`, and persist state across steps in `context.Properties`:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Scenarios/ScenarioExecutionContext.cs
+public class ScenarioExecutionContext
+{
+    public IServiceProvider ServiceProvider { get; }
+    public Dictionary<string, object> Properties { get; }
+    public virtual void Reset() => Properties.Clear();
+}
+```
+
+`Reset()` is called from `Scenario.Reset()` whenever a client (re)starts.
+
+## The `ScenarioStep` abstraction
+
+A step is one round-trip — typically one HTTP call. `modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Scenarios/ScenarioStep.cs` defines the timing harness:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Scenarios/ScenarioStep.cs
+public async Task RunAsync(ScenarioExecutionContext context)
+{
+    await BeforeExecuteAsync(context);
+    var stopwatch = Stopwatch.StartNew();
+    try
+    {
+        await ExecuteAsync(context);
+        SuccessCount++;
+        LastExecutionDuration = stopwatch.Elapsed.TotalMilliseconds;
+        TotalExecutionDuration += LastExecutionDuration;
+        if (MinExecutionDuration > LastExecutionDuration) MinExecutionDuration = LastExecutionDuration;
+        if (MaxExecutionDuration < LastExecutionDuration) MaxExecutionDuration = LastExecutionDuration;
+    }
+    catch (Exception ex)
+    {
+        FailCount++;
+        context.ServiceProvider.GetService<ILogger<ScenarioStep>>().LogException(ex);
+    }
+    finally
+    {
+        stopwatch.Stop();
+        ExecutionCount++;
+    }
+    await AfterExecuteAsync(context);
+}
+```
+
+Subclasses override the abstract `ExecuteAsync(...)` — the framework handles the stopwatch, the success/fail accounting, and the rolling min/max/total durations. The optional `BeforeExecuteAsync` / `AfterExecuteAsync` hooks let you do per-step setup outside the timed window (e.g. randomize a payload before the request, log the response after).
+
+### `SleepScenarioStep`
+
+The only built-in step ships at `modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Scenarios/SleepScenarioStep.cs` — a `Task.Delay(Duration)` wrapper that lets you model think time between API calls:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Scenarios/SleepScenarioStep.cs
+public class SleepScenarioStep : ScenarioStep
+{
+    public string Name { get; }
+    public int Duration { get; }
+    public SleepScenarioStep(string name, int duration = 1000) { Name = name; Duration = duration; }
+
+    protected override Task ExecuteAsync(ScenarioExecutionContext context)
+        => Task.Delay(Duration);
+
+    public override string GetDisplayText() => base.GetDisplayText() + $" ({Name})";
+}
+```
+
+A representative scenario thus looks like:
+
+```csharp
+public class BookCrudScenario : Scenario
+{
+    public BookCrudScenario(IServiceProvider serviceProvider) : base(serviceProvider)
+    {
+        AddStep(new CreateBookStep());
+        AddStep(new SleepScenarioStep("After Create", 500));
+        AddStep(new GetBookListStep());
+        AddStep(new UpdateBookStep());
+        AddStep(new SleepScenarioStep("Cooldown", 1000));
+        AddStep(new DeleteBookStep());
+    }
+}
+```
+
+## `IClient` and `Client`
+
+A `Client` is a single virtual user thread running a single `Scenario`. The contract at `modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Clients/IClient.cs`:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Clients/IClient.cs
+public interface IClient
+{
+    event EventHandler Stopped;
+    ClientState State { get; }
+    void Initialize(Scenario scenario);
+    void Start();
+    void Stop();
+    ClientSnapshot CreateSnapshot();
+}
+```
+
+`ClientState` (`modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Clients/ClientState.cs`) is a three-value enum: `Stopped`, `Running`, `Stopping`. The implementation `modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Clients/Client.cs` is `ITransientDependency` and spins a dedicated OS thread per client:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Clients/Client.cs
+public void Start()
+{
+    lock (SyncLock)
+    {
+        if (State != ClientState.Stopped)
+            throw new UserFriendlyException(...);
+        State = ClientState.Running;
+        Scenario.Reset();
+        ClientThread = new Thread(Run);
+        ClientThread.Start();
+    }
+}
+
+private void Run()
+{
+    while (true)
+    {
+        lock (SyncLock)
+        {
+            if (State != ClientState.Running)
+            {
+                State = ClientState.Stopped;
+                ClientThread = null;
+                Stopped.InvokeSafely(this);
+                break;
+            }
+        }
+        AsyncHelper.RunSync(() => Scenario.ProceedAsync());
+    }
+}
+```
+
+<Warning>
+Each client is a real `Thread`, not a `Task` on the thread pool — by design, so that 200 clients = 200 threads and the load actually parallelizes through the kernel scheduler rather than starving the pool. `AsyncHelper.RunSync(...)` is used to block that thread until the async scenario step completes; on the dashboard side, the `Snapshot` calls are taken under `SyncObj` so the counters are stable.
+</Warning>
+
+`Stop()` flips `State` to `Stopping`; the next iteration of `Run`'s loop observes that, sets `State = Stopped`, nulls the thread, and raises the `Stopped` event. `Simulation` listens for that event to detect "all clients have come to rest" and transition the simulation itself back to `Stopped`.
+
+## `Simulation`: the singleton orchestrator
+
+`modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Simulation.cs` is `ISingletonDependency` and `IDisposable`. It owns the `List<IClient>`, a private `IServiceScope`, and a `SimulationState` enum (`modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/SimulationState.cs` — `Stopped`, `Starting`, `Started`, `Stopping`).
+
+### `Start()`
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Simulation.cs
+public virtual void Start()
+{
+    lock (SyncObj)
+    {
+        if (State != SimulationState.Stopped)
+            throw new UserFriendlyException($"Simulation should be stopped...");
+
+        State = SimulationState.Starting;
+        try
+        {
+            DisposeResources();
+            ServiceScope = ServiceScopeFactory.CreateScope();
+
+            foreach (var scenarioConfiguration in Options.Scenarios)
+            {
+                for (int i = 0; i < scenarioConfiguration.ClientCount; i++)
+                {
+                    var scenario = (Scenario)ServiceScope.ServiceProvider
+                        .GetRequiredService(scenarioConfiguration.ScenarioType);
+                    var client = ServiceScope.ServiceProvider.GetRequiredService<IClient>();
+                    client.Stopped += Client_OnStopped;
+                    client.Initialize(scenario);
+                    Clients.Add(client);
+                }
+            }
+            foreach (var client in Clients) client.Start();
+
+            State = SimulationState.Started;
+        }
+        catch (Exception ex) { Logger.LogException(ex); State = SimulationState.Stopped; }
+    }
+}
+```
+
+Notice the explicit `IServiceScope` — every simulation run creates a fresh scope so that scoped dependencies (per-client `HttpClient` factories, AuditLog accessors, etc.) don't leak between runs. Disposing the simulation, or starting a new one, calls `DisposeResources()` which drops the scope.
+
+### `Stop()`
+
+`Stop()` flips to `Stopping`, then iterates and calls `Stop()` on every client. The transition back to `Stopped` happens later, asynchronously, in `Client_OnStopped`:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Simulation.cs
+protected virtual void Client_OnStopped(object sender, EventArgs e)
+{
+    lock (SyncObj)
+    {
+        if (Clients.All(c => c.State == ClientState.Stopped))
+            OnStopped();
+    }
+}
+private void OnStopped() => State = SimulationState.Stopped;
+```
+
+### `CreateSnapshot()`
+
+The dashboard pulls metrics via `CreateSnapshot()`, which assembles a `SimulationSnapshot` under the same lock:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Simulation.cs
+public virtual SimulationSnapshot CreateSnapshot()
+{
+    SimulationSnapshot snapshot;
+    lock (SyncObj)
+    {
+        snapshot = new SimulationSnapshot
+        {
+            State = State,
+            Clients = Clients.Select(c => c.CreateSnapshot()).ToList()
+        };
+    }
+    snapshot.CreateSummaries();
+    return snapshot;
+}
+```
+
+## Snapshot DTOs
+
+Six DTOs under `modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Snapshot/` make up the JSON payload the UI consumes:
+
+<CardGroup cols={2}>
+  <Card title="SimulationSnapshot" icon="chart-line">
+    `Snapshot/SimulationSnapshot.cs` — top-level: `State`, `List<ClientSnapshot> Clients`, `List<ScenarioSummarySnapshot> Scenarios` aggregated from clients.
+  </Card>
+  <Card title="ClientSnapshot" icon="user">
+    `Snapshot/ClientSnapshot.cs` — `ClientState State` and the current `ScenarioSnapshot`.
+  </Card>
+  <Card title="ScenarioSnapshot" icon="clipboard-list">
+    `Snapshot/ScenarioSnapshot.cs` — `DisplayText`, `List<ScenarioStepSnapshot> Steps`, and `CurrentStep` pointer.
+  </Card>
+  <Card title="ScenarioStepSnapshot" icon="stopwatch">
+    `Snapshot/ScenarioStepSnapshot.cs` — per-step counters: `ExecutionCount`, `SuccessCount`, `FailCount`, `MinExecutionDuration`, `MaxExecutionDuration`, `AvgExecutionDuration`, `LastExecutionDuration`, `TotalExecutionDuration`.
+  </Card>
+  <Card title="ScenarioSummarySnapshot" icon="layer-group">
+    `Snapshot/ScenarioSummarySnapshot.cs` — one entry per *unique* scenario display text; rolls up `Steps` across all clients running that scenario.
+  </Card>
+  <Card title="ScenarioStepSummarySnapshot" icon="calculator">
+    `Snapshot/ScenarioStepSummarySnapshot.cs` — aggregated step metrics across clients within the same scenario.
+  </Card>
+</CardGroup>
+
+The aggregation lives on `SimulationSnapshot.CreateSummaries()` in `Snapshot/SimulationSnapshot.cs`:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation/Volo/ClientSimulation/Snapshot/SimulationSnapshot.cs
+foreach (var client in Clients)
+{
+    var scenarioSummary = scenarioDictionary.GetOrAdd(
+        client.Scenario.DisplayText,
+        () => new ScenarioSummarySnapshot
+        {
+            DisplayText = client.Scenario.DisplayText,
+            Steps = new List<ScenarioStepSummarySnapshot>()
+        });
+
+    foreach (var scenarioStep in client.Scenario.Steps)
+    {
+        var scenarioStepSummary = scenarioSummary.Steps
+            .FirstOrDefault(s => s.DisplayText == scenarioStep.DisplayText)
+            ?? AddNew(scenarioSummary, scenarioStep);
+
+        scenarioStepSummary.ExecutionCount += scenarioStep.ExecutionCount;
+        scenarioStepSummary.SuccessCount   += scenarioStep.SuccessCount;
+        scenarioStepSummary.FailCount      += scenarioStep.FailCount;
+        scenarioStepSummary.TotalExecutionDuration += scenarioStep.TotalExecutionDuration;
+        // min / max / avg ...
+    }
+}
+```
+
+Steps are keyed by `DisplayText`, which is why two `SleepScenarioStep` instances with different `Name`s show up as two distinct rows in the summary table.
+
+## Web UI: `/ClientSimulation`
+
+`modules/client-simulation/src/Volo.ClientSimulation.Web/Pages/ClientSimulation/Index.cshtml` is the dashboard shell. Its model `Pages/ClientSimulation/Index.cshtml.cs` is a one-line `OnGetAsync` that just returns `Page()`:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation.Web/Pages/ClientSimulation/Index.cshtml.cs
+public class IndexModel : PageModel
+{
+    public virtual Task<IActionResult> OnGetAsync()
+        => Task.FromResult<IActionResult>(Page());
+}
+```
+
+The interesting work is in the polled partial `Pages/ClientSimulation/SimulationArea.cshtml`, backed by `Pages/ClientSimulation/SimulationArea.cshtml.cs`:
+
+```csharp
+// modules/client-simulation/src/Volo.ClientSimulation.Web/Pages/ClientSimulation/SimulationArea.cshtml.cs
+public class SimulationAreaModel : PageModel
+{
+    public SimulationSnapshot Snapshot { get; private set; }
+    protected Simulation Simulation { get; }
+
+    public SimulationAreaModel(Simulation simulation) { Simulation = simulation; }
+
+    public virtual Task<IActionResult> OnGetAsync()
+    {
+        Snapshot = Simulation.CreateSnapshot();
+        return Task.FromResult<IActionResult>(Page());
+    }
+
+    public virtual async Task<IActionResult> OnPostStartAsync()
+    {
+        Simulation.Start();
+        return new NoContentResult();
+    }
+
+    public virtual async Task<IActionResult> OnPostStopAsync()
+    {
+        Simulation.Stop();
+        return new NoContentResult();
+    }
+}
+```
+
+So the page exposes three Razor Pages handlers:
+
+| Route | Handler | Purpose |
+| --- | --- | --- |
+| `GET /ClientSimulation/SimulationArea` | `OnGetAsync` | Returns the rendered HTML for the current snapshot; polled from the browser on a timer. |
+| `POST /ClientSimulation/SimulationArea?handler=Start` | `OnPostStartAsync` | Calls `Simulation.Start()`. |
+| `POST /ClientSimulation/SimulationArea?handler=Stop` | `OnPostStopAsync` | Calls `Simulation.Stop()`. |
+
+The host wires both `Index.cshtml` and `SimulationArea.cshtml` through the embedded file set under `Volo.ClientSimulation` declared by `ClientSimulationWebModule.ConfigureServices`. The associated `_ViewImports.cshtml` in the same folder pulls in the standard ABP tag helpers.
+
+## Full lifecycle
+
+<Steps>
+  <Step title="Configure scenarios">
+    In the host module's `ConfigureServices`, add `ScenarioConfiguration` entries to `ClientSimulationOptions.Scenarios`. Each entry declares a `Scenario` subtype and a client count.
+  </Step>
+  <Step title="Operator opens /ClientSimulation">
+    The Razor page loads; a JS poll hits `SimulationArea` on a timer, calling `Simulation.CreateSnapshot()` repeatedly. Because the simulation starts in `SimulationState.Stopped`, the page shows the "Start" button.
+  </Step>
+  <Step title="Operator clicks Start">
+    Browser POSTs to `SimulationArea?handler=Start`. `Simulation.Start()` creates a new `IServiceScope`, instantiates `ClientCount` scenarios and clients per row, wires `client.Stopped += Client_OnStopped`, and launches each client thread.
+  </Step>
+  <Step title="Clients loop">
+    Each `Client.Run` thread loops: lock-check state, `AsyncHelper.RunSync(() => Scenario.ProceedAsync())`. Each `Scenario.ProceedAsync` runs the next `ScenarioStep`, advancing `CurrentStepIndex` and wrapping at the end. Each `ScenarioStep.RunAsync` times the call and updates `SuccessCount`/`FailCount`/durations.
+  </Step>
+  <Step title="Dashboard polls">
+    The polled GET on `SimulationArea` re-takes `Simulation.CreateSnapshot()`. The snapshot includes per-step counters from every client plus the summary view rolled up by scenario display text.
+  </Step>
+  <Step title="Operator clicks Stop">
+    Browser POSTs to `SimulationArea?handler=Stop`. `Simulation.Stop()` flips its own state to `Stopping` and asks every client to stop. Each `Client.Run` observes the state on its next loop iteration and raises `Stopped`. `Simulation.Client_OnStopped` waits until every client is in `ClientState.Stopped`, then transitions the simulation to `SimulationState.Stopped` — only then can it be restarted.
+  </Step>
+</Steps>
+
+## Writing a custom step
+
+A real HTTP step typically resolves the IdentityModel-backed dynamic HTTP client proxy from `context.ServiceProvider`:
+
+```csharp
+public class GetBookListStep : ScenarioStep
+{
+    protected override async Task ExecuteAsync(ScenarioExecutionContext context)
+    {
+        var bookAppService = context.ServiceProvider.GetRequiredService<IBookAppService>();
+        var page = await bookAppService.GetListAsync(new PagedAndSortedResultRequestDto());
+        if (page.TotalCount == 0)
+        {
+            throw new InvalidOperationException("Empty book list");
+        }
+    }
+}
+```
+
+Because `ClientSimulationModule` depends on `AbpHttpClientIdentityModelModule`, that `IBookAppService` will be resolved as an HTTP client proxy that already carries an OAuth token from the configured `IdentityModel` client — so each scenario step runs as the simulation's *authenticated* user, not as anonymous.
+
+## Snapshot serialization caveats
+
+All six snapshot DTOs are `[Serializable]` and are intended to round-trip through the standard ASP.NET JSON pipeline. There is no `[DataContract]`/`[DataMember]` annotation — property names go through the host's `JsonSerializerOptions.PropertyNamingPolicy`. If you embed the simulation snapshot in a custom API, set `Newtonsoft.Json` or `System.Text.Json` defaults consistently with the rest of your app to avoid casing surprises in the rendered table.
+
+## When to use it
+
+<CardGroup cols={2}>
+  <Card title="Yes" icon="check">
+    Smoke-testing a new application service under realistic concurrency; reproducing race conditions; measuring latency-vs-clients curves inside the same process the host runs in.
+  </Card>
+  <Card title="No" icon="xmark">
+    Sustained external load tests that need to stress kestrel + TLS termination + reverse proxy — use a real out-of-process tool (k6, JMeter) for those. Client Simulation lives inside your host and so shares its CPU.
+  </Card>
+</CardGroup>
+
+The right mental model is "scriptable, observable, in-process traffic generator for ABP services". It is most valuable when you want to throw a curve at your application services and inspect counters and aggregated latency without leaving the host project — and it leans on the same DI graph, the same audit pipeline, and the same authorization stack as production.

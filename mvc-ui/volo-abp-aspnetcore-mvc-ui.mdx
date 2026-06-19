@@ -1,0 +1,305 @@
+---
+title: "Volo.Abp.AspNetCore.Mvc.UI - Razor Pages Core for ABP"
+sidebarTitle: "MVC UI Core"
+description: "Internals of the ABP Framework MVC UI root package: AbpAspNetCoreMvcUiModule, AbpPageModel, IPageLayout, IThemeManager and alert plumbing."
+---
+
+The ABP Framework root MVC UI package, `Volo.Abp.AspNetCore.Mvc.UI`, is the smallest piece of the MVC UI stack that a Razor Pages application can depend on and still get all the ABP conveniences: DI-resolved page models, an `IThemeManager` that maps logical layouts to physical layouts, a per-request `IPageLayout` for titles and breadcrumbs, an `IAlertManager` for one-shot alerts, the `LayoutHookViewComponent` for `<abp-layout-hook>`, and an `ApplicationPart` registration for the assembly's Razor compiled views. Everything in this page is implemented under `framework/src/Volo.Abp.AspNetCore.Mvc.UI/`.
+
+## The root module
+
+The whole package boots through a single module class — `AbpAspNetCoreMvcUiModule` in `framework/src/Volo.Abp.AspNetCore.Mvc.UI/Volo/Abp/AspNetCore/Mvc/UI/AbpAspNetCoreMvcUiModule.cs`. It declares two `[DependsOn]` relationships: `AbpAspNetCoreMvcModule` (so the host already speaks ASP.NET Core MVC) and `AbpUiNavigationModule` (so `IMenuManager` is available to anything calling `_LayoutMenu` or building a sidebar).
+
+In `PreConfigureServices` the module calls `PreConfigure<IMvcBuilder>(mvcBuilder => mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpAspNetCoreMvcUiModule).Assembly))`. That single line is critical: without it, the embedded `LayoutHook/Default.cshtml`, the Razor TagHelpers and the view components in this assembly would not be discovered by ASP.NET Core's view engine. The corresponding `ConfigureServices` adds the assembly as an embedded file set via `Configure<AbpVirtualFileSystemOptions>(options => options.FileSets.AddEmbedded<AbpAspNetCoreMvcUiModule>())`, so the same files are available through `IFileProvider` to the bundling pipeline.
+
+## AbpMvcUiOptions
+
+`AbpMvcUiOptions` (`framework/src/Volo.Abp.AspNetCore.Mvc.UI/Volo/Abp/AspNetCore/Mvc/UI/AbpMvcUiOptions.cs`) is the simplest options object in the entire UI stack: two `string` properties, `LoginUrl` (default `"/Account/Login"`) and `LogoutUrl` (default `"/Account/Logout"`). They are read by the Theme.Shared error views, by the global script bundle's authentication-state listener, and by the navbar user menus to construct the correct redirect URLs when an unauthenticated user clicks a protected link.
+
+```csharp
+public class AbpMvcUiOptions
+{
+    public string LoginUrl { get; set; } = "/Account/Login";
+    public string LogoutUrl { get; set; } = "/Account/Logout";
+}
+```
+
+A solution that hosts the Account module on a separate host typically overrides both inside `ConfigureServices`:
+
+```csharp
+Configure<AbpMvcUiOptions>(options =>
+{
+    options.LoginUrl  = "https://auth.example.com/Account/Login";
+    options.LogoutUrl = "https://auth.example.com/Account/Logout";
+});
+```
+
+## DI-based page activation
+
+ASP.NET Core's default `IPageModelActivatorProvider` constructs Razor page models with `ActivatorUtilities.CreateInstance`, which means constructor parameters are resolved from DI but the page model itself is not registered as a service. ABP replaces that behaviour with `ServiceBasedPageModelActivatorProvider` (`framework/src/Volo.Abp.AspNetCore.Mvc.UI/Volo/Abp/AspNetCore/Mvc/UI/RazorPages/ServiceBasedPageModelActivatorProvider.cs`):
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class ServiceBasedPageModelActivatorProvider : IPageModelActivatorProvider, ITransientDependency
+{
+    public Func<PageContext, object> CreateActivator(CompiledPageActionDescriptor descriptor)
+    {
+        Check.NotNull(descriptor, nameof(descriptor));
+        return context => context.HttpContext.RequestServices.GetRequiredService(descriptor.ModelTypeInfo!);
+    }
+
+    public Action<PageContext, object>? CreateReleaser(CompiledPageActionDescriptor descriptor) => null;
+}
+```
+
+The activator delegates to `context.HttpContext.RequestServices.GetRequiredService(descriptor.ModelTypeInfo!)`. That makes every `PageModel` resolvable from the ABP container, which in turn means it can participate in interceptors (auditing, unit of work, authorization), property injection of `IAbpLazyServiceProvider`, and per-request scoping. ABP relies on `IConventionalRegistrar` infrastructure to register every concrete `PageModel` as transient when the assembly is added as an application part.
+
+The base class for these pages is `AbpPageModel` (`RazorPages/AbpPageModel.cs`). It exposes everything a typical page needs as lazy properties built on top of `IAbpLazyServiceProvider`: `Clock`, `Alerts`, `UnitOfWorkManager`, `ObjectMapper`, `GuidGenerator`, `LoggerFactory`, `StringLocalizerFactory`, a localizer property `L`, plus `CurrentUser`, `CurrentTenant`, `SettingProvider`, `ModelValidator`, `AuthorizationService`, `AlertManager` and `AppUrlProvider`. The class also offers safe-redirect helpers — `RedirectSafelyAsync(returnUrl, returnUrlHash)`, `NormalizeReturnUrlAsync(returnUrl)`, `GetAppHomeUrlAsync()` — that consult `IAppUrlProvider.IsRedirectAllowedUrlAsync` to defeat open-redirect attacks.
+
+A second, view-side, base class — `AbpPage` (`RazorPages/AbpPage.cs`) — exposes only `[RazorInject] public ICurrentUser CurrentUser`, which is what Razor `.cshtml` files inherit by virtue of `_ViewImports.cshtml` declaring `@inherits AbpPage`.
+
+## The layout primitives
+
+A Razor layout receives the current page's metadata through three small types in `framework/src/Volo.Abp.AspNetCore.Mvc.UI/Volo/Abp/AspNetCore/Mvc/UI/Layout/`.
+
+### IPageLayout / PageLayout
+
+`IPageLayout` is intentionally tiny:
+
+```csharp
+public interface IPageLayout
+{
+    ContentLayout Content { get; }
+}
+```
+
+`PageLayout : IPageLayout, IScopedDependency` (in `Layout/PageLayout.cs`) just news up a `ContentLayout` per scope, so the same instance is shared between the page handler that *sets* breadcrumbs and the layout view that *reads* them. Because it is `IScopedDependency`, ABP registers it as scoped in the container automatically.
+
+### ContentLayout
+
+`ContentLayout` (`Layout/ContentLayout.cs`) carries the data the layout actually renders:
+
+```csharp
+public class ContentLayout
+{
+    public string? Title { get; set; }
+    public BreadCrumb BreadCrumb { get; }
+    public string? MenuItemName { get; set; }
+    public bool ShowToolbar { get; set; } = true;
+
+    public virtual bool ShouldShowBreadCrumb()
+    {
+        if (BreadCrumb.Items.Any()) return true;
+        return BreadCrumb.ShowCurrent || BreadCrumb.ShowHome;
+    }
+}
+```
+
+- `Title` is the page's title and shows up in the `<title>` and the page header.
+- `MenuItemName` matches an `ApplicationMenuItem.Name` so the sidebar can highlight the active entry.
+- `ShowToolbar` toggles the entire page-toolbar slot off (used by login/account pages that have a clean look).
+- `ShouldShowBreadCrumb()` returns `true` when the page has supplied items *or* when either of the two defaults is on.
+
+### BreadCrumb / BreadCrumbItem
+
+```csharp
+public class BreadCrumb
+{
+    public bool ShowHome { get; set; } = true;
+    public bool ShowCurrent { get; set; } = true;
+    public List<BreadCrumbItem> Items { get; }
+
+    public void Add(string text, string? url = null, string? icon = null)
+        => Items.Add(new BreadCrumbItem(text, url, icon));
+}
+```
+
+`BreadCrumbItem` is a record-like POCO with `Text`, `Icon`, `Url`. A typical page handler builds them via `PageLayout.Content.BreadCrumb.Add("Customers", "/customers")` and the Theme.Shared `AbpBreadCrumb` view component renders them with the `home` and `current` flags honoured.
+
+## The theming layer
+
+The MVC UI core package contains the *abstractions* for theming — physical themes live in dedicated packages, but the contract and the default selector are here under `framework/src/Volo.Abp.AspNetCore.Mvc.UI/Volo/Abp/AspNetCore/Mvc/UI/Theming/`.
+
+### ITheme and StandardLayouts
+
+```csharp
+public interface ITheme
+{
+    string GetLayout(string name, bool fallbackToDefault = true);
+}
+
+public static class StandardLayouts
+{
+    public const string Application = "Application";
+    public const string Account     = "Account";
+    public const string Public      = "Public";
+    public const string Empty       = "Empty";
+}
+```
+
+The four constants in `StandardLayouts.cs` are the *only* layouts every theme is required to know about. `ThemeExtensions` (`ThemeExtensions.cs`) provides typed sugar — `GetApplicationLayout()`, `GetAccountLayout()`, `GetPublicLayout()`, `GetEmptyLayout()` — that calls `GetLayout(constant, fallbackToDefault)` under the hood. A concrete theme implementation returns a Razor path like `"~/Themes/Basic/Layouts/Application.cshtml"` from `GetLayout`.
+
+### AbpThemingOptions and ThemeDictionary
+
+`AbpThemingOptions` exposes a `ThemeDictionary` keyed by `Type` plus the optional `DefaultThemeName` and a `BaseUrl` used to emit a `<base href="...">` element when set.
+
+```csharp
+public class AbpThemingOptions
+{
+    public ThemeDictionary Themes { get; }
+    public string? DefaultThemeName { get; set; }
+    public string? BaseUrl { get; set; }
+}
+```
+
+`ThemeDictionary.Add<TTheme>()` creates a `ThemeInfo(Type)` wrapper. `ThemeInfo` resolves the display name from a `[ThemeName("…")]` attribute or falls back to the type name (`ThemeInfo.cs`, `ThemeNameAttribute.cs`).
+
+### DefaultThemeSelector and DefaultThemeManager
+
+`IThemeSelector` returns the `ThemeInfo` for the current request. The default — `DefaultThemeSelector` — uses `AbpThemingOptions.DefaultThemeName` when set, otherwise the first registered theme; it throws `AbpException` when no themes are configured. `DefaultThemeManager` (`DefaultThemeManager.cs`) then resolves the `ITheme` instance from the container *once per request* and caches it under `HttpContext.Items["__AbpCurrentTheme"]`:
+
+```csharp
+protected virtual ITheme GetCurrentTheme()
+{
+    var preSelectedTheme = HttpContextAccessor.HttpContext!.Items[CurrentThemeHttpContextKey] as ITheme;
+
+    if (preSelectedTheme == null)
+    {
+        preSelectedTheme = (ITheme)ServiceProvider.GetRequiredService(ThemeSelector.GetCurrentThemeInfo().ThemeType);
+        HttpContextAccessor.HttpContext.Items[CurrentThemeHttpContextKey] = preSelectedTheme;
+    }
+
+    return preSelectedTheme;
+}
+```
+
+This guarantees the `_Layout.cshtml` and any `<abp-layout-hook>` running inside it see the same `ITheme` instance, even if there are multiple resolvers active.
+
+```mermaid
+graph LR
+    Options[AbpThemingOptions.Themes]
+    Selector[DefaultThemeSelector]
+    Manager[DefaultThemeManager]
+    Theme[(ITheme implementation)]
+    Razor["_ViewStart.cshtml"]
+
+    Options --> Selector
+    Selector -->|GetCurrentThemeInfo| Manager
+    Manager -->|GetRequiredService| Theme
+    Razor -->|@inject IThemeManager| Manager
+    Razor -->|Layout = ThemeManager.CurrentTheme.GetLayout&#40;...&#41;| Theme
+```
+
+## Alerts
+
+The alerts subsystem in `framework/src/Volo.Abp.AspNetCore.Mvc.UI/Volo/Abp/AspNetCore/Mvc/UI/Alerts/` is the canonical "flash messages" implementation for ABP.
+
+`IAlertManager` is the interface; `AlertManager : IAlertManager, IScopedDependency` is the implementation. Because it's scoped, the same `AlertList` is observed by the page handler that adds alerts and the layout that renders them.
+
+```csharp
+public class AlertList : List<AlertMessage>
+{
+    public void Info(string text, string? title = null, bool dismissible = true)
+        => Add(new AlertMessage(AlertType.Info, text, title, dismissible));
+    public void Warning(string text, string? title = null, bool dismissible = true)
+        => Add(new AlertMessage(AlertType.Warning, text, title, dismissible));
+    public void Danger(string text, string? title = null, bool dismissible = true)
+        => Add(new AlertMessage(AlertType.Danger, text, title, dismissible));
+    public void Success(string text, string? title = null, bool dismissible = true)
+        => Add(new AlertMessage(AlertType.Success, text, title, dismissible));
+}
+```
+
+`AlertType` is the Bootstrap palette: `Default`, `Primary`, `Secondary`, `Success`, `Danger`, `Warning`, `Info`, `Light`, `Dark` (`AlertType.cs`). `AlertMessage` is the model (`AlertMessage.cs`). Inside a page handler the `AbpPageModel.Alerts` property delegates to `AlertManager.Alerts` so a call like `Alerts.Success(L["Saved!"])` simply appends to the request-scoped list. Theme.Shared's alert view component reads it back at render time.
+
+## Layout hooks
+
+A *layout hook* is a slot inside a layout into which any module can plug a view component. The contract is `LayoutHooks` (in `Volo.Abp.UI/Volo/Abp/Ui/LayoutHooks/LayoutHooks.cs`) — see the Theme Shared page for the full list of names. The MVC UI core package supplies the consumer side as `LayoutHookViewComponent` (`Components/LayoutHook/LayoutHookViewComponent.cs`):
+
+```csharp
+public virtual IViewComponentResult Invoke(string name, string? layout)
+{
+    var hooks = Options.Hooks.GetOrDefault(name)?
+        .Where(x => IsViewComponent(x) && (string.IsNullOrWhiteSpace(x.Layout) || x.Layout == layout))
+        .ToArray() ?? Array.Empty<LayoutHookInfo>();
+
+    return View(
+        "~/Volo/Abp/AspNetCore/Mvc/UI/Components/LayoutHook/Default.cshtml",
+        new LayoutHookViewModel(hooks, layout)
+    );
+}
+```
+
+It looks up `AbpLayoutHookOptions.Hooks` by name, optionally filters by layout, and renders each registered `LayoutHookInfo.ComponentType` inside `Default.cshtml`. A companion extension class `ViewComponentHelperLayoutHookExtensions` (in the same folder) wraps invocation as a one-liner from inside a layout.
+
+## TagHelper localization contract
+
+Even though the actual `AbpTagHelperLocalizer` lives in the Bootstrap package, the contract — `IAbpTagHelperLocalizer` — is consumed widely and shows up in dozens of TagHelper services. It is defined in `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/IAbpTagHelperLocalizer.cs`:
+
+```csharp
+public interface IAbpTagHelperLocalizer : ITransientDependency
+{
+    string GetLocalizedText(string text, ModelExplorer explorer);
+    IStringLocalizer? GetLocalizerOrNull(ModelExplorer explorer);
+    IStringLocalizer? GetLocalizerOrNull(Assembly assembly);
+}
+```
+
+The implementation (`AbpTagHelperLocalizer.cs`) uses `AbpMvcDataAnnotationsLocalizationOptions.AssemblyResources` to find which `IStringLocalizer` resource type corresponds to the assembly that defined the bound model. That mapping lets `<abp-input>` automatically localize `[Display(Name="…")]` strings without per-attribute configuration.
+
+```mermaid
+sequenceDiagram
+    participant Input as &lt;abp-input asp-for=&quot;Name&quot;/&gt;
+    participant Service as AbpInputTagHelperService
+    participant Localizer as AbpTagHelperLocalizer
+    participant Factory as IStringLocalizerFactory
+    participant Options as AbpMvcDataAnnotationsLocalizationOptions
+
+    Input->>Service: Process(context, output)
+    Service->>Localizer: GetLocalizedText("Name", modelExplorer)
+    Localizer->>Localizer: GetResourceType(assembly)
+    Localizer->>Options: AssemblyResources.GetOrDefault(assembly)
+    Options-->>Localizer: typeof(MyResource) | null
+    Localizer->>Factory: Create(resourceType) | CreateDefaultOrNull()
+    Factory-->>Localizer: IStringLocalizer
+    Localizer-->>Service: localized text
+    Service-->>Input: rendered <label>
+```
+
+A page-level `IPageBindingContext`-style hook is *not* a separate interface — Razor pages reuse ASP.NET Core's existing `ModelExplorer` chain; the localized text is then woven into the rendered HTML by `AbpInputTagHelperService`, `AbpSelectTagHelperService` and `AbpRadioInputTagHelperService` (see `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/TagHelpers/Form/*.cs`).
+
+## Object-extension helpers
+
+`MvcUiObjectExtensionPropertyInfoExtensions` (`framework/src/Volo.Abp.AspNetCore.Mvc.UI/Volo/Abp/ObjectExtending/MvcUiObjectExtensionPropertyInfoExtensions.cs`) bridges ABP's object-extending feature to the MVC UI form generation. Generic CRUD pages call it to discover extra columns / fields registered through `ObjectExtensionManager.Instance.AddOrUpdate<MyDto>(o => o.AddOrUpdateProperty<string>("Twitter"))` and render them with the same TagHelpers used by hand-written pages.
+
+## How an application turns this on
+
+The minimal moving parts for a fresh Razor Pages host that wants ABP's MVC UI services are:
+
+<Steps>
+  <Step title="Depend on the module">
+    Add `[DependsOn(typeof(AbpAspNetCoreMvcUiModule))]` to your module. Transitively that pulls in `AbpAspNetCoreMvcModule` and `AbpUiNavigationModule`.
+  </Step>
+  <Step title="Register at least one theme">
+    Themes are not provided by this package; register one (or the LeptonX / Basic theme) via `Configure<AbpThemingOptions>(o => o.Themes.Add<MyTheme>())`. Without that, `DefaultThemeSelector` throws on the first request.
+  </Step>
+  <Step title="Inherit from AbpPageModel">
+    Have your `.cshtml.cs` files extend `AbpPageModel` so `Alerts`, `L`, `CurrentUser` and `PageLayout` are available. The Razor side (`.cshtml`) inherits `AbpPage` via `_ViewImports.cshtml`.
+  </Step>
+  <Step title="Set page metadata">
+    Inside `OnGet*`, set `PageLayout.Content.Title`, `PageLayout.Content.BreadCrumb.Add(...)`, `PageLayout.Content.MenuItemName`. The layout reads them.
+  </Step>
+  <Step title="Wire LoginUrl / LogoutUrl if needed">
+    If the Account module isn't hosted in-process, override `AbpMvcUiOptions.LoginUrl` and `AbpMvcUiOptions.LogoutUrl` to redirect to the right SSO host.
+  </Step>
+</Steps>
+
+<Tip>
+Everything in this package is intentionally agnostic of Bootstrap, jQuery, and any specific design language. Visual decisions live in `Volo.Abp.AspNetCore.Mvc.UI.Bootstrap` and `Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared`. That separation is why LeptonX, the Basic theme and any third-party Razor theme can all sit on top of the same root module.
+</Tip>
+
+## Where to read next
+
+- The Bootstrap theming page enumerates every TagHelper that ships in `Volo.Abp.AspNetCore.Mvc.UI.Bootstrap` and shows how they consume `IPageLayout`, `IAlertManager` and `IAbpTagHelperLocalizer` introduced here.
+- The Theme Shared page covers `AbpPageToolbarOptions`, `LayoutHooks`, the brand component, the JSON navigation provider and `StandardBundles.Styles.Global` / `StandardBundles.Scripts.Global` used by every concrete theme.
+- The Bundling page details the asset pipeline that `<abp-style-bundle>` and `<abp-script-bundle>` in your `_Layout.cshtml` actually execute when a request resolves the current theme.

@@ -1,0 +1,327 @@
+---
+title: "Tenant Management Web UI, Razor Pages and Blazor ABP"
+sidebarTitle: "Web UI"
+description: "Inside the ABP Framework Tenant Management web layer: TenantController, Razor CreateModal and EditModal, Blazor TenantManagement page and menus."
+---
+
+The Tenant Management module exposes its functionality through three parallel UI surfaces in the ABP Framework: a thin HTTP API controller (`TenantController`), a Razor Pages dashboard under `Pages/TenantManagement/Tenants/`, and a Blazor component pair (`Volo.Abp.TenantManagement.Blazor` for Blazorise and `.Blazor.MudBlazor` for MudBlazor). All three drive the same `ITenantAppService`. This page walks them in turn.
+
+## `TenantController` — the HTTP surface
+
+`Volo.Abp.TenantManagement.TenantController` is decorated:
+
+```csharp
+[Controller]
+[RemoteService(Name = TenantManagementRemoteServiceConsts.RemoteServiceName)]
+[Area(TenantManagementRemoteServiceConsts.ModuleName)]
+[Route("api/multi-tenancy/tenants")]
+public class TenantController : AbpControllerBase, ITenantAppService
+```
+
+It implements `ITenantAppService` directly and the constructor accepts `ITenantAppService` for delegation — every method body is a one-line forward. The routing layout is:
+
+| Verb + path | Method | Authorization |
+| --- | --- | --- |
+| `GET    api/multi-tenancy/tenants/{id}` | `GetAsync(Guid id)` | `Tenants.Default` |
+| `GET    api/multi-tenancy/tenants` | `GetListAsync(GetTenantsInput input)` | `Tenants.Default` |
+| `POST   api/multi-tenancy/tenants` | `CreateAsync(TenantCreateDto input)` | `Tenants.Create` |
+| `PUT    api/multi-tenancy/tenants/{id}` | `UpdateAsync(Guid id, TenantUpdateDto input)` | `Tenants.Update` |
+| `DELETE api/multi-tenancy/tenants/{id}` | `DeleteAsync(Guid id)` | `Tenants.Delete` |
+| `GET    api/multi-tenancy/tenants/{id}/default-connection-string` | `GetDefaultConnectionStringAsync(Guid id)` | `Tenants.ManageConnectionStrings` |
+| `PUT    api/multi-tenancy/tenants/{id}/default-connection-string` | `UpdateDefaultConnectionStringAsync(Guid id, string defaultConnectionString)` | `Tenants.ManageConnectionStrings` |
+| `DELETE api/multi-tenancy/tenants/{id}/default-connection-string` | `DeleteDefaultConnectionStringAsync(Guid id)` | `Tenants.ManageConnectionStrings` |
+
+`CreateAsync` calls `ValidateModel()` before delegating — explicit because the controller does not use `[ApiController]` (the comment in source explains that automatic `[ApiController]` validation breaks file uploads on inherited controllers). The result is that the same DataAnnotations validation runs both server-side here and in the Razor model.
+
+`AbpTenantManagementHttpApiModule` simply depends on `AbpTenantManagementApplicationContractsModule` and `AbpAspNetCoreMvcModule` — there is no other logic.
+
+## Razor Pages
+
+The Razor surface lives under `Volo.Abp.TenantManagement.Web/Pages/TenantManagement/Tenants/`:
+
+```
+Pages/TenantManagement/Tenants/
+├── Index.cshtml
+├── Index.cshtml.cs           ← IndexModel
+├── CreateModal.cshtml
+├── CreateModal.cshtml.cs     ← CreateModalModel
+├── EditModal.cshtml
+├── EditModal.cshtml.cs       ← EditModalModel
+├── TenantManagementPageModel.cs
+└── _ViewImports.cshtml
+```
+
+### `TenantManagementPageModel`
+
+A tiny abstract base:
+
+```csharp
+public abstract class TenantManagementPageModel : AbpPageModel
+{
+    public TenantManagementPageModel() { ObjectMapperContext = typeof(AbpTenantManagementWebModule); }
+}
+```
+
+It binds the object-mapper context so subclasses can rely on `ObjectMapper.Map<TenantInfoModel, TenantCreateDto>` resolving against the web module's mappers (declared in `AbpTenantManagementWebMapperlyMappers`).
+
+### `IndexModel`
+
+```csharp
+public class IndexModel : TenantManagementPageModel
+{
+    public virtual Task<IActionResult> OnGetAsync()  => Task.FromResult<IActionResult>(Page());
+    public virtual Task<IActionResult> OnPostAsync() => Task.FromResult<IActionResult>(Page());
+}
+```
+
+The page itself does all the work via DataTables and AJAX — the model only renders the chrome. The list is fetched from `GET /api/multi-tenancy/tenants`. The toolbar's "New Tenant" button is registered through `AbpPageToolbarOptions`:
+
+```csharp
+Configure<AbpPageToolbarOptions>(options =>
+{
+    options.Configure<Volo.Abp.TenantManagement.Web.Pages.TenantManagement.Tenants.IndexModel>(toolbar =>
+    {
+        toolbar.AddButton(
+            LocalizableString.Create<AbpTenantManagementResource>("NewTenant"),
+            icon: "plus",
+            name: "CreateTenant",
+            requiredPolicyName: TenantManagementPermissions.Tenants.Create);
+    });
+});
+```
+
+### `CreateModalModel`
+
+```csharp
+public class CreateModalModel : TenantManagementPageModel
+{
+    [BindProperty] public TenantInfoModel Tenant { get; set; }
+    protected ITenantAppService TenantAppService { get; }
+
+    public virtual Task<IActionResult> OnGetAsync()
+    {
+        Tenant = new TenantInfoModel();
+        return Task.FromResult<IActionResult>(Page());
+    }
+
+    public virtual async Task<IActionResult> OnPostAsync()
+    {
+        ValidateModel();
+        var input = ObjectMapper.Map<TenantInfoModel, TenantCreateDto>(Tenant);
+        await TenantAppService.CreateAsync(input);
+        return NoContent();
+    }
+
+    public class TenantInfoModel : ExtensibleObject
+    {
+        [Required]
+        [DynamicStringLength(typeof(TenantConsts), nameof(TenantConsts.MaxNameLength))]
+        [Display(Name = "DisplayName:TenantName")]
+        public string Name { get; set; }
+
+        [Required] [EmailAddress]
+        [DynamicStringLength(typeof(TenantConsts), nameof(TenantConsts.MaxAdminEmailAddressLength))]
+        public string AdminEmailAddress { get; set; }
+
+        [Required] [DataType(DataType.Password)]
+        [DynamicStringLength(typeof(TenantConsts), nameof(TenantConsts.MaxAdminPasswordLength))]
+        public string AdminPassword { get; set; }
+    }
+}
+```
+
+Notice the inner `TenantInfoModel : ExtensibleObject` — that base class plus the `ObjectExtending` mapping in `AbpTenantManagementWebMapperlyMappers` is what makes object-extension fields flow from the dynamic Razor form straight into `TenantCreateDto.ExtraProperties` without manual coding.
+
+### `EditModalModel`
+
+```csharp
+public virtual async Task<IActionResult> OnGetAsync(Guid id)
+{
+    Tenant = ObjectMapper.Map<TenantDto, TenantInfoModel>(await TenantAppService.GetAsync(id));
+    return Page();
+}
+
+public virtual async Task<IActionResult> OnPostAsync()
+{
+    ValidateModel();
+    var input = ObjectMapper.Map<TenantInfoModel, TenantUpdateDto>(Tenant);
+    await TenantAppService.UpdateAsync(Tenant.Id, input);
+    return NoContent();
+}
+```
+
+The inner `TenantInfoModel : ExtensibleObject, IHasConcurrencyStamp` adds `[HiddenInput] Id` and `[HiddenInput] ConcurrencyStamp` so the modal carries the optimistic-concurrency stamp transparently.
+
+### Razor authorization conventions
+
+`AbpTenantManagementWebModule.ConfigureServices` wires page-level authorization conventions:
+
+```csharp
+Configure<RazorPagesOptions>(options =>
+{
+    options.Conventions.AuthorizePage("/TenantManagement/Tenants/Index",       TenantManagementPermissions.Tenants.Default);
+    options.Conventions.AuthorizePage("/TenantManagement/Tenants/CreateModal", TenantManagementPermissions.Tenants.Create);
+    options.Conventions.AuthorizePage("/TenantManagement/Tenants/EditModal",   TenantManagementPermissions.Tenants.Update);
+});
+```
+
+These complement (rather than replace) the controller's `[Authorize(...)]` attributes — they fail-fast at the page-binding stage so the page never renders for an unauthorized user.
+
+## Menu contributor (Razor)
+
+`AbpTenantManagementWebMainMenuContributor : IMenuContributor` adds the Administration sub-menu entry:
+
+```csharp
+public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+{
+    if (context.Menu.Name != StandardMenus.Main) return Task.CompletedTask;
+    var administrationMenu = context.Menu.GetAdministration();
+    var l = context.GetLocalizer<AbpTenantManagementResource>();
+
+    var tenantManagementMenuItem = new ApplicationMenuItem(
+        TenantManagementMenuNames.GroupName, l["Menu:TenantManagement"], icon: "fa fa-users");
+    administrationMenu.AddItem(tenantManagementMenuItem);
+
+    tenantManagementMenuItem.AddItem(new ApplicationMenuItem(
+        TenantManagementMenuNames.Tenants, l["Tenants"], url: "~/TenantManagement/Tenants"
+    ).RequirePermissions(TenantManagementPermissions.Tenants.Default));
+
+    return Task.CompletedTask;
+}
+```
+
+`TenantManagementMenuNames.GroupName = "TenantManagement"` and `Tenants = GroupName + ".Tenants"` are the canonical menu identifiers. The contributor is registered via `Configure<AbpNavigationOptions>(o => o.MenuContributors.Add(...))` in `AbpTenantManagementWebModule.ConfigureServices`.
+
+## Object-extension UI binding
+
+`AbpTenantManagementWebModule.PostConfigureServices` calls a single helper that the framework uses to inject extra properties into the Razor forms automatically:
+
+```csharp
+ModuleExtensionConfigurationHelper.ApplyEntityConfigurationToUi(
+    TenantManagementModuleExtensionConsts.ModuleName,
+    TenantManagementModuleExtensionConsts.EntityNames.Tenant,
+    createFormTypes: new[] { typeof(CreateModalModel.TenantInfoModel) },
+    editFormTypes:   new[] { typeof(EditModalModel.TenantInfoModel)   });
+```
+
+That single registration is what makes every property declared through `ObjectExtensionManager.Instance.Modules().ConfigureTenantManagement(...)` appear in both modals as the right input control (string, date, dropdown, etc.) without modifying the .cshtml.
+
+The module also disables the dynamic JS proxy for this remote service — `Configure<DynamicJavaScriptProxyOptions>(o => o.DisableModule(TenantManagementRemoteServiceConsts.ModuleName));` — because the Razor pages call the controller directly via jQuery proxies generated by `AbpAspNetCoreMvc` rather than the dynamic JS layer.
+
+## Blazor UI
+
+The Blazor surface lives in two flavor-specific packages:
+
+- `Volo.Abp.TenantManagement.Blazor` for the default Blazorise theme.
+- `Volo.Abp.TenantManagement.Blazor.MudBlazor` for the MudBlazor theme.
+
+Each carries `Pages/TenantManagement/TenantManagement.razor` + `TenantManagement.razor.cs` and a `Navigation/TenantManagementBlazorMenuContributor.cs` + `Navigation/TenantManagementMenuNames.cs`.
+
+### `TenantManagement.razor.cs` (Blazorise)
+
+The component derives from `AbpCrudPageBase<ITenantAppService, TenantDto, Guid, GetTenantsInput, TenantCreateDto, TenantUpdateDto>` (via `[Parameter]` plumbing and the generated `.razor` partial). The constructor sets the policy bindings and references the embedded `FeatureManagementModal`:
+
+```csharp
+public partial class TenantManagement
+{
+    [Parameter] public string? Culture { get; set; }
+    protected const string FeatureProviderName = "T";
+    protected bool   HasManageFeaturesPermission;
+    protected string ManageFeaturesPolicyName;
+    protected FeatureManagementModal FeatureManagementModal;
+    protected bool   ShowPassword { get; set; }
+    protected PageToolbar Toolbar { get; } = new();
+    protected List<TableColumn> TenantManagementTableColumns => TableColumns.Get<TenantManagement>();
+
+    public TenantManagement()
+    {
+        LocalizationResource = typeof(AbpTenantManagementResource);
+        ObjectMapperContext  = typeof(AbpTenantManagementBlazorModule);
+
+        CreatePolicyName        = TenantManagementPermissions.Tenants.Create;
+        UpdatePolicyName        = TenantManagementPermissions.Tenants.Update;
+        DeletePolicyName        = TenantManagementPermissions.Tenants.Delete;
+        ManageFeaturesPolicyName = TenantManagementPermissions.Tenants.ManageFeatures;
+    }
+```
+
+The component overrides `SetPermissionsAsync` to additionally compute `HasManageFeaturesPermission` via `AuthorizationService.IsGrantedAsync(ManageFeaturesPolicyName)`, then binds it to the row-action visibility. The `FeatureManagementModal` reference is a `@ref` to the Blazor modal from the Feature Management module — opening it with `FeatureManagementModal.OpenAsync("T", tenantId.ToString())` is what shows the per-tenant feature override page directly inline from the tenant grid.
+
+`SetBreadcrumbItemsAsync` adds three crumbs: Administration → TenantManagement → Tenants, all sourced through `AbpTenantManagementResource`.
+
+The Razor partial (`TenantManagement.razor`, paired with this code-behind) lays out an `AbpExtensibleDataGrid` for the list, an `AbpModal` for create, an `AbpModal` for edit, plus the inlined `FeatureManagementModal`.
+
+### Blazor menu contributor
+
+```csharp
+public class TenantManagementBlazorMenuContributor : IMenuContributor
+{
+    public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.Main) return Task.CompletedTask;
+        var administrationMenu = context.Menu.GetAdministration();
+        var l = context.GetLocalizer<AbpTenantManagementResource>();
+
+        var item = new ApplicationMenuItem(
+            TenantManagementMenuNames.GroupName, l["Menu:TenantManagement"], icon: "fa fa-users");
+        administrationMenu.AddItem(item);
+
+        item.AddItem(new ApplicationMenuItem(
+            TenantManagementMenuNames.Tenants, l["Tenants"], url: "~/tenant-management/tenants"
+        ).RequirePermissions(TenantManagementPermissions.Tenants.Default));
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+Routing parity matters: Razor uses `~/TenantManagement/Tenants` (PascalCase, matching the Razor folder structure) while Blazor uses `~/tenant-management/tenants` (kebab-case, matching the `@page` route directive on `TenantManagement.razor`).
+
+### MudBlazor variant
+
+`Volo.Abp.TenantManagement.Blazor.MudBlazor/Pages/TenantManagement/TenantManagement.razor.cs` is the MudBlazor twin. It inherits a different theme base, uses a MudBlazor `MudDataGrid` for listing, and a MudBlazor dialog system, but the constructor and authorization flow are byte-for-byte the same as the Blazorise version — only the chrome differs.
+
+## Sequence: editing a tenant from the UI
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor A as Admin
+    participant UI as IndexModel + DataTable
+    participant Edit as EditModalModel
+    participant Ctrl as TenantController
+    participant App as TenantAppService
+
+    A->>UI: Click "Edit"
+    UI->>Edit: GET /TenantManagement/Tenants/EditModal?id=...
+    Edit->>Ctrl: GET /api/multi-tenancy/tenants/{id}
+    Ctrl->>App: GetAsync(id)
+    App-->>Edit: TenantDto
+    Edit-->>UI: rendered form
+    A->>UI: Change name, click Save
+    UI->>Edit: POST /TenantManagement/Tenants/EditModal
+    Edit->>Edit: ValidateModel()
+    Edit->>App: UpdateAsync(id, TenantUpdateDto)
+    App-->>Edit: TenantDto
+    Edit-->>UI: 204 NoContent; modal closes; grid reloads
+```
+
+## Server / WebAssembly companion packages
+
+`Volo.Abp.TenantManagement.Blazor.Server`, `.Blazor.WebAssembly`, `.Blazor.MudBlazor.Server` and `.Blazor.MudBlazor.WebAssembly` are thin glue modules. Each `[DependsOn]`s the corresponding theme package and the matching Feature Management Blazor flavor so that opening `FeatureManagementModal` from the tenant grid Just Works in both hosting models.
+
+## Where to customize
+
+<AccordionGroup>
+  <Accordion title="Custom column in the tenant grid" icon="table-columns">
+    Replace `TenantManagementTableColumns` resolution via `TableColumns.Configure<TenantManagement>(...)` in your Blazor module. For Razor pages, override the `Index.cshtml` columns through the standard DataTables config.
+  </Accordion>
+  <Accordion title="Add a row action" icon="ellipsis-vertical">
+    Override `GetEntityActionsAsync` on the Blazor page. The base class exposes `EntityActions.Get<TenantManagement>()` so contributing buttons from other modules is a one-liner.
+  </Accordion>
+  <Accordion title="Change the API route prefix" icon="route">
+    Subclass `TenantController`, override `[Route(...)]` and replace the registration in your Web module. The controller delegates to `ITenantAppService`, so all behavior is preserved.
+  </Accordion>
+</AccordionGroup>
+
+Return to [Overview](/module-tenant-management/overview), revisit [Domain](/module-tenant-management/domain) or [Application](/module-tenant-management/application) to see how the layers below feed this UI.

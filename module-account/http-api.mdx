@@ -1,0 +1,323 @@
+---
+title: "Account HTTP API: Controllers, Routes & Client Proxies"
+sidebarTitle: "HTTP API"
+description: "Inside Volo.Abp.Account.HttpApi and .HttpApi.Client: AccountController, ProfileController, DynamicClaimsController, plus the generated client proxies."
+---
+
+The HTTP API layer of the ABP Framework Account module turns the three application services from the previous page (`IAccountAppService`, `IProfileAppService`, `IDynamicClaimsAppService`) into a real REST surface and ships pre-generated C# client proxies that SPA hosts and microservice clients can call directly. The two packages involved are `modules/account/src/Volo.Abp.Account.HttpApi/` and `modules/account/src/Volo.Abp.Account.HttpApi.Client/`.
+
+## Package modules
+
+`Volo.Abp.Account.HttpApi/Volo/Abp/Account/AbpAccountHttpApiModule.cs` depends on `AbpAccountApplicationContractsModule`, `AbpIdentityHttpApiModule`, and `AbpAspNetCoreMvcModule`. Its `PreConfigureServices` registers the assembly as an MVC application part so the controllers below are discovered without an explicit `services.AddControllers().AddApplicationPart(...)` in the host. Its `ConfigureServices` adds the `AbpUiResource` base type to `AccountResource` so the controllers can resolve UI strings (used by error pages):
+
+```csharp
+Configure<AbpLocalizationOptions>(options =>
+{
+    options.Resources
+        .Get<AccountResource>()
+        .AddBaseTypes(typeof(AbpUiResource));
+});
+```
+
+`Volo.Abp.Account.HttpApi.Client/Volo/Abp/Account/AbpAccountHttpApiClientModule.cs` depends on `AbpAccountApplicationContractsModule` and `AbpHttpClientModule`, calls `AddStaticHttpClientProxies(typeof(AbpAccountApplicationContractsModule).Assembly, AccountRemoteServiceConsts.RemoteServiceName)`, and embeds its own virtual files (used by the dynamic client-proxy script bundle).
+
+## `AccountController`
+
+`Volo.Abp.Account.HttpApi/Volo/Abp/Account/AccountController.cs` is a textbook ABP API controller: it implements `IAccountAppService` and forwards every call to the injected `AccountAppService`. The attributes pin it to the right area and route:
+
+```csharp
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[Route("api/account")]
+public class AccountController : AbpControllerBase, IAccountAppService
+{
+    protected IAccountAppService AccountAppService { get; }
+
+    public AccountController(IAccountAppService accountAppService)
+    {
+        AccountAppService = accountAppService;
+    }
+
+    [HttpPost, Route("register")]
+    public virtual Task<IdentityUserDto> RegisterAsync(RegisterDto input)
+        => AccountAppService.RegisterAsync(input);
+
+    [HttpPost, Route("send-password-reset-code")]
+    public virtual Task SendPasswordResetCodeAsync(SendPasswordResetCodeDto input)
+        => AccountAppService.SendPasswordResetCodeAsync(input);
+
+    [HttpPost, Route("verify-password-reset-token")]
+    public virtual Task<bool> VerifyPasswordResetTokenAsync(VerifyPasswordResetTokenInput input)
+        => AccountAppService.VerifyPasswordResetTokenAsync(input);
+
+    [HttpPost, Route("reset-password")]
+    public virtual Task ResetPasswordAsync(ResetPasswordDto input)
+        => AccountAppService.ResetPasswordAsync(input);
+}
+```
+
+The route table is therefore:
+
+| Verb | URL | Handler | Auth |
+| --- | --- | --- | --- |
+| POST | `/api/account/register` | `RegisterAsync` | anonymous |
+| POST | `/api/account/send-password-reset-code` | `SendPasswordResetCodeAsync` | anonymous |
+| POST | `/api/account/verify-password-reset-token` | `VerifyPasswordResetTokenAsync` | anonymous |
+| POST | `/api/account/reset-password` | `ResetPasswordAsync` | anonymous |
+
+The `RemoteServiceName` constant — `"AbpAccount"` — comes from `Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/AccountRemoteServiceConsts.cs` and is the key into `RemoteServiceOptions.RemoteServices` that SPA hosts use to resolve the API base URL.
+
+## `ProfileController`
+
+`Volo.Abp.Account.HttpApi/Volo/Abp/Account/ProfileController.cs` is slightly more elaborate because the profile API uses a REST-style verb mapping:
+
+```csharp
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[ControllerName("Profile")]
+[Route("/api/account/my-profile")]
+public class ProfileController : AbpControllerBase, IProfileAppService
+{
+    protected IProfileAppService ProfileAppService { get; }
+
+    [HttpGet]
+    public virtual Task<ProfileDto> GetAsync()
+        => ProfileAppService.GetAsync();
+
+    [HttpPut]
+    public virtual Task<ProfileDto> UpdateAsync(UpdateProfileDto input)
+        => ProfileAppService.UpdateAsync(input);
+
+    [HttpPost, Route("change-password")]
+    public virtual Task ChangePasswordAsync(ChangePasswordInput input)
+        => ProfileAppService.ChangePasswordAsync(input);
+}
+```
+
+The `[ControllerName("Profile")]` attribute ensures the generated client class is `ProfileClientProxy` (not `MyProfileClientProxy`, which would otherwise be the convention since the route segment is `my-profile`).
+
+| Verb | URL | Handler | Auth |
+| --- | --- | --- | --- |
+| GET | `/api/account/my-profile` | `GetAsync` | authenticated |
+| PUT | `/api/account/my-profile` | `UpdateAsync` | authenticated |
+| POST | `/api/account/my-profile/change-password` | `ChangePasswordAsync` | authenticated |
+
+`ProfileAppService` itself is decorated `[Authorize]`, so the auth requirement is enforced at the application-service layer; the controller does not redundantly add the attribute.
+
+## `DynamicClaimsController`
+
+`Volo.Abp.Account.HttpApi/Volo/Abp/Account/DynamicClaimsController.cs` exposes a single endpoint that lets a SPA force-rebuild the user's claims principal after a profile change:
+
+```csharp
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[ControllerName("DynamicClaims")]
+[Route("/api/account/dynamic-claims")]
+public class DynamicClaimsController : AbpControllerBase, IDynamicClaimsAppService
+{
+    [HttpPost, Route("refresh")]
+    public virtual Task RefreshAsync() => DynamicClaimsAppService.RefreshAsync();
+}
+```
+
+The actual implementation lives in `Volo.Abp.Account.Application/Volo/Abp/Account/DynamicClaimsAppService.cs` and ultimately calls `IdentityDynamicClaimsPrincipalContributorCache.ClearAsync(userId, tenantId)`. This is the same cache that the Razor `LoginModel` clears after a successful sign-in.
+
+## Dynamic API surface details
+
+Every controller above inherits from `AbpControllerBase`, which already implements the ABP error-handling, current-user, and localization plumbing. None of them re-declares `[ApiController]` because `AbpAspNetCoreMvcModule`'s convention adds it implicitly to anything inside an `[Area]` that matches a remote-service registration. The `[RemoteService]` attribute also drives the OpenAPI grouping: hosts that depend on `Volo.Abp.Swashbuckle` will see a separate **AbpAccount** tag containing exactly the routes above.
+
+Versioning is taken care of by the global `AbpApiVersioningOptions` configuration in the host; the Account controllers do not declare `[ApiVersion("1.0")]` themselves. `ProfileController` and `DynamicClaimsController` do bring in `using Asp.Versioning;` so the host-level options can apply transparently.
+
+The `DynamicJavaScriptProxyOptions.DisableModule(AccountRemoteServiceConsts.ModuleName)` call inside `AbpAccountWebModule` (see the [Web UI page](/module-account/web-ui)) prevents the legacy `abp.services.account.*` JS proxy from being emitted for the MVC theme — the shared Razor Pages do not consume it, and the SPAs use the static C# proxies via the HTTP API client package instead.
+
+## Static client proxies
+
+`Volo.Abp.Account.HttpApi.Client/ClientProxies/Volo/Abp/Account/` contains three pairs of files (`*.Generated.cs` and a hand-written companion partial for each proxy). The generated file for the account proxy looks like this:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(IAccountAppService), typeof(AccountClientProxy))]
+public partial class AccountClientProxy : ClientProxyBase<IAccountAppService>, IAccountAppService
+{
+    public virtual async Task<IdentityUserDto> RegisterAsync(RegisterDto input)
+    {
+        return await RequestAsync<IdentityUserDto>(nameof(RegisterAsync), new ClientProxyRequestTypeValue
+        {
+            { typeof(RegisterDto), input }
+        });
+    }
+    // ... SendPasswordResetCodeAsync, VerifyPasswordResetTokenAsync, ResetPasswordAsync
+}
+```
+
+Key points:
+
+- `[Dependency(ReplaceServices = true)]` means that when a host module brings in both `Volo.Abp.Account.Application` *and* `Volo.Abp.Account.HttpApi.Client`, the client proxy wins. This is what lets a host project act simultaneously as an in-process server (for tests) and as a remote client; the choice is decided by module composition.
+- `ClientProxyBase<TService>` lives in `Volo.Abp.Http.Client` and uses the `IHttpClientProxyConfigurer` plus `IApiDescriptionFinder` machinery to translate the `nameof` method names into HTTP requests. The framework discovers the route + verb from the `IApiDescriptionFinder` cache — populated by the controller annotations above — so the proxy stays in sync with whatever the controllers declare.
+- The `ProfileClientProxy.Generated.cs` follows the same pattern but for `IProfileAppService`. The same is true for `DynamicClaimsClientProxy.Generated.cs`.
+
+The companion `AccountClientProxy.cs` (without `.Generated`) is empty by default and exists so module authors can add tenant-specific overrides without modifying the generated file — ABP Suite regenerates the `.Generated.cs` file whenever the contracts change.
+
+The proxies are registered by the single call inside `AbpAccountHttpApiClientModule`:
+
+```csharp
+context.Services.AddStaticHttpClientProxies(
+    typeof(AbpAccountApplicationContractsModule).Assembly,
+    AccountRemoteServiceConsts.RemoteServiceName);
+```
+
+`AddStaticHttpClientProxies` scans the contracts assembly for every `IRemoteService` interface, and for each one it registers the matching `*ClientProxy` (discovered by the `[ExposeServices]` attribute) under the configured remote-service group name.
+
+## Configuration: remote-service URL
+
+The `AccountRemoteServiceConsts.RemoteServiceName = "AbpAccount"` constant is what the client uses to look up the base URL. In a typical SPA host the `appsettings.json` will contain:
+
+```json
+"RemoteServices": {
+  "AbpAccount": {
+    "BaseUrl": "https://auth.mycompany.com/"
+  },
+  "Default": {
+    "BaseUrl": "https://api.mycompany.com/"
+  }
+}
+```
+
+If `AbpAccount` is not configured, the proxy falls back to `Default` because that is the convention encoded in `AbpRemoteServiceOptions`. Most templates point the Account proxy at the same host that serves the OpenIddict/IdentityServer authority — the same host that runs `Volo.Abp.Account.Web.OpenIddict` or `Volo.Abp.Account.Web.IdentityServer`.
+
+## How the controllers are reused
+
+Because every controller implements the matching `I*AppService` interface, the dynamic C# client proxies generated by `Volo.Abp.Http.Client` would also be able to call them directly. ABP ships the static proxies for two reasons: they remove a startup cost (no reflection at first call) and they make the dependency graph explicit (the proxy file is checked in, so a microservice consumer can find the call site with a text search). When you need to add a new method, the workflow is:
+
+<Steps>
+  <Step title="Add the method to the interface">
+    Update `IAccountAppService` in `Volo.Abp.Account.Application.Contracts/Volo/Abp/Account/`.
+  </Step>
+  <Step title="Implement it in the app service">
+    Add the implementation to `AccountAppService` in `Volo.Abp.Account.Application/Volo/Abp/Account/`.
+  </Step>
+  <Step title="Expose it on the controller">
+    Add an attribute-routed method to `AccountController` that delegates to the application service.
+  </Step>
+  <Step title="Regenerate proxies">
+    Run `abp generate-proxy -t csharp -m account` (or the equivalent ABP Suite command) to refresh `AccountClientProxy.Generated.cs`.
+  </Step>
+</Steps>
+
+The result is that every consumer of the static proxy — Blazor WebAssembly, MAUI, console workers, microservices — automatically gets the new method without further work.
+
+## OpenAPI shape
+
+When a host project depends on both `Volo.Abp.Account.HttpApi` and `Volo.Abp.Swashbuckle`, Swagger UI surfaces a tag named **AbpAccount** (the `RemoteServiceName`) containing every route from the three controllers above. The tag is set by `RemoteServiceAttribute` automatically; you do not need to add `[ApiExplorerSettings(GroupName = ...)]`. Two endpoints carry `[ApiExplorerSettings(IgnoreApi = true)]` and are therefore hidden from Swagger:
+
+- `POST /api/account/checkPassword` on `AccountController` in `Volo.Abp.Account.Web/Areas/Account/Controllers/`. This is the camelCase legacy alias kept for backwards compatibility — the canonical replacement is `POST /api/account/check-password`.
+- Internal handlers exposed only to the Razor pages (handlers on `LoginModel`, `RegisterModel`, etc.) do not appear because they are not `[Controller]` methods.
+
+The generated OpenAPI document is what `abp generate-proxy` consumes when regenerating either the C# proxies or the dynamic JavaScript/TypeScript proxies for the Angular package — both flows ultimately read the same `IApiDescriptionFinder` data.
+
+## Anonymous endpoints and rate-limiting
+
+All four routes on `AccountController` (`register`, `send-password-reset-code`, `verify-password-reset-token`, `reset-password`) are anonymous by design — they have to be, because the user is not signed in yet. None of them carry an `[AllowAnonymous]` attribute because `AbpControllerBase` defaults to anonymous unless an `[Authorize]` attribute is present on the class or method. The application services themselves take care of every safety check:
+
+- `AccountAppService.RegisterAsync` runs `CheckSelfRegistrationAsync` to honor the `Abp.Account.IsSelfRegistrationEnabled` setting.
+- `AccountAppService.SendPasswordResetCodeAsync` runs `GetUserByEmailAsync` which throws a localized `UserFriendlyException` rather than enumerating users on a not-found case.
+- `AccountAppService.VerifyPasswordResetTokenAsync` returns `false` on bad tokens — never throws — so the UI can display a generic "invalid link" message without leaking information.
+- `AccountAppService.ResetPasswordAsync` writes an `IdentitySecurityLogContext` with `Action = IdentitySecurityLogActionConsts.ChangePassword`.
+
+If your host needs rate-limiting on these endpoints — almost certainly yes for `register` and `send-password-reset-code` — add `AspNetCoreRateLimit` or the built-in ASP.NET Core rate limiter middleware at the host level. The Account module does not bundle a limiter.
+
+## Tenant resolution
+
+Every controller above runs through ABP's standard request pipeline, which means `ICurrentTenant` is resolved before the action executes. `AccountAppService.RegisterAsync` creates the new `IdentityUser` with `CurrentTenant.Id`, so the choice of tenant is whatever the host's `MultiTenancyOptions.TenantResolvers` produced — typically the `__tenant` cookie, the `__tenant` query string, or a subdomain. For OpenIddict/IdentityServer hosts the value is also pre-seeded by the login page based on the `__tenant` parameter inside the authorize request (see the [OpenIddict host page](/module-account/web-openiddict) and the [IdentityServer host page](/module-account/web-identityserver)).
+
+## How to call the proxies
+
+In a Blazor WebAssembly or microservice client, after the modules are added you can inject the interface and use it directly:
+
+```csharp
+public class ProfilePage
+{
+    private readonly IProfileAppService _profileService;
+    public ProfilePage(IProfileAppService profileService) => _profileService = profileService;
+
+    public async Task<ProfileDto> LoadAsync() => await _profileService.GetAsync();
+}
+```
+
+Because `ProfileClientProxy` was registered with `[Dependency(ReplaceServices = true)]` and `[ExposeServices(typeof(IProfileAppService), typeof(ProfileClientProxy))]`, the DI container returns the HTTP-driven proxy. The proxy uses `IHttpClientFactory` under the hood, so its `HttpClient` follows the host's `IHttpClientBuilder` configuration — typically wired up by the auth-server template to include `Authorization: Bearer <access_token>`.
+
+A common pitfall is forgetting to configure the `RemoteServiceOptions`: a missing `AbpAccount` entry will cause the proxy to fall back to the `Default` base URL, which on a misconfigured host may resolve to the *current* origin and produce confusing 404s if the API host is in fact a separate service. Always set the base URL explicitly on SPA hosts.
+
+## Comparing the three controllers
+
+The three controllers have intentionally different conventions:
+
+| Controller | Route prefix | Verb style | Auth | DTO inheritance |
+| --- | --- | --- | --- | --- |
+| `AccountController` | `/api/account` | POST-only with explicit sub-routes | anonymous | `ExtensibleObject` |
+| `ProfileController` | `/api/account/my-profile` | REST (GET/PUT/POST sub-route) | enforced by `[Authorize]` on the service | `ExtensibleObject` |
+| `DynamicClaimsController` | `/api/account/dynamic-claims` | POST-only with `refresh` | enforced by `[Authorize]` on the service | none |
+
+The mismatch between POST-with-sub-routes (`AccountController`) and REST verbs (`ProfileController`) is historical: the registration/reset flow predates the REST conventions ABP later adopted for new controllers. Keeping `register`, `send-password-reset-code`, etc. as named POST routes makes the intent visible in the URL itself and avoids a versioning headache.
+
+## Adding a new controller in a derived module
+
+If your application needs an additional endpoint — say, a sign-up-with-invitation route — the canonical recipe is:
+
+```csharp
+[RemoteService(Name = AccountRemoteServiceConsts.RemoteServiceName)]
+[Area(AccountRemoteServiceConsts.ModuleName)]
+[Route("api/account/invitations")]
+public class InvitationController : AbpControllerBase
+{
+    private readonly IInvitationAppService _invitations;
+    public InvitationController(IInvitationAppService invitations) => _invitations = invitations;
+
+    [HttpPost, Route("accept")]
+    public Task<InvitationAcceptResult> AcceptAsync(AcceptInvitationDto input)
+        => _invitations.AcceptAsync(input);
+}
+```
+
+Re-using `AccountRemoteServiceConsts.RemoteServiceName` keeps the new endpoint grouped under the same Swagger tag and inherits the same `RemoteServices:AbpAccount:BaseUrl` configuration, so clients do not need extra wiring to call it. Place the controller inside a module that depends on `Volo.Abp.Account.HttpApi`, and register an MVC application part for that module's assembly the same way `AbpAccountHttpApiModule.PreConfigureServices` does for itself.
+
+## Convention summary
+
+The takeaways from `Volo.Abp.Account.HttpApi` are reusable for any ABP module:
+
+- Implement each `I*AppService` interface on a thin controller, route under `/api/<module-name>/`, and let the service own the logic.
+- Group every controller under the same `[RemoteService(Name = "...")]` so SPA hosts can override the base URL per module.
+- Use `[Area(AccountRemoteServiceConsts.ModuleName)]` (where the area name is the module's `ModuleName`) so the conventional model-binder finds the controllers without colliding with other areas.
+- Register the assembly as an MVC application part inside `PreConfigureServices` so the host does not need an explicit `AddApplicationPart` call.
+
+`Volo.Abp.Account.HttpApi.Client` follows the inverse pattern: depend on contracts only, register static proxies via `AddStaticHttpClientProxies(assembly, remoteServiceName)`, and let `[Dependency(ReplaceServices = true)]` decide whether the in-process service or the proxy wins based on which modules the host pulled in.
+
+## How the dynamic JavaScript proxy is disabled
+
+ABP normally emits a JavaScript proxy for every `IRemoteService` so legacy MVC views can call `abp.services.account.account.register(...)` from the browser. The Account module **opts out** of that generator on the Web side:
+
+```csharp
+// Volo.Abp.Account.Web/AbpAccountWebModule.cs
+Configure<DynamicJavaScriptProxyOptions>(options =>
+{
+    options.DisableModule(AccountRemoteServiceConsts.ModuleName);
+});
+```
+
+The `account` module is disabled because:
+
+- The shared Razor Pages call the application services in-process (via property-injected `AccountAppService`), so they do not need a JS proxy.
+- The SPA hosts use the static C# proxy from `Volo.Abp.Account.HttpApi.Client`, not the dynamic JS proxy.
+- Emitting a redundant `account.js` would increase bundle size on every page that includes the ABP dynamic proxies.
+
+The Manage page is the exception — its bundle adds `/client-proxies/account-proxy.js` explicitly because the personal-info view component issues `PUT /api/account/my-profile` via XHR. The `account-proxy.js` file is itself generated at build time by `abp generate-proxy -t js` and shipped as a static asset under the host's `wwwroot/client-proxies/`.
+
+## What the HTTP API does *not* expose
+
+A few endpoints that exist in the application layer have no controller representation here:
+
+- The `Volo.Abp.Account.Web/Areas/Account/Controllers/AccountController` (`POST /api/account/login`, `GET /api/account/logout`, `POST /api/account/check-password`) lives in the **Web** package, not the HTTP API package, because it depends on cookie auth and is meant for the host's own MVC pages.
+- External-login start/callback endpoints are routed through Razor Page handlers (`?handler=ExternalLogin` and `?handler=ExternalLoginCallback`) — see `Volo.Abp.Account.Web/Pages/Account/Login.cshtml.cs`. They are not REST APIs.
+- The OAuth/OIDC endpoints (`/connect/authorize`, `/connect/token`, `/connect/logout`, etc.) belong to the chosen authorization-server module (`Volo.Abp.OpenIddict.AspNetCore` or the IdentityServer4 equivalent), not to Account.
+
+The cleanest mental model is: anything you can call from outside the auth-server, with just an access token, is in `Volo.Abp.Account.HttpApi`. Anything that needs interactive UI, cookies, or session is in `Volo.Abp.Account.Web`.

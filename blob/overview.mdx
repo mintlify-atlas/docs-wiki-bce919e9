@@ -1,0 +1,309 @@
+---
+title: "BLOB Storing System Overview and Provider Matrix Index"
+sidebarTitle: "Overview"
+description: "Map the ABP Framework BLOB storing stack — IBlobContainer, providers for File System, Azure, AWS S3, GCS, Aliyun OSS, MinIO, Bunny, and Memory."
+---
+
+The ABP Framework's BLOB storing system gives you a single `IBlobContainer` abstraction over a long list of object storage back ends. Application code talks to `IBlobContainer<TContainer>` for typed containers and `IBlobContainer` for the default container — both interfaces are stream-in, stream-out, naming-normalized, and multi-tenant-aware. The implementations live across nine sibling packages: a core abstraction (`Volo.Abp.BlobStoring`) plus one package per provider.
+
+This overview maps every package in the system and shows the provider matrix at a glance. Subsequent pages drill into each provider individually.
+
+## Package layout
+
+```
+framework/src/
+├── Volo.Abp.BlobStoring/                        ← core abstraction
+├── Volo.Abp.BlobStoring.FileSystem/             ← local disk
+├── Volo.Abp.BlobStoring.Azure/                  ← Azure Blob Storage
+├── Volo.Abp.BlobStoring.Aws/                    ← Amazon S3 + S3-compatible
+├── Volo.Abp.BlobStoring.Google/                 ← Google Cloud Storage
+├── Volo.Abp.BlobStoring.Aliyun/                 ← Aliyun OSS
+├── Volo.Abp.BlobStoring.Minio/                  ← MinIO
+├── Volo.Abp.BlobStoring.Bunny/                  ← Bunny.net Edge Storage
+└── Volo.Abp.BlobStoring.Memory/                 ← In-memory (test / cache)
+
+modules/blob-storing-database/                    ← optional database-backed module
+```
+
+## Core abstraction at a glance
+
+The core package `framework/src/Volo.Abp.BlobStoring/` defines:
+
+- `IBlobContainer` and `IBlobContainer<TContainer>` in `IBlobContainer.cs` — the stream-based API consumers call.
+- `BlobContainer` and `BlobContainer<TContainer>` in `BlobContainer.cs` — implementations that route to the configured `IBlobProvider`.
+- `IBlobProvider` in `IBlobProvider.cs` with `BlobProviderBase` in `BlobProviderBase.cs` — the per-provider contract.
+- `BlobProviderArgs`, `BlobProviderSaveArgs`, `BlobProviderGetArgs`, `BlobProviderDeleteArgs`, `BlobProviderExistsArgs` — the typed argument bags every provider operation receives.
+- `AbpBlobStoringOptions` and `BlobContainerConfigurations` in `AbpBlobStoringOptions.cs` / `BlobContainerConfigurations.cs` — the options bag where you call `Containers.ConfigureDefault(...)` or `Containers.Configure<MyContainer>(...)`.
+- `IBlobNormalizeNamingService` and `BlobNormalizeNamingService` — the pipeline that asks per-provider `IBlobNamingNormalizer` implementations to make container/blob names valid for the chosen back end.
+- `IBlobContainerFactory` and `BlobContainerFactory` — the factory that constructs a `BlobContainer` for a given name.
+
+A consumer writes:
+
+```csharp
+public class ReportService
+{
+    private readonly IBlobContainer<ReportContainer> _reports;
+    public ReportService(IBlobContainer<ReportContainer> reports) => _reports = reports;
+
+    public Task SaveAsync(string id, Stream pdf)
+        => _reports.SaveAsync(id + ".pdf", pdf, overrideExisting: true);
+}
+```
+
+…and `BlobContainer<TContainer>` (defined in `framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/BlobContainer.cs`) routes that to the right provider based on the configuration for `ReportContainer`.
+
+See the [BLOB Core](/blob/core) page for the full breakdown of the abstraction.
+
+## Provider matrix
+
+The table below summarizes the eight providers shipped in the framework, their NuGet dependencies, and which capabilities each one exposes via its `Use*` extension. All capability flags come from the per-provider configuration classes named `*BlobProviderConfiguration` in each package.
+
+| Provider | Package | `Use*` extension | Config class | External SDK | Container creation | Multi-credential |
+|---|---|---|---|---|---|---|
+| File System | `Volo.Abp.BlobStoring.FileSystem` | `UseFileSystem` | `FileSystemBlobProviderConfiguration` | none (System.IO) | Always creates directories | n/a |
+| Azure | `Volo.Abp.BlobStoring.Azure` | `UseAzure` | `AzureBlobProviderConfiguration` | `Azure.Storage.Blobs` | `CreateContainerIfNotExists` flag | Connection string |
+| AWS S3 | `Volo.Abp.BlobStoring.Aws` | `UseAws` | `AwsBlobProviderConfiguration` | `AWSSDK.S3` | `CreateContainerIfNotExists` flag | Access key, profile, temporary credentials, federated |
+| Google Cloud | `Volo.Abp.BlobStoring.Google` | `UseGoogle` | `GoogleBlobProviderConfiguration` | `Google.Cloud.Storage.V1` | `CreateContainerIfNotExists` flag | Service account or ADC |
+| Aliyun OSS | `Volo.Abp.BlobStoring.Aliyun` | `UseAliyun` | `AliyunBlobProviderConfiguration` | `Aliyun.OSS.SDK.NetCore` | `CreateContainerIfNotExists` flag | Sub-account or STS temporary |
+| MinIO | `Volo.Abp.BlobStoring.Minio` | `UseMinio` | `MinioBlobProviderConfiguration` | `Minio` (official client) | `CreateBucketIfNotExists` flag | Access key + secret |
+| Bunny | `Volo.Abp.BlobStoring.Bunny` | `UseBunny` | `BunnyBlobProviderConfiguration` | `BunnyCDN.Net.Storage` | `CreateContainerIfNotExists` flag | Access key per storage zone |
+| In-Memory | `Volo.Abp.BlobStoring.Memory` | `UseMemory` | (none) | none | n/a | n/a |
+
+Every provider package also ships a `*BlobNamingNormalizer` that implements `IBlobNamingNormalizer` from `framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/IBlobNamingNormalizer.cs` and a `*BlobNameCalculator` that decides the on-disk layout (typically `host/{container}/{blob}` or `tenants/{tenantId}/{container}/{blob}`).
+
+## How a Save call flows through the system
+
+```mermaid
+sequenceDiagram
+    participant App as Application code
+    participant Typed as BlobContainer&lt;T&gt;
+    participant Inner as BlobContainer
+    participant Norm as IBlobNormalizeNamingService
+    participant Selector as IBlobProviderSelector
+    participant Provider as IBlobProvider
+
+    App->>Typed: SaveAsync(name, stream)
+    Typed->>Inner: SaveAsync(name, stream)
+    Inner->>Norm: NormalizeNaming(config, container, blob)
+    Norm-->>Inner: BlobNormalizeNaming (sanitized)
+    Inner->>Selector: Get(containerName)
+    Selector-->>Inner: IBlobProvider instance
+    Inner->>Provider: SaveAsync(BlobProviderSaveArgs)
+    Provider-->>Inner: completed
+    Inner-->>App: Task
+```
+
+Each arrow corresponds to code in one specific source file:
+
+- `BlobContainer.SaveAsync` is in `framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/BlobContainer.cs`.
+- `IBlobNormalizeNamingService.NormalizeNaming` is in `framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/BlobNormalizeNamingService.cs`.
+- `DefaultBlobProviderSelector.Get` is in `framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/DefaultBlobProviderSelector.cs`.
+- The provider's `SaveAsync` lives in its respective `*BlobProvider.cs` file (e.g. `AzureBlobProvider.cs`, `FileSystemBlobProvider.cs`).
+
+## Container configuration model
+
+Every container is configured by a `BlobContainerConfiguration` instance (`framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/BlobContainerConfiguration.cs`). The configuration carries:
+
+- `ProviderType` — the CLR type of the chosen `IBlobProvider`. Set by the `Use*` extension methods.
+- `IsMultiTenant` — defaults to `true`. When the application is multi-tenant, blobs are scoped per tenant.
+- `NamingNormalizers` — a `TypeList<IBlobNamingNormalizer>`. The provider extensions add their own normalizer here.
+- Free-form properties via `SetConfiguration(name, value)` and `GetConfiguration<T>(name)` — provider-specific values like AWS keys, Azure connection strings, etc.
+- A fallback chain via `BlobContainerConfiguration(fallbackConfiguration)` — values not set on a container's own dictionary fall through to the default container's configuration. The `BlobContainerConfigurations.Default` instance acts as the root of this chain.
+
+A typical configuration call:
+
+```csharp
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.Configure<ReportContainer>(c =>
+    {
+        c.UseAzure(azure =>
+        {
+            azure.ConnectionString = "...";
+            azure.ContainerName = "reports";
+            azure.CreateContainerIfNotExists = true;
+        });
+    });
+});
+```
+
+The `UseAzure` extension in `framework/src/Volo.Abp.BlobStoring.Azure/Volo/Abp/BlobStoring/Azure/AzureBlobContainerConfigurationExtensions.cs` sets `ProviderType = typeof(AzureBlobProvider)` and adds `AzureBlobNamingNormalizer` to the normalizer list, then runs the user-supplied lambda against `AzureBlobProviderConfiguration` which writes provider-specific keys into `BlobContainerConfiguration._properties`.
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="BLOB Core" icon="cube" href="/blob/core">
+    Read the full reference for `IBlobContainer`, `IBlobProvider`, `AbpBlobStoringOptions`, and the args / configuration types.
+  </Card>
+  <Card title="File System" icon="folder" href="/blob/file-system">
+    Local disk provider — `FileSystemBlobProvider` and `DefaultBlobFilePathCalculator`.
+  </Card>
+  <Card title="Azure" icon="cloud" href="/blob/azure">
+    `AzureBlobProvider`, naming rules, and connection-string configuration.
+  </Card>
+  <Card title="AWS S3" icon="aws" href="/blob/aws-s3">
+    `AwsBlobProvider`, region/profile/temporary credentials.
+  </Card>
+  <Card title="Google Cloud" icon="google" href="/blob/google-cloud">
+    `GoogleBlobProvider` and ADC vs service account.
+  </Card>
+  <Card title="Aliyun OSS" icon="dragon" href="/blob/aliyun-oss">
+    `AliyunBlobProvider` and STS temporary credentials.
+  </Card>
+  <Card title="MinIO" icon="hard-drive" href="/blob/minio">
+    `MinioBlobProvider`, presigned URLs.
+  </Card>
+  <Card title="Bunny" icon="rabbit" href="/blob/bunny">
+    `BunnyBlobProvider` for Bunny.net Edge Storage.
+  </Card>
+  <Card title="In-Memory" icon="memory" href="/blob/in-memory">
+    `MemoryBlobProvider` for tests and ephemeral caching.
+  </Card>
+  <Card title="BLOB Database Module" icon="database" href="/blob/database-module">
+    The `modules/blob-storing-database/` module — store blobs in a relational database.
+  </Card>
+</CardGroup>
+
+## When to pick which provider
+
+<AccordionGroup>
+  <Accordion title="Local-only, dev or single-server prod" icon="laptop">
+    Use **File System**. Zero external dependencies; survives restarts; supports the same `IBlobContainer` API as the cloud providers.
+  </Accordion>
+  <Accordion title="Hosted on Azure" icon="cloud">
+    Use **Azure Blob Storage**. The provider supports connection strings, can create containers on demand, and uses `Azure.Storage.Blobs` natively.
+  </Accordion>
+  <Accordion title="Hosted on AWS" icon="aws">
+    Use **AWS S3**. The provider supports static keys, named profiles, temporary credentials, and STS federation through `Amazon.SecurityToken`.
+  </Accordion>
+  <Accordion title="Hosted on GCP" icon="google">
+    Use **Google Cloud Storage**. The provider supports service accounts with private keys and Application Default Credentials.
+  </Accordion>
+  <Accordion title="Hosted in China" icon="dragon">
+    Use **Aliyun OSS**. The provider supports both sub-account credentials and STS temporary tokens scoped by a role policy.
+  </Accordion>
+  <Accordion title="Self-hosted S3-compatible" icon="server">
+    Use **MinIO**. The provider talks to the official MinIO client and supports both insecure (HTTP) and SSL (HTTPS) endpoints.
+  </Accordion>
+  <Accordion title="Edge-cached static assets" icon="rabbit">
+    Use **Bunny** if you already use Bunny.net's CDN; the provider writes to Bunny Edge Storage so you can serve via the pull zone.
+  </Accordion>
+  <Accordion title="Unit tests or in-process caching" icon="flask">
+    Use **In-Memory**. Backed by `ConcurrentDictionary<string, byte[]>`. No I/O at all.
+  </Accordion>
+  <Accordion title="No external storage available" icon="database">
+    Use the database-backed module — see [BLOB Database](/blob/database-module). Useful for small attachments where you do not want to manage a separate object store.
+  </Accordion>
+</AccordionGroup>
+
+## Multi-tenant scoping
+
+Every provider that ships in the framework scopes blobs by `CurrentTenant.Id` when `BlobContainerConfiguration.IsMultiTenant` is true. The exact layout varies per provider:
+
+- File System: `{BasePath}/host/{container}/{blob}` for the host, `{BasePath}/tenants/{tenantId}/{container}/{blob}` for a tenant (see `framework/src/Volo.Abp.BlobStoring.FileSystem/Volo/Abp/BlobStoring/FileSystem/DefaultBlobFilePathCalculator.cs`).
+- Azure / AWS / Google / Aliyun: prefix the blob key with `host/` or `tenants/{tenantId}/` — implemented in the per-provider `DefaultBlobNameCalculator` classes (e.g. `DefaultAzureBlobNameCalculator.cs`, `DefaultAwsBlobNameCalculator.cs`).
+- Memory: composes the cache key as `{tenantId}_{blobName}_{containerName}` — see `MemoryBlobProvider.GetCacheKey` in `MemoryBlobProvider.cs`.
+
+The tenant `Guid?` itself comes from `ICurrentTenant.Id`, which `BlobContainer.SaveAsync` reads inside its own `using (CurrentTenant.Change(GetTenantIdOrNull()))` scope.
+
+Continue to [BLOB Core](/blob/core) for the full reference of the abstraction, or pick the provider you need from the cards above.
+
+## Stream lifecycle conventions
+
+Across every provider the framework follows a uniform set of conventions for streams:
+
+- `SaveAsync` takes ownership of *reading* the input stream but never closes it. The caller controls the input stream's lifetime — typically by wrapping the upload in a `using`.
+- `GetAsync` / `GetOrNullAsync` return a stream the caller must dispose. Some providers (Azure, AWS, GCS, MinIO) return chunked network streams; others (File System, In-Memory, Memory of the Bunny provider) return memory-backed streams.
+- `ExistsAsync` and `DeleteAsync` do not touch streams at all.
+- The optional `CancellationToken` is forwarded to the underlying SDK call so cancellation is honored end-to-end.
+
+The exact disposal contracts vary between providers — for example, the Azure `OpenReadAsync` stream releases its HTTP connection only on `Dispose`, while the File System `File.OpenRead` stream releases a file handle. Always wrap returned streams in `using` or `await using` to be safe.
+
+## Configuration discovery vs hard-coded keys
+
+A configuration pattern that runs across every cloud provider package is "discover credentials from `IConfiguration`, fall back to environment variables, fall back to provider-specific defaults". The recommended order:
+
+1. `IConfiguration["Storage:<Provider>:..."]` keys — set in `appsettings.json`, `appsettings.{Env}.json`, or `User-Secrets`.
+2. Cloud-native ambient credentials — AWS profile/role, GCP ADC, Azure Managed Identity.
+3. Provider-specific defaults — typically "use the system credential store" mode.
+
+None of the framework providers prescribe a configuration root; you can name the section whatever you like. The examples in each provider page use `Storage:<Provider>:...` to keep them parallel.
+
+## Naming normalization deep dive
+
+The core `IBlobNormalizeNamingService` (`framework/src/Volo.Abp.BlobStoring/Volo/Abp/BlobStoring/BlobNormalizeNamingService.cs`) iterates every `IBlobNamingNormalizer` type registered on a `BlobContainerConfiguration.NamingNormalizers` list. The normalizers run in the order they were added — the order matters when you stack multiple providers' normalizers (you typically don't, but the framework allows it).
+
+For each provider, the per-package normalizer ensures container names and blob names are safe for the back end:
+
+- File System (`FileSystemBlobNamingNormalizer`) replaces Windows-forbidden characters: `/ \ : * ? " < > |`.
+- Azure (`AzureBlobNamingNormalizer`) lowercases container names and replaces invalid chars with hyphens.
+- AWS S3 (`AwsBlobNamingNormalizer`) enforces S3 bucket-name DNS rules.
+- Google (`GoogleBlobNamingNormalizer`) enforces GCS naming including the no-`goog`-prefix rule.
+- Aliyun (`AliyunBlobNamingNormalizer`) enforces OSS bucket rules.
+- MinIO (`MinioBlobNamingNormalizer`) enforces the same S3-compatible rules.
+- Bunny (`BunnyBlobNamingNormalizer`) enforces Bunny storage zone rules.
+- Memory does not register a normalizer — the dictionary accepts any string.
+
+The normalization is best-effort: container names that cannot be made valid (because they are too short, conflict with reserved prefixes, etc.) raise exceptions before the provider is called. This is intentional — failing at the abstraction layer gives a much clearer error than the opaque "Invalid bucket name" message most SDKs return.
+
+## Choosing between containers vs blobs
+
+ABP's BLOB abstraction maps "container" to whatever the back end calls a top-level grouping — an Azure container, an S3 bucket, a GCS bucket, a Bunny storage zone, an OSS bucket. The model assumes you create one container per *logical concern* (reports, attachments, marketing assets), not one per tenant.
+
+Two patterns work well in practice:
+
+<AccordionGroup>
+  <Accordion title="One container per concern, prefix per tenant" icon="layer-group">
+    The default ABP pattern. Configure one ABP container per business concern, leave `IsMultiTenant = true`, and let the per-provider name calculator prefix object keys with `host/` or `tenants/{tenantId}/`. Operations team manages a small number of cloud containers, scales to thousands of tenants, easy to enumerate.
+  </Accordion>
+  <Accordion title="One container per tenant" icon="object-group">
+    Useful when each tenant must be able to export their data as a single bucket dump (compliance), or when per-tenant bucket policies / access tiers are required. Replace the per-provider name calculator with one that returns `args.ContainerName + "-" + currentTenantId` (or similar) and set `IsMultiTenant = false`. Operations team manages many cloud containers but isolation is structural.
+  </Accordion>
+</AccordionGroup>
+
+The mapping happens entirely in the per-provider `*BlobNameCalculator` classes (`DefaultAzureBlobNameCalculator.cs`, `DefaultAwsBlobNameCalculator.cs`, etc.), so switching patterns requires no application changes — only a calculator replacement via `Services.Replace`.
+
+## Multi-provider deployments
+
+Nothing in the framework prevents you from mixing providers in a single application. A typical mixed deployment:
+
+| Container | Provider | Rationale |
+|---|---|---|
+| `ReportContainer` | Azure | Long-term audit storage; serve via SAS URL. |
+| `AvatarContainer` | File System | Local cache that the CDN pulls from. |
+| `TempContainer` | Memory | Short-lived request-bound artifacts. |
+| `MarketingContainer` | Bunny | Public CDN distribution. |
+
+Configure them independently:
+
+```csharp
+options.Containers.Configure<ReportContainer>(c => c.UseAzure(...));
+options.Containers.Configure<AvatarContainer>(c => c.UseFileSystem(...));
+options.Containers.Configure<TempContainer>(c => c.UseMemory());
+options.Containers.Configure<MarketingContainer>(c => c.UseBunny(...));
+```
+
+The provider selector (`DefaultBlobProviderSelector`) looks at each container's `ProviderType` and routes to the matching `IBlobProvider` registered in DI. Because every provider package registers its `*BlobProvider` as `ITransientDependency`, having multiple provider packages referenced simultaneously is supported out of the box.
+
+## Observability and metrics
+
+The BLOB stack does not emit telemetry by itself. To track operations:
+
+- Wrap `BlobContainer` (or `IBlobContainer`) in a decorator that pushes counters to `System.Diagnostics.Metrics` — easy to do because every operation goes through `BlobContainer.SaveAsync` / `GetAsync` etc.
+- Use ABP's interception support to add audit logs at the `IBlobProvider` boundary.
+- For per-provider telemetry, hook into the underlying SDK's `EventSource` (Azure's `Azure.Core.Diagnostics`, AWS's `Amazon.Runtime.Internal.Util.Logger`, etc.).
+
+## Multi-tenant tenant id resolution
+
+`BlobContainer` reads `ICurrentTenant.Id` inside its `using (CurrentTenant.Change(GetTenantIdOrNull()))` scope. The actual id resolution happens earlier in the request pipeline — typically by `framework/src/Volo.Abp.AspNetCore.MultiTenancy/.../TenantResolver.cs` reading a `__tenant` cookie, query string, or claim. By the time the blob method runs, `ICurrentTenant.Id` already holds the right value.
+
+For background workers that aren't in an HTTP request, set the tenant explicitly:
+
+```csharp
+using (CurrentTenant.Change(tenantId))
+{
+    await container.SaveAsync(...);
+}
+```
+
+The `using` block ensures the previous tenant scope is restored when the operation completes.

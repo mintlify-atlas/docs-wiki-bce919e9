@@ -1,0 +1,500 @@
+---
+title: "ABP BLOB Database Persistence: EF Core and Mongo Stores"
+sidebarTitle: "Persistence"
+description: "Inspect the EF Core and MongoDB persistence layers of ABP's database BLOB-storing module: DbContexts, repositories, schema mapping, and provider wiring."
+---
+
+## Overview
+
+The ABP Framework's database BLOB-storing module persists binary content
+inside the same relational or document store as the rest of your application.
+The domain layer defines two aggregates — `DatabaseBlobContainer` and
+`DatabaseBlob` — together with provider, repository, and configuration
+helpers. Two persistence-specific projects then implement the repositories
+twice, once for Entity Framework Core and once for MongoDB, so you can
+swap stores without touching domain code or the consuming
+`IBlobContainer` API.
+
+This page walks the persistence layer end-to-end:
+
+1. The domain aggregates and shared constants in
+   `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/`.
+2. The EF Core implementation in
+   `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/`.
+3. The MongoDB implementation in
+   `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/`.
+
+Both implementations share repository interfaces, so the rest of the framework
+(notably `DatabaseBlobProvider`) is unaware of which store is in use.
+
+## Domain layer
+
+### `DatabaseBlobContainer`
+
+The container aggregate, defined in
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobContainer.cs`,
+represents a named bucket for blobs. It implements both `AggregateRoot<Guid>`
+and `IMultiTenant`:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobContainer.cs
+public class DatabaseBlobContainer : AggregateRoot<Guid>, IMultiTenant
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string Name { get; protected set; }
+
+    protected DatabaseBlobContainer() { }
+
+    public DatabaseBlobContainer(Guid id, string name, Guid? tenantId = null)
+        : base(id)
+    {
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name), DatabaseContainerConsts.MaxNameLength);
+        TenantId = tenantId;
+    }
+}
+```
+
+`Name` is validated against `DatabaseContainerConsts.MaxNameLength` so that
+both EF Core and MongoDB schemas can enforce a consistent maximum length.
+
+### `DatabaseBlob`
+
+The blob aggregate at
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlob.cs`
+stores the binary content itself plus the foreign key back to its container:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlob.cs
+public class DatabaseBlob : AggregateRoot<Guid>, IMultiTenant
+{
+    public virtual Guid ContainerId { get; protected set; }
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string Name { get; protected set; }
+
+    [DisableAuditing]
+    public virtual byte[] Content { get; protected set; }
+
+    public DatabaseBlob(Guid id, Guid containerId, string name, byte[] content,
+        Guid? tenantId = null) : base(id)
+    {
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name), DatabaseBlobConsts.MaxNameLength);
+        ContainerId = containerId;
+        Content = CheckContentLength(content);
+        TenantId = tenantId;
+    }
+
+    public virtual void SetContent(byte[] content) => Content = CheckContentLength(content);
+
+    protected virtual byte[] CheckContentLength(byte[] content)
+    {
+        Check.NotNull(content, nameof(content));
+        if (content.Length >= DatabaseBlobConsts.MaxContentLength)
+            throw new AbpException(
+                $"Blob content size cannot be more than {DatabaseBlobConsts.MaxContentLength} Bytes.");
+        return content;
+    }
+}
+```
+
+The `[DisableAuditing]` attribute on `Content` excludes the byte payload from
+ABP's change-tracking history — auditing each version of every blob would
+quickly fill the database. The `CheckContentLength` guard enforces the
+configured size cap consistently regardless of which persistence layer is
+wired in.
+
+### Repository interfaces
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/IDatabaseBlobContainerRepository.cs`
+adds a single name lookup on top of `IBasicRepository<DatabaseBlobContainer, Guid>`:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/IDatabaseBlobContainerRepository.cs
+public interface IDatabaseBlobContainerRepository : IBasicRepository<DatabaseBlobContainer, Guid>
+{
+    Task<DatabaseBlobContainer> FindAsync(string name, CancellationToken cancellationToken = default);
+}
+```
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/IDatabaseBlobRepository.cs`
+similarly adds container-scoped lookups, existence checks, and deletions:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/IDatabaseBlobRepository.cs
+public interface IDatabaseBlobRepository : IBasicRepository<DatabaseBlob, Guid>
+{
+    Task<DatabaseBlob> FindAsync(Guid containerId, string name,
+        CancellationToken cancellationToken = default);
+    Task<bool> ExistsAsync(Guid containerId, string name,
+        CancellationToken cancellationToken = default);
+    Task<bool> DeleteAsync(Guid containerId, string name, bool autoSave = false,
+        CancellationToken cancellationToken = default);
+}
+```
+
+These are the only methods `DatabaseBlobProvider` depends on, which is why
+both EF Core and MongoDB can satisfy the contract without divergence in
+the calling layer.
+
+### `DatabaseBlobProvider`
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobProvider.cs`
+is the `BlobProviderBase` subclass that integrates the database store with
+`IBlobContainer`. It composes `IDatabaseBlobRepository`,
+`IDatabaseBlobContainerRepository`, `IGuidGenerator`, and `ICurrentTenant`,
+overriding `SaveAsync`, `DeleteAsync`, `ExistsAsync`, and `GetOrNullAsync`.
+
+Key behaviours from `DatabaseBlobProvider.cs`:
+
+- `SaveAsync` first calls `GetOrCreateContainerAsync` to lazily create the
+  container row, then either calls `SetContent` + `UpdateAsync` (on existing
+  blobs, throwing `BlobAlreadyExistsException` if
+  `args.OverrideExisting` is `false`) or `InsertAsync` (for new blobs).
+- `DeleteAsync` and `ExistsAsync` short-circuit to `false` when the
+  container row is missing, avoiding spurious queries.
+- `GetOrNullAsync` wraps the persisted byte array in a `MemoryStream`, which
+  is the contract `IBlobContainer.GetAsync` expects.
+- `GetOrCreateContainerAsync` reads `CurrentTenant.Id` for the new container,
+  so every container is automatically tenant-scoped.
+
+### Connection-string and schema constants
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/AbpBlobStoringDatabaseDbProperties.cs`
+centralises the schema / connection-string identifiers used by both
+persistence layers. `DbTablePrefix` and `DbSchema` default to
+`AbpCommonDbProperties` values and the constant
+`ConnectionStringName = "AbpBlobStoring"` is what the `[ConnectionStringName]`
+attribute references on both DbContext types below; setting
+`appsettings.json:ConnectionStrings:AbpBlobStoring` routes the module to a
+dedicated database without affecting the rest of your application.
+
+### Domain module
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/BlobStoringDatabaseDomainModule.cs`
+registers the default provider:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/BlobStoringDatabaseDomainModule.cs
+[DependsOn(
+    typeof(AbpDddDomainModule),
+    typeof(AbpBlobStoringModule),
+    typeof(BlobStoringDatabaseDomainSharedModule))]
+public class BlobStoringDatabaseDomainModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBlobStoringOptions>(options =>
+        {
+            options.Containers.ConfigureDefault(container =>
+            {
+                if (container.ProviderType == null)
+                {
+                    container.UseDatabase();
+                }
+            });
+        });
+    }
+}
+```
+
+By calling `container.UseDatabase()` (defined in
+`DatabaseBlobContainerConfigurationExtensions.cs`) for every container that
+hasn't already chosen a provider, the module makes the database store the
+default — opting a container into a different provider remains explicit.
+
+## EF Core layer
+
+### `IBlobStoringDbContext` and `BlobStoringDbContext`
+
+The DbContext interface in
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/IBlobStoringDbContext.cs`
+defines the two `DbSet`s the module needs and applies
+`[ConnectionStringName(AbpBlobStoringDatabaseDbProperties.ConnectionStringName)]`:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/IBlobStoringDbContext.cs
+[ConnectionStringName(AbpBlobStoringDatabaseDbProperties.ConnectionStringName)]
+public interface IBlobStoringDbContext : IEfCoreDbContext
+{
+    DbSet<DatabaseBlobContainer> BlobContainers { get; }
+    DbSet<DatabaseBlob> Blobs { get; }
+}
+```
+
+The concrete `BlobStoringDbContext` in `BlobStoringDbContext.cs` derives
+from `AbpDbContext<BlobStoringDbContext>`, implements
+`IBlobStoringDbContext`, and overrides `OnModelCreating` to call
+`builder.ConfigureBlobStoring()` after `base.OnModelCreating(builder)`. The
+`[ConnectionStringName]` attribute is repeated on the class so EF Core
+tooling picks it up at design time as well.
+
+### Schema mapping
+
+The schema is declared in
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/BlobStoringDbContextModelCreatingExtensions.cs`
+via `ConfigureBlobStoring`:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/BlobStoringDbContextModelCreatingExtensions.cs
+builder.Entity<DatabaseBlobContainer>(b =>
+{
+    b.ToTable(AbpBlobStoringDatabaseDbProperties.DbTablePrefix + "BlobContainers",
+        AbpBlobStoringDatabaseDbProperties.DbSchema);
+    b.ConfigureByConvention();
+    b.Property(p => p.Name).IsRequired().HasMaxLength(DatabaseContainerConsts.MaxNameLength);
+    b.HasMany<DatabaseBlob>().WithOne().HasForeignKey(p => p.ContainerId);
+    b.HasIndex(x => new { x.TenantId, x.Name });
+    b.ApplyObjectExtensionMappings();
+});
+
+builder.Entity<DatabaseBlob>(b =>
+{
+    b.ToTable(AbpBlobStoringDatabaseDbProperties.DbTablePrefix + "Blobs",
+        AbpBlobStoringDatabaseDbProperties.DbSchema);
+    b.ConfigureByConvention();
+    b.Property(p => p.Name).IsRequired().HasMaxLength(DatabaseBlobConsts.MaxNameLength);
+    b.Property(p => p.Content).HasMaxLength(DatabaseBlobConsts.MaxContentLength);
+    b.HasOne<DatabaseBlobContainer>().WithMany().HasForeignKey(p => p.ContainerId);
+    b.HasIndex(x => new { x.TenantId, x.ContainerId, x.Name });
+    b.ApplyObjectExtensionMappings();
+});
+
+builder.TryConfigureObjectExtensions<BlobStoringDbContext>();
+```
+
+Three things worth highlighting:
+
+1. Table names use the configurable `DbTablePrefix` (default `"Abp"`) and
+   `DbSchema` from `AbpBlobStoringDatabaseDbProperties`, so the resulting
+   tables are `AbpBlobContainers` and `AbpBlobs` by default.
+2. Indexes cover the common access paths used by the repositories below —
+   `(TenantId, Name)` for container lookup and
+   `(TenantId, ContainerId, Name)` for blob lookup.
+3. `ApplyObjectExtensionMappings` and `TryConfigureObjectExtensions` integrate
+   with the `ObjectExtensionManager` so consumers can attach extra columns to
+   both aggregates without modifying the module's source.
+
+### `EfCoreDatabaseBlobRepository`
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/EfCoreDatabaseBlobRepository.cs`
+implements `IDatabaseBlobRepository` against the EF Core DbContext:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/EfCoreDatabaseBlobRepository.cs
+public class EfCoreDatabaseBlobRepository
+    : EfCoreRepository<IBlobStoringDbContext, DatabaseBlob, Guid>, IDatabaseBlobRepository
+{
+    public virtual async Task<DatabaseBlob> FindAsync(Guid containerId, string name,
+        CancellationToken cancellationToken = default)
+        => (await GetDbSetAsync())
+            .FirstOrDefault(x => x.ContainerId == containerId && x.Name == name);
+
+    public virtual async Task<bool> ExistsAsync(Guid containerId, string name,
+        CancellationToken cancellationToken = default)
+        => await (await GetDbSetAsync())
+            .AnyAsync(x => x.ContainerId == containerId && x.Name == name,
+                GetCancellationToken(cancellationToken));
+
+    public virtual async Task<bool> DeleteAsync(Guid containerId, string name,
+        bool autoSave = false, CancellationToken cancellationToken = default)
+    {
+        var blob = await FindAsync(containerId, name, cancellationToken);
+        if (blob == null) { return false; }
+        await base.DeleteAsync(blob, autoSave,
+            cancellationToken: GetCancellationToken(cancellationToken));
+        return true;
+    }
+}
+```
+
+The class inherits the base CRUD members from `EfCoreRepository` and adds
+the three name-based helpers. The `DeleteAsync` implementation follows the
+"find then delete" pattern that the source code itself flags as a TODO.
+
+### `EfCoreDatabaseBlobContainerRepository`
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/EfCoreDatabaseBlobContainerRepository.cs`
+is the simpler counterpart: it derives from
+`EfCoreRepository<IBlobStoringDbContext, DatabaseBlobContainer, Guid>` and
+implements `FindAsync(string name, CancellationToken)` with
+`(await GetDbSetAsync()).FirstOrDefaultAsync(x => x.Name == name, GetCancellationToken(cancellationToken))`.
+
+### EF Core module
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/BlobStoringDatabaseEntityFrameworkCoreModule.cs`
+binds everything together:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/Volo/Abp/BlobStoring/Database/EntityFrameworkCore/BlobStoringDatabaseEntityFrameworkCoreModule.cs
+[DependsOn(
+    typeof(BlobStoringDatabaseDomainModule),
+    typeof(AbpEntityFrameworkCoreModule))]
+public class BlobStoringDatabaseEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<BlobStoringDbContext>(options =>
+        {
+            options.AddRepository<DatabaseBlobContainer, EfCoreDatabaseBlobContainerRepository>();
+            options.AddRepository<DatabaseBlob, EfCoreDatabaseBlobRepository>();
+        });
+    }
+}
+```
+
+`AddAbpDbContext<BlobStoringDbContext>` registers the DbContext and the two
+`AddRepository<TEntity, TRepository>` calls bind the custom repository
+implementations so that `IDatabaseBlobRepository` and
+`IDatabaseBlobContainerRepository` resolve to the EF Core types — the
+same interfaces `DatabaseBlobProvider` injects.
+
+## MongoDB layer
+
+### `IBlobStoringMongoDbContext` and `BlobStoringMongoDbContext`
+
+The MongoDB DbContext interface in
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/IBlobStoringMongoDbContext.cs`
+mirrors the EF Core interface but uses `IMongoCollection<T>` and reuses the
+same `[ConnectionStringName(AbpBlobStoringDatabaseDbProperties.ConnectionStringName)]`
+attribute so the same `appsettings.json` value drives both stores:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/IBlobStoringMongoDbContext.cs
+[ConnectionStringName(AbpBlobStoringDatabaseDbProperties.ConnectionStringName)]
+public interface IBlobStoringMongoDbContext : IAbpMongoDbContext
+{
+    IMongoCollection<DatabaseBlobContainer> BlobContainers { get; }
+    IMongoCollection<DatabaseBlob> Blobs { get; }
+}
+```
+
+The implementation at `BlobStoringMongoDbContext.cs` derives from
+`AbpMongoDbContext`, projects each `IMongoCollection<T>` accessor to
+`Collection<T>()`, and overrides `CreateModel` to invoke
+`modelBuilder.ConfigureBlobStoring()` after calling `base.CreateModel(...)`.
+
+### Collection naming
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/BlobStoringMongoDbContextExtensions.cs`
+applies the same `DbTablePrefix` used by the EF Core schema, so collection
+names match the relational table names:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/BlobStoringMongoDbContextExtensions.cs
+public static void ConfigureBlobStoring(this IMongoModelBuilder builder)
+{
+    builder.Entity<DatabaseBlobContainer>(b =>
+    {
+        b.CollectionName = AbpBlobStoringDatabaseDbProperties.DbTablePrefix + "BlobContainers";
+    });
+    builder.Entity<DatabaseBlob>(b =>
+    {
+        b.CollectionName = AbpBlobStoringDatabaseDbProperties.DbTablePrefix + "Blobs";
+    });
+}
+```
+
+This means a deployment that uses the default prefix `"Abp"` finds its data
+in either `AbpBlobContainers`/`AbpBlobs` tables (EF Core) or
+`AbpBlobContainers`/`AbpBlobs` collections (MongoDB) — useful for tooling
+that targets both stores.
+
+### `MongoDbDatabaseBlobRepository`
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/MongoDbDatabaseBlobRepository.cs`
+implements `IDatabaseBlobRepository` against `MongoDbRepository`:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/MongoDbDatabaseBlobRepository.cs
+public class MongoDbDatabaseBlobRepository
+    : MongoDbRepository<IBlobStoringMongoDbContext, DatabaseBlob, Guid>, IDatabaseBlobRepository
+{
+    public virtual async Task<DatabaseBlob> FindAsync(Guid containerId, string name,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken = GetCancellationToken(cancellationToken);
+        return await (await GetQueryableAsync(cancellationToken))
+            .FirstOrDefaultAsync(x => x.ContainerId == containerId && x.Name == name,
+                cancellationToken);
+    }
+
+    public virtual async Task<bool> ExistsAsync(Guid containerId, string name,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken = GetCancellationToken(cancellationToken);
+        return await (await GetQueryableAsync(cancellationToken))
+            .AnyAsync(x => x.ContainerId == containerId && x.Name == name, cancellationToken);
+    }
+
+    public virtual async Task<bool> DeleteAsync(Guid containerId, string name,
+        bool autoSave = false, CancellationToken cancellationToken = default)
+    {
+        var blob = await FindAsync(containerId, name, cancellationToken);
+        if (blob == null) { return false; }
+        await base.DeleteAsync(blob, autoSave, cancellationToken);
+        return true;
+    }
+}
+```
+
+Aside from using `GetQueryableAsync` instead of `GetDbSetAsync`, the
+implementation is structurally identical to the EF Core repository — same
+predicates, same find-then-delete pattern.
+
+### `MongoDbDatabaseBlobContainerRepository`
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/MongoDbDatabaseBlobContainerRepository.cs`
+derives from `MongoDbRepository<IBlobStoringMongoDbContext, DatabaseBlobContainer, Guid>`
+and implements `FindAsync(string name, CancellationToken)` by delegating to
+the base `FindAsync(x => x.Name == name, ...)` predicate overload.
+
+### MongoDB module
+
+`modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/BlobStoringDatabaseMongoDbModule.cs`
+mirrors the EF Core module:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/Volo/Abp/BlobStoring/Database/MongoDB/BlobStoringDatabaseMongoDbModule.cs
+[DependsOn(typeof(BlobStoringDatabaseDomainModule), typeof(AbpMongoDbModule))]
+public class BlobStoringDatabaseMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<BlobStoringMongoDbContext>(options =>
+        {
+            options.AddRepository<DatabaseBlobContainer, MongoDbDatabaseBlobContainerRepository>();
+            options.AddRepository<DatabaseBlob, MongoDbDatabaseBlobRepository>();
+        });
+    }
+}
+```
+
+By taking a dependency on `BlobStoringDatabaseDomainModule`, the MongoDB
+module inherits the default-provider wiring that points `IBlobContainer` at
+`DatabaseBlobProvider`.
+
+## Choosing a store
+
+<CardGroup cols={2}>
+  <Card title="EF Core" icon="database">
+    Reference `BlobStoringDatabaseEntityFrameworkCoreModule` and configure
+    the `"AbpBlobStoring"` connection string in `appsettings.json`. Use the
+    standard ABP EF Core migration tooling against `BlobStoringDbContext`
+    to create the `AbpBlobContainers` / `AbpBlobs` tables.
+  </Card>
+  <Card title="MongoDB" icon="leaf">
+    Reference `BlobStoringDatabaseMongoDbModule` and configure the same
+    `"AbpBlobStoring"` connection string. No migrations are required —
+    collections are created on first write and named via
+    `BlobStoringMongoDbContextExtensions.ConfigureBlobStoring`.
+  </Card>
+</CardGroup>
+
+Both modules satisfy the same `IDatabaseBlobRepository` and
+`IDatabaseBlobContainerRepository` interfaces, so `DatabaseBlobProvider` (and
+through it, any container configured with `.UseDatabase()` from
+`DatabaseBlobContainerConfigurationExtensions.cs`) works unchanged on either
+store.
+
+## Related concerns
+
+<CardGroup cols={2}>
+  <Card title="Object Extending" href="/concerns/object-extending">
+    `ApplyObjectExtensionMappings` and `TryConfigureObjectExtensions` in
+    `BlobStoringDbContextModelCreatingExtensions.cs` integrate with the
+    `ObjectExtensionManager` so consumers can add columns without forking
+    the module.
+  </Card>
+  <Card title="BLOB storing core" icon="cloud-arrow-up">
+    The provider base class `BlobProviderBase` and the configuration
+    extension point `AbpBlobStoringOptions` referenced from
+    `BlobStoringDatabaseDomainModule.cs` come from
+    `framework/src/Volo.Abp.BlobStoring/`.
+  </Card>
+</CardGroup>

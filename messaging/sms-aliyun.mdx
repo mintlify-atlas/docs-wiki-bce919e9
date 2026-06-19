@@ -1,0 +1,256 @@
+---
+title: "Aliyun SMS Provider for ABP: AbpSmsAliyunModule"
+sidebarTitle: "SMS Aliyun"
+description: "Wire Aliyun Dysmsapi (Dayu) into ABP Framework using AbpSmsAliyunModule, AliyunSmsSender and AbpAliyunSmsOptions for templated mobile messages."
+---
+
+The ABP Framework `Volo.Abp.Sms.Aliyun` package provides an `ISmsSender` backed by the Alibaba Cloud SDK `AlibabaCloud.SDK.Dysmsapi20170525.Client`. Reference this module and any code that depends on `ISmsSender` (`Volo.Abp.Identity` 2FA, `Volo.Abp.Account` phone confirmation, custom notification flows) will route through the Aliyun Dysmsapi service.
+
+The package only contains three C# files, all under `framework/src/Volo.Abp.Sms.Aliyun/Volo/Abp/Sms/Aliyun/`:
+
+| File | Purpose |
+| --- | --- |
+| `AbpSmsAliyunModule.cs` | Module class, binds the `AbpAliyunSms` configuration section |
+| `AliyunSmsSender.cs` | `ISmsSender` implementation calling the Aliyun SDK |
+| `AbpAliyunSmsOptions.cs` | Strongly typed options: `AccessKeyId`, `AccessKeySecret`, `EndPoint` |
+
+## AbpSmsAliyunModule
+
+`AbpSmsAliyunModule` (`framework/src/Volo.Abp.Sms.Aliyun/Volo/Abp/Sms/Aliyun/AbpSmsAliyunModule.cs`) depends on `AbpSmsModule` so the `ISmsSender` abstraction and the fallback `NullSmsSender` registration are in place before this module overrides them:
+
+```csharp
+[DependsOn(typeof(AbpSmsModule))]
+public class AbpSmsAliyunModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpAliyunSmsOptions>(configuration.GetSection("AbpAliyunSms"));
+    }
+}
+```
+
+The module's only job is to bind `AbpAliyunSmsOptions` from the `AbpAliyunSms` section of `IConfiguration`. The actual sender registration happens via `[ITransientDependency]` on `AliyunSmsSender`. Because `NullSmsSender` (from `Volo.Abp.Sms`) is registered with `[Dependency(TryRegister = true)]`, the Aliyun sender wins automatically — see the [SMS Core](./sms-core) page for the composition rules.
+
+## AbpAliyunSmsOptions
+
+The options class at `framework/src/Volo.Abp.Sms.Aliyun/Volo/Abp/Sms/Aliyun/AbpAliyunSmsOptions.cs`:
+
+```csharp
+public class AbpAliyunSmsOptions
+{
+    public string AccessKeySecret { get; set; } = default!;
+    public string AccessKeyId     { get; set; } = default!;
+    public string EndPoint        { get; set; } = default!;
+}
+```
+
+- `AccessKeyId` / `AccessKeySecret` — the [RAM credentials](https://www.alibabacloud.com/help/en/ram/) for a sub-account with the `AliyunDysmsFullAccess` policy.
+- `EndPoint` — the regional endpoint of the Dysmsapi service. The Chinese-mainland default is `dysmsapi.aliyuncs.com`; Singapore (international) is `dysmsapi.ap-southeast-1.aliyuncs.com`.
+
+`default!` is the null-forgiving operator. The defaults are non-null markers — the application is responsible for providing real values via configuration. If `AccessKeyId` is empty at runtime the Aliyun SDK throws.
+
+### Binding from appsettings
+
+`AbpSmsAliyunModule.ConfigureServices` binds the section named exactly `"AbpAliyunSms"`:
+
+```json
+{
+  "AbpAliyunSms": {
+    "AccessKeyId":     "LTAI...",
+    "AccessKeySecret": "...",
+    "EndPoint":        "dysmsapi.aliyuncs.com"
+  }
+}
+```
+
+Use a user-secret store or an environment variable for the `AccessKeySecret` in real deployments.
+
+## AliyunSmsSender
+
+`AliyunSmsSender` (`framework/src/Volo.Abp.Sms.Aliyun/Volo/Abp/Sms/Aliyun/AliyunSmsSender.cs`) is the concrete provider. It depends on `IOptionsMonitor<AbpAliyunSmsOptions>` so credential updates are reloaded without restarting the container:
+
+```csharp
+public class AliyunSmsSender : ISmsSender, ITransientDependency
+{
+    protected AbpAliyunSmsOptions Options { get; }
+
+    public AliyunSmsSender(IOptionsMonitor<AbpAliyunSmsOptions> options)
+    {
+        Options = options.CurrentValue;
+    }
+
+    public async Task SendAsync(SmsMessage smsMessage)
+    {
+        var client = CreateClient();
+
+        await client.SendSmsAsync(new AliyunSendSmsRequest
+        {
+            PhoneNumbers  = smsMessage.PhoneNumber,
+            SignName      = smsMessage.Properties.GetOrDefault("SignName")     as string,
+            TemplateCode  = smsMessage.Properties.GetOrDefault("TemplateCode") as string,
+            TemplateParam = smsMessage.Text
+        });
+    }
+
+    protected virtual AliyunClient CreateClient()
+    {
+        return new(new AliyunConfig
+        {
+            AccessKeyId     = Options.AccessKeyId,
+            AccessKeySecret = Options.AccessKeySecret,
+            Endpoint        = Options.EndPoint
+        });
+    }
+}
+```
+
+The using-aliases at the top of the file remap the long Alibaba Cloud SDK type names:
+
+```csharp
+using AliyunClient         = AlibabaCloud.SDK.Dysmsapi20170525.Client;
+using AliyunConfig         = AlibabaCloud.OpenApiClient.Models.Config;
+using AliyunSendSmsRequest = AlibabaCloud.SDK.Dysmsapi20170525.Models.SendSmsRequest;
+```
+
+### Field mapping
+
+The sender translates the abstract `SmsMessage` into the Aliyun-specific request:
+
+| `SmsMessage` field | Aliyun field | Notes |
+| --- | --- | --- |
+| `PhoneNumber` | `PhoneNumbers` | One or more E.164 numbers, comma-separated when batching. The sender does not split — it passes the raw string. |
+| `Properties["SignName"]` | `SignName` | The pre-approved "签名" associated with your Aliyun SMS account. Required by Aliyun. |
+| `Properties["TemplateCode"]` | `TemplateCode` | The pre-approved template ID, e.g. `SMS_123456789`. Required. |
+| `Text` | `TemplateParam` | A JSON object whose keys match placeholders in the template. The sender does not validate or transform the value — pass it as a JSON string. |
+
+`smsMessage.Properties.GetOrDefault(key) as string` is the standard ABP dictionary helper from `framework/src/Volo.Abp.Core/Volo/Abp/Collections/Generic/DictionaryExtensions.cs`. It returns `null` when the key is missing or when the value is not a `string`, which then propagates to the Aliyun SDK and surfaces as an `IsvSignatureDoesNotMatch` or similar error.
+
+<Tip>
+Aliyun's `TemplateParam` must be a JSON object — not a plain message string. If your template reads `{ code }`, set `Text = "{\"code\":\"1234\"}"` or build it with `System.Text.Json` before calling `SendAsync`.
+</Tip>
+
+### Client lifetime
+
+`CreateClient` is `protected virtual` and constructs a new `AlibabaCloud.SDK.Dysmsapi20170525.Client` on every send. The Alibaba SDK's `Client` is cheap to allocate (it is a thin TEA / RPC wrapper) and is thread-safe-by-creation, so the per-call cost is negligible. Override the method to pool clients or to point at a regional sub-endpoint:
+
+```csharp
+public class RegionalAliyunSender : AliyunSmsSender
+{
+    public RegionalAliyunSender(IOptionsMonitor<AbpAliyunSmsOptions> o) : base(o) { }
+
+    protected override AliyunClient CreateClient()
+    {
+        return new(new AliyunConfig
+        {
+            AccessKeyId     = Options.AccessKeyId,
+            AccessKeySecret = Options.AccessKeySecret,
+            Endpoint        = "dysmsapi.ap-southeast-1.aliyuncs.com" // override
+        });
+    }
+}
+```
+
+## Flow
+
+```mermaid
+sequenceDiagram
+    participant App as Application code
+    participant Sender as AliyunSmsSender
+    participant Opts as IOptionsMonitor&lt;AbpAliyunSmsOptions&gt;
+    participant Sdk as Dysmsapi.Client
+    participant Aliyun as dysmsapi.aliyuncs.com
+
+    App->>Sender: SendAsync(SmsMessage)
+    Sender->>Opts: CurrentValue
+    Sender->>Sdk: new Client(Config{Endpoint,KeyId,Secret})
+    Sender->>Sdk: SendSmsAsync(SendSmsRequest)
+    Sdk->>Aliyun: HTTPS RPC
+    Aliyun-->>Sdk: SendSmsResponse
+    Sdk-->>Sender: Task complete
+    Sender-->>App: done
+```
+
+The sender does not inspect the response — exceptions raised by the SDK (rate limits, signature mismatches, blacklisted phone numbers) bubble up as `AbpException`/`Aliyun` SDK exceptions and the caller decides how to react.
+
+## Setup recipe
+
+1. Add a NuGet reference to `Volo.Abp.Sms.Aliyun`.
+2. Depend on `AbpSmsAliyunModule` from your application module.
+3. Populate the `AbpAliyunSms` section in `appsettings.json` or environment variables.
+4. Inject `ISmsSender` and call `SendAsync`.
+
+```csharp
+[DependsOn(typeof(AbpSmsAliyunModule))]
+public class MySmsModule : AbpModule { }
+```
+
+### Sending a templated message
+
+```csharp
+public class TwoFactorService : IDomainService
+{
+    private readonly ISmsSender _smsSender;
+    public TwoFactorService(ISmsSender smsSender) => _smsSender = smsSender;
+
+    public Task SendCodeAsync(string phoneNumber, string code)
+    {
+        var msg = new SmsMessage(
+            phoneNumber,
+            JsonSerializer.Serialize(new { code }));
+
+        msg.Properties["SignName"]     = "Contoso";
+        msg.Properties["TemplateCode"] = "SMS_12345";
+
+        return _smsSender.SendAsync(msg);
+    }
+}
+```
+
+The `Properties` dictionary keys (`SignName`, `TemplateCode`) are matched as literal strings in `AliyunSmsSender.SendAsync`; misspelling them silently produces an Aliyun error like `MissingSignature`.
+
+### Quick send without provider properties
+
+If you have not yet configured a template (for example, during development against the international endpoint that supports test signatures), the SDK still requires `SignName` and `TemplateCode`. Use the extension `_smsSender.SendAsync(phoneNumber, text)` only with the `NullSmsSender` or with a router that fills in defaults.
+
+## Per-tenant credentials
+
+The Aliyun sender resolves options via `IOptionsMonitor.CurrentValue` at construction time — not per call. To support per-tenant credentials, register a custom `IConfigureOptions<AbpAliyunSmsOptions>` that reads tenant data through `ICurrentTenant` and wraps `AliyunSmsSender` in a transient decorator that resolves options on demand:
+
+```csharp
+public class TenantAliyunSmsSender : ISmsSender, ITransientDependency
+{
+    private readonly IOptionsMonitor<AbpAliyunSmsOptions> _opts;
+    private readonly ICurrentTenant _tenant;
+
+    public TenantAliyunSmsSender(
+        IOptionsMonitor<AbpAliyunSmsOptions> opts,
+        ICurrentTenant tenant)
+    {
+        _opts = opts; _tenant = tenant;
+    }
+
+    public Task SendAsync(SmsMessage msg)
+    {
+        var opts = _opts.Get(_tenant.Id?.ToString());
+        // build a new AliyunClient with these opts, then send
+        ...
+    }
+}
+```
+
+Because the package's own `AliyunSmsSender` only captures `IOptionsMonitor.CurrentValue` in its constructor, per-tenant credentials require subclassing.
+
+## Composition pitfalls
+
+- Do not also depend on `AbpSmsTencentCloudModule` in the same module — both register their sender with plain `[ITransientDependency]`. Whichever module is loaded last wins, and you cannot predict the order if both transitively appear.
+- The `EndPoint` value is unvalidated. A typo (`dysmsapi.aliyun.com` instead of `aliyuncs.com`) results in a DNS failure on first send, not at startup.
+- `IOptionsMonitor.CurrentValue` is captured once in the constructor; if you mutate `AbpAliyunSmsOptions` at runtime through `IPostConfigureOptions`, the change takes effect only for newly constructed `AliyunSmsSender` instances.
+
+## Reference
+
+| Type | File |
+| --- | --- |
+| `AbpSmsAliyunModule` | `framework/src/Volo.Abp.Sms.Aliyun/Volo/Abp/Sms/Aliyun/AbpSmsAliyunModule.cs` |
+| `AliyunSmsSender` | `framework/src/Volo.Abp.Sms.Aliyun/Volo/Abp/Sms/Aliyun/AliyunSmsSender.cs` |
+| `AbpAliyunSmsOptions` | `framework/src/Volo.Abp.Sms.Aliyun/Volo/Abp/Sms/Aliyun/AbpAliyunSmsOptions.cs` |

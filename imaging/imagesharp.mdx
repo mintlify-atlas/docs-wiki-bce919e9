@@ -1,0 +1,286 @@
+---
+title: "ImageSharp Provider for ABP Framework Imaging Pipeline"
+sidebarTitle: "ImageSharp"
+description: "Resize and compress images in ABP Framework via SixLabors.ImageSharp: AbpImagingImageSharpModule, contributors, ImageSharpCompressOptions and encoders."
+---
+
+The ABP Framework `Volo.Abp.Imaging.ImageSharp` package is the pure-managed default provider for the imaging pipeline. It registers two contributors — `ImageSharpImageResizerContributor` and `ImageSharpImageCompressorContributor` — that plug into the `IImageResizer` / `IImageCompressor` coordinators defined by `Volo.Abp.Imaging.Abstractions` (see [Overview](./overview)). Because `SixLabors.ImageSharp` has no native dependencies, this provider is the safest choice for cross-platform containerized deployments.
+
+## Package layout
+
+The provider contains four files under `framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/`:
+
+| File | Purpose |
+| --- | --- |
+| `AbpImagingImageSharpModule.cs` | Module class, depends on `AbpImagingAbstractionsModule` |
+| `ImageSharpImageResizerContributor.cs` | Resize contributor mapping `ImageResizeMode` to ImageSharp `ResizeMode` |
+| `ImageSharpImageCompressorContributor.cs` | Compress contributor choosing an encoder per MIME type |
+| `ImageSharpCompressOptions.cs` | Options carrying the three encoders and a default quality |
+
+## AbpImagingImageSharpModule
+
+```csharp
+[DependsOn(typeof(AbpImagingAbstractionsModule))]
+public class AbpImagingImageSharpModule : AbpModule
+{
+}
+```
+
+(`framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/AbpImagingImageSharpModule.cs`)
+
+No service registrations in `ConfigureServices` — the contributors are picked up automatically via `[ITransientDependency]`. Depend on `AbpImagingImageSharpModule` from your application module and both resize and compress paths gain ImageSharp support.
+
+## ImageSharpCompressOptions
+
+The compress side of the provider is configurable:
+
+```csharp
+public class ImageSharpCompressOptions
+{
+    public IImageEncoder JpegEncoder { get; set; }
+    public IImageEncoder PngEncoder  { get; set; }
+    public IImageEncoder WebpEncoder { get; set; }
+    public int           DefaultQuality { get; set; } = 75;
+
+    public ImageSharpCompressOptions()
+    {
+        JpegEncoder = new JpegEncoder { Quality = DefaultQuality };
+        PngEncoder  = new PngEncoder
+        {
+            CompressionLevel = PngCompressionLevel.BestCompression,
+            SkipMetadata     = true
+        };
+        WebpEncoder = new WebpEncoder { Quality = DefaultQuality };
+    }
+}
+```
+
+(`framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/ImageSharpCompressOptions.cs`)
+
+Defaults:
+
+- **JPEG** — `Quality = 75` (the `DefaultQuality` property).
+- **PNG** — `PngCompressionLevel.BestCompression` (zlib level 9) plus `SkipMetadata = true` to discard EXIF/XMP/iCC blobs that are usually irrelevant in web pipelines.
+- **WebP** — `Quality = 75`.
+
+Override these to pick lossless WebP, higher JPEG quality or to preserve metadata:
+
+```csharp
+Configure<ImageSharpCompressOptions>(o =>
+{
+    o.DefaultQuality = 85;
+    o.JpegEncoder = new JpegEncoder { Quality = 85, ColorType = JpegColorType.YCbCrRatio444 };
+    o.WebpEncoder = new WebpEncoder { Quality = 90, FileFormat = WebpFileFormatType.Lossless };
+});
+```
+
+<Tip>
+`DefaultQuality` is only consumed by the constructor — assigning it later does not update the already-created `JpegEncoder` / `WebpEncoder`. Set the encoders explicitly when you customize.
+</Tip>
+
+## ImageSharpImageResizerContributor
+
+The resize implementation (`ImageSharpImageResizerContributor.cs`) is a thin adapter on `SixLabors.ImageSharp.Processing.Resize`. The class is `[ITransientDependency]` and implements `IImageResizerContributor`.
+
+### Supported formats
+
+```csharp
+protected virtual bool CanResize(string? mimeType) => mimeType switch
+{
+    MimeTypes.Image.Jpeg => true,
+    MimeTypes.Image.Png  => true,
+    MimeTypes.Image.Gif  => true,
+    MimeTypes.Image.Bmp  => true,
+    MimeTypes.Image.Tiff => true,
+    MimeTypes.Image.Webp => true,
+    _ => false
+};
+```
+
+The MIME-type constants come from `framework/src/Volo.Abp.Http.Abstractions/Volo/Abp/Http/MimeTypes.cs`. When the caller provides a MIME type that fails the switch, the contributor short-circuits and returns `ImageProcessState.Unsupported` without even decoding the image. When no MIME type is passed, the contributor calls `Image.LoadAsync` and inspects `image.Metadata.DecodedImageFormat!.DefaultMimeType` after the fact.
+
+### Resize mode mapping
+
+```csharp
+protected Dictionary<ImageResizeMode, ResizeMode> ResizeModeMap = new()
+{
+    { ImageResizeMode.None,    default            },
+    { ImageResizeMode.Stretch, ResizeMode.Stretch },
+    { ImageResizeMode.BoxPad,  ResizeMode.BoxPad  },
+    { ImageResizeMode.Min,     ResizeMode.Min     },
+    { ImageResizeMode.Max,     ResizeMode.Max     },
+    { ImageResizeMode.Crop,    ResizeMode.Crop    },
+    { ImageResizeMode.Pad,     ResizeMode.Pad     }
+};
+```
+
+ImageSharp's `ResizeMode` enum closely mirrors the ABP one, making the map one-to-one. `ImageResizeMode.None` produces ImageSharp's `default(ResizeMode)` (= `ResizeMode.Crop` in the underlying enum, but with width/height interpreted as exact targets).
+
+`ImageResizeMode.Default` is normalized away inside `ImageResizer.ChangeDefaultResizeMode` before the contributor is invoked, so it never appears in the map. A user-defined `ImageResizeMode` value not present in the map causes `NotSupportedException`.
+
+### Resize execution
+
+```csharp
+using var image = await Image.LoadAsync(stream, cancellationToken);
+
+if (!CanResize(image.Metadata.DecodedImageFormat!.DefaultMimeType))
+    return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+
+if (ResizeModeMap.TryGetValue(resizeArgs.Mode, out var resizeMode))
+    image.Mutate(x => x.Resize(new ResizeOptions
+    {
+        Size = GetSize(resizeArgs),
+        Mode = resizeMode
+    }));
+```
+
+The image is decoded once with `Image.LoadAsync`, mutated in place via `image.Mutate`, and re-encoded back into a new `MemoryStream` using the source's `DecodedImageFormat`. So a PNG stays a PNG, a JPEG stays a JPEG — the contributor does not change the container format.
+
+The size is computed by:
+
+```csharp
+private static Size GetSize(ImageResizeArgs resizeArgs)
+{
+    var size = new Size();
+    if (resizeArgs.Width  > 0) size.Width  = (int)resizeArgs.Width;
+    if (resizeArgs.Height > 0) size.Height = (int)resizeArgs.Height;
+    return size;
+}
+```
+
+A zero in either dimension lets ImageSharp infer the missing edge from the aspect ratio — see ImageSharp's `ResizeOptions` documentation.
+
+### Byte overload
+
+The `byte[]` overload wraps the buffer in a `MemoryStream`, delegates to the stream-based overload, then copies the resulting stream out to a fresh `byte[]` via the extension method `GetAllBytesAsync` from `Volo.Abp.IO`.
+
+## ImageSharpImageCompressorContributor
+
+The compress contributor (`ImageSharpImageCompressorContributor.cs`) follows the same pattern. It is `[ITransientDependency]` and implements `IImageCompressorContributor`.
+
+### Supported formats
+
+```csharp
+protected virtual bool CanCompress(string? mimeType) => mimeType switch
+{
+    MimeTypes.Image.Jpeg => true,
+    MimeTypes.Image.Png  => true,
+    MimeTypes.Image.Webp => true,
+    _ => false
+};
+```
+
+The compressor handles only **JPEG, PNG, WebP** — the three formats with a corresponding encoder in `ImageSharpCompressOptions`. GIF/BMP/TIFF are reported as `Unsupported` and the coordinator passes them to the next contributor (typically Magick.NET if it's also registered).
+
+### Encoder selection
+
+```csharp
+protected virtual IImageEncoder GetEncoder(IImageFormat format) => format.DefaultMimeType switch
+{
+    MimeTypes.Image.Jpeg => Options.JpegEncoder,
+    MimeTypes.Image.Png  => Options.PngEncoder,
+    MimeTypes.Image.Webp => Options.WebpEncoder,
+    _ => throw new NotSupportedException($"No encoder available for the given format: {format.Name}")
+};
+```
+
+### "Did it help?" check
+
+```csharp
+if (memoryStream.Length < stream.Length)
+    return new ImageCompressResult<Stream>(memoryStream, ImageProcessState.Done);
+
+await memoryStream.DisposeAsync();
+return new ImageCompressResult<Stream>(stream, ImageProcessState.Canceled);
+```
+
+After re-encoding, the contributor compares the new size against the original. If the compressed output is **larger** than the input — common for already-compressed JPEGs — it returns the **original** stream with `ImageProcessState.Canceled`, freeing the failed buffer first. The coordinator then short-circuits the chain because `Canceled` is not `Unsupported`.
+
+This guard means re-running `IImageCompressor.CompressAsync` on already-optimized assets is safe and idempotent: there is no quality cliff from repeated round-trips.
+
+## Resize pipeline visualized
+
+```mermaid
+flowchart LR
+    A[Stream / byte[] in] --> B{CanResize?<br/>(by mimeType)}
+    B -->|no| Z[Unsupported -> original]
+    B -->|yes / unknown| C[Image.LoadAsync]
+    C --> D{CanResize by<br/>DecodedImageFormat}
+    D -->|no| Z
+    D -->|yes| E{ResizeModeMap}
+    E -->|missing| X[NotSupportedException]
+    E -->|hit| F[image.Mutate(x => x.Resize(...))]
+    F --> G[image.SaveAsync to<br/>new MemoryStream]
+    G --> H[Done -> new stream]
+```
+
+## Configuration recipes
+
+### High-quality JPEG and lossless WebP
+
+```csharp
+Configure<ImageSharpCompressOptions>(o =>
+{
+    o.JpegEncoder = new JpegEncoder
+    {
+        Quality        = 92,
+        ColorType      = JpegColorType.YCbCrRatio444,
+        Interleaved    = true
+    };
+    o.WebpEncoder = new WebpEncoder
+    {
+        FileFormat = WebpFileFormatType.Lossless,
+        Method     = 6
+    };
+});
+```
+
+### Preserve metadata
+
+The default `PngEncoder` strips metadata. Replace it explicitly to keep EXIF/XMP:
+
+```csharp
+Configure<ImageSharpCompressOptions>(o =>
+{
+    o.PngEncoder = new PngEncoder
+    {
+        CompressionLevel = PngCompressionLevel.BestCompression,
+        SkipMetadata     = false
+    };
+});
+```
+
+### Add a TIFF compressor
+
+The default contributor does not handle TIFF. Register a custom contributor that uses ImageSharp's `TiffEncoder`:
+
+```csharp
+public class TiffCompressorContributor : IImageCompressorContributor, ITransientDependency
+{
+    public Task<ImageCompressResult<Stream>> TryCompressAsync(Stream stream, string? mimeType, CancellationToken ct)
+    {
+        if (mimeType != MimeTypes.Image.Tiff)
+            return Task.FromResult(new ImageCompressResult<Stream>(stream, ImageProcessState.Unsupported));
+        // implement using SixLabors.ImageSharp.Formats.Tiff.TiffEncoder ...
+    }
+    public Task<ImageCompressResult<byte[]>> TryCompressAsync(byte[] bytes, string? mimeType, CancellationToken ct) { ... }
+}
+```
+
+The coordinator picks it up alongside `ImageSharpImageCompressorContributor`. Returning `Unsupported` lets the other contributor have a turn.
+
+## Notes and limitations
+
+- ImageSharp 3.x is licensed under the [Six Labors Split License](https://docs.sixlabors.com/articles/imagesharp/license.html) — free for OSS and small commercial use but requires a commercial license above a revenue threshold. Check the licensing before shipping.
+- The PNG default `BestCompression` is CPU-heavy; for many small thumbnails consider `DefaultCompression` or `BestSpeed`.
+- `Image.LoadAsync` reads the whole image into memory. For very large images (>100 MB), consider wrapping the call in a custom contributor that streams tiles via `Image.Identify` first.
+- GIF compression is intentionally absent — animated GIF re-encoding is best handled by Magick.NET; reference both modules and let ImageSharp handle JPEG/PNG/WebP while Magick.NET handles GIF.
+
+## Reference
+
+| Type | File |
+| --- | --- |
+| `AbpImagingImageSharpModule` | `framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/AbpImagingImageSharpModule.cs` |
+| `ImageSharpImageResizerContributor` | `framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/ImageSharpImageResizerContributor.cs` |
+| `ImageSharpImageCompressorContributor` | `framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/ImageSharpImageCompressorContributor.cs` |
+| `ImageSharpCompressOptions` | `framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/ImageSharpCompressOptions.cs` |

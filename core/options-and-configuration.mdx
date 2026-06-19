@@ -1,0 +1,243 @@
+---
+title: "Options and Configuration in ABP Modules"
+sidebarTitle: "Options & Config"
+description: "How ABP wraps Microsoft.Extensions.Options: AbpOptionsFactory, PreConfigure, AbpModule.Configure shortcuts, dynamic options, and configuration discovery."
+---
+
+The ABP Framework layers a small set of helpers on top of `Microsoft.Extensions.Options` and `Microsoft.Extensions.Configuration` so that modules can share options across phases and so that downstream code can override options at runtime without rebuilding the container. This page covers `framework/src/Volo.Abp.Core/Volo/Abp/Options/` and the relevant `Microsoft/Extensions/DependencyInjection/` and `Microsoft/Extensions/Configuration/` extension files.
+
+## Responsibility
+
+- Provide a **pre-configure phase** that runs *before* `ConfigureServices`, accumulated in an in-memory `PreConfigureActionList<TOptions>` and replayed when the options are first materialised.
+- Expose convenient `Configure<TOptions>` / `PreConfigure<TOptions>` / `PostConfigure<TOptions>` / `PostConfigureAll<TOptions>` shortcuts on `AbpModule`.
+- Allow **dynamic options** that re-compute themselves on demand via `AbpDynamicOptionsManager<T>` and its `SetAsync` entry point.
+- Ship an `AbpUnnamedOptionsManager<TOptions>` that avoids the lock used by the BCL's `UnnamedOptionsManager`, preventing deadlocks when options are accessed concurrently.
+- Provide an `AbpOptionsFactory<TOptions>` that mirrors the BCL `OptionsFactory<T>` (until the BCL version becomes injectable).
+- Build the application `IConfiguration` from `appsettings*.json`, user secrets, environment variables, and command-line args via `ConfigurationHelper.BuildConfiguration`.
+
+## File inventory
+
+| File | Purpose |
+| --- | --- |
+| `Volo/Abp/Options/AbpOptionsFactory.cs` | Custom `IOptionsFactory<TOptions>` that snapshots `Setups`, `PostConfigures`, and `Validations` into arrays — see source comment referencing the BCL `OptionsFactory.cs`. |
+| `Volo/Abp/Options/AbpDynamicOptionsManager.cs` | Base class for dynamic options. Inherits `OptionsManager<T>`. Exposes `SetAsync()` and an abstract `OverrideOptionsAsync(name, options)`. |
+| `Volo/Abp/Options/AbpUnnamedOptionsManager.cs` | Lock-free `IOptions<TOptions>` implementation. |
+| `Volo/Abp/Options/PreConfigureActionList.cs` | `List<Action<TOptions>>` with `Configure(options)` and `Configure()` (build-fresh) helpers. |
+| `Microsoft/Extensions/DependencyInjection/ServiceCollectionPreConfigureExtensions.cs` | `services.PreConfigure<TOptions>`, `services.GetPreConfigureActions<TOptions>`, `services.ExecutePreConfiguredActions<TOptions>(options?)`. |
+| `Microsoft/Extensions/DependencyInjection/ServiceCollectionOptionsExtensions.cs` | `services.AddAbpOptions<TOptions>()` registering `AbpUnnamedOptionsManager`. |
+| `Microsoft/Extensions/DependencyInjection/ServiceCollectionConfigurationExtensions.cs` | `ReplaceConfiguration`, `GetConfiguration`, `GetConfigurationOrNull`. |
+| `Microsoft/Extensions/DependencyInjection/ServiceCollectionDynamicOptionsManagerExtensions.cs` | `services.AddAbpDynamicOptions<TOptions, TManager>()` replaces `IOptions<TOptions>` and `IOptionsSnapshot<TOptions>` with `TManager`. |
+| `Microsoft/Extensions/Options/OptionsAbpDynamicOptionsManagerExtensions.cs` | `options.SetAsync()` / `SetAsync(name)` on `IOptions<T>` (casts to `AbpDynamicOptionsManager<T>`). |
+| `Microsoft/Extensions/Configuration/ConfigurationHelper.cs` | `BuildConfiguration(AbpConfigurationBuilderOptions, Action<IConfigurationBuilder>)`. |
+| `Microsoft/Extensions/Configuration/AbpConfigurationBuilderOptions.cs` | Knobs for the above: `FileName` (default `appsettings`), `EnvironmentName`, `BasePath`, `UserSecretsAssembly`/`UserSecretsId`, `EnvironmentVariablesPrefix`, `CommandLineArgs`, `Optional`, `ReloadOnChange`. |
+| `Microsoft/Extensions/Configuration/AbpConfigurationExtensions.cs` | `AddAppSettingsSecretsJson(path = AppSettingsSecretJsonPath)`. |
+
+## Key abstractions
+
+| Class / interface | File | What it does | Who calls it |
+| --- | --- | --- | --- |
+| `AbpOptionsFactory<TOptions>` | `AbpOptionsFactory.cs` | Like BCL `OptionsFactory<T>`, but snapshots the configure/post-configure/validate enumerables into arrays at construction time. Methods `Create(name)`, `ConfigureOptions`, `PostConfigureOptions`, `ValidateOptions`, `CreateInstance(name)` are all `virtual`. | Manually registered when the BCL factory is unsuitable. |
+| `AbpDynamicOptionsManager<TOptions>` | `AbpDynamicOptionsManager.cs` | Subclass of `OptionsManager<T>`. `SetAsync()` calls `OverrideOptionsAsync(name, base.Get(name))`, then the cache is replaced. Implementations override `OverrideOptionsAsync` to fetch fresh values (e.g. from the database for `ISettingProvider`). | `services.AddAbpDynamicOptions<T, TMgr>()` |
+| `AbpUnnamedOptionsManager<TOptions>` | `AbpUnnamedOptionsManager.cs` | Lock-free `IOptions<T>`. Class doc says *"…similar to Microsoft UnnamedOptionsManager but without the locking mechanism. Prevent deadlocks when accessing options in multiple threads."* | Wired by `services.AddAbpOptions<T>()`. |
+| `PreConfigureActionList<TOptions>` | `PreConfigureActionList.cs` | A list of `Action<TOptions>` plus `Configure(options)` (apply to existing) and `Configure()` (create a fresh one). | `ServiceCollectionPreConfigureExtensions` |
+| `AbpModule.Configure<TOptions>` / `PreConfigure<TOptions>` / `PostConfigure<TOptions>` / `PostConfigureAll<TOptions>` | `Volo/Abp/Modularity/AbpModule.cs` | Thin wrappers around `ServiceConfigurationContext.Services.{Configure,PreConfigure,PostConfigure,PostConfigureAll}<TOptions>`. | Every module |
+| `services.PreConfigure<TOptions>(Action<TOptions>)` | `ServiceCollectionPreConfigureExtensions.cs` | Looks up the singleton `IObjectAccessor<PreConfigureActionList<TOptions>>` via `GetSingletonInstanceOrNull`; if missing, creates a new list and registers it via `services.AddObjectAccessor(actionList)`. Appends the action. | Modules that need to influence options *before* `Configure<T>` runs |
+| `services.ExecutePreConfiguredActions<TOptions>(options?)` | `ServiceCollectionPreConfigureExtensions.cs` | Invokes every pre-configure action against an existing `TOptions` or a newly created one. | Modules that build options at startup (e.g. before AspNetCore wiring) |
+| `services.AddAbpOptions<TOptions>()` | `ServiceCollectionOptionsExtensions.cs` | `TryAddSingleton<IOptions<TOptions>, AbpUnnamedOptionsManager<TOptions>>()` then `AddOptions<TOptions>()`. The doc-comment warns: *"You should only use this method to register options if you need to continue using the ServiceProvider to get other options in your Options configuration method."* | Niche cases |
+| `services.AddAbpDynamicOptions<TOptions, TManager>()` | `ServiceCollectionDynamicOptionsManagerExtensions.cs` | `services.Replace(ServiceDescriptor.Scoped<IOptions<TOptions>, TManager>())` and the same for `IOptionsSnapshot<TOptions>`. | Modules with database-backed options (Settings, Features, etc.) |
+| `options.SetAsync()` | `OptionsAbpDynamicOptionsManagerExtensions.cs` | Casts `IOptions<T>` to `AbpDynamicOptionsManager<T>` and calls `SetAsync()`. Throws `AbpException($"Options must be derived from the {nameof(AbpDynamicOptionsManager)}!")` if the cast fails. | Long-running services that need to refresh options |
+| `services.GetConfiguration()` / `GetConfigurationOrNull()` | `ServiceCollectionConfigurationExtensions.cs` | Tries `HostBuilderContext.Configuration` first, falls back to a singleton-registered `IConfiguration`. `GetConfiguration` throws `AbpException` if both are missing. | Modules during `ConfigureServices` |
+| `services.ReplaceConfiguration(IConfiguration)` | `ServiceCollectionConfigurationExtensions.cs` | `services.Replace(ServiceDescriptor.Singleton<IConfiguration>(configuration))`. | `InternalServiceCollectionExtensions.AddCoreAbpServices` |
+| `ConfigurationHelper.BuildConfiguration` | `ConfigurationHelper.cs` | Builds an `IConfigurationRoot` from `BasePath` + `FileName.json` + `FileName.secrets.json` + `FileName.{EnvironmentName}.json` + user secrets (in Development only) + env vars + command-line args. | `AbpApplicationBase.AddCoreAbpServices` when no `IConfiguration` is already registered |
+| `AbpConfigurationBuilderOptions` | `AbpConfigurationBuilderOptions.cs` | Holds the knobs: `FileName` default `appsettings`, `Optional` default true, `ReloadOnChange` default true, `EnvironmentName`, `BasePath`, `UserSecretsId`/`UserSecretsAssembly`, `EnvironmentVariablesPrefix`, `CommandLineArgs`. | Same |
+
+## Configure-phase data flow
+
+```mermaid
+flowchart TB
+    pre[Module A.PreConfigureServices<br/>services.PreConfigure&lt;FooOptions&gt;(o =&gt; o.X = 1)] --> store[PreConfigureActionList&lt;FooOptions&gt;<br/>stored as ObjectAccessor singleton]
+    store --> later[Module B.ConfigureServices<br/>reads via services.ExecutePreConfiguredActions]
+    later --> apply[FooOptions instance has X=1]
+    apply --> cfg[Module B.Configure&lt;FooOptions&gt;(o =&gt; o.Y = 2)]
+    cfg --> reg[services.Configure&lt;FooOptions&gt;<br/>standard BCL flow]
+    reg --> post[Module C.PostConfigure&lt;FooOptions&gt;<br/>via PostConfigure&lt;TOptions&gt;]
+    post --> final[Final TOptions resolved from container]
+```
+
+The pre-configure list is **not** a `IConfigureOptions<TOptions>` registration. It is a separate per-type bag stored as an `IObjectAccessor<PreConfigureActionList<TOptions>>` singleton, retrieved at materialisation time. That is why modules that build options out-of-band (e.g. before `AddMvc` reads them) call `services.ExecutePreConfiguredActions<TOptions>()` themselves and feed the result into the framework's API.
+
+## Module-level shortcuts
+
+`AbpModule` exposes:
+
+```csharp
+protected void Configure<TOptions>(Action<TOptions>)               where TOptions : class;
+protected void Configure<TOptions>(string name, Action<TOptions>)  where TOptions : class;
+protected void Configure<TOptions>(IConfiguration)                 where TOptions : class;
+protected void Configure<TOptions>(IConfiguration, Action<BinderOptions>) where TOptions : class;
+protected void Configure<TOptions>(string name, IConfiguration)    where TOptions : class;
+protected void PreConfigure<TOptions>(Action<TOptions>)            where TOptions : class;
+protected void PostConfigure<TOptions>(Action<TOptions>)           where TOptions : class;
+protected void PostConfigureAll<TOptions>(Action<TOptions>)        where TOptions : class;
+```
+
+These are defined in `framework/src/Volo.Abp.Core/Volo/Abp/Modularity/AbpModule.cs` and all delegate to `ServiceConfigurationContext.Services.{Configure,PreConfigure,PostConfigure,PostConfigureAll}<TOptions>`. The named variants and the `IConfiguration` overloads exist because the BCL `Configure<T>(IConfiguration)` overload is in a separate package (`Microsoft.Extensions.Options.ConfigurationExtensions`) that `Volo.Abp.Core` already references.
+
+## Accessing IConfiguration
+
+```mermaid
+sequenceDiagram
+    participant Mod as AbpModule
+    participant Ctx as ServiceConfigurationContext
+    participant Svc as IServiceCollection
+    participant Host as HostBuilderContext
+    participant Self as Singleton IConfiguration
+
+    Mod->>Ctx: ctx.Configuration
+    Ctx->>Svc: services.GetConfiguration()
+    Svc->>Host: GetSingletonInstanceOrNull&lt;HostBuilderContext&gt;()
+    alt host configuration present
+        Host-->>Svc: HostBuilderContext.Configuration
+    else
+        Svc->>Self: GetSingletonInstanceOrNull&lt;IConfiguration&gt;()
+        Self-->>Svc: configuration or null
+    end
+    Svc-->>Ctx: IConfiguration or throw AbpException
+    Ctx-->>Mod: IConfiguration
+```
+
+The lazy field `_configuration` in `ServiceConfigurationContext` (`Volo/Abp/Modularity/ServiceConfigurationContext.cs`) caches the result so subsequent accesses inside the same module instance don't re-walk the service collection.
+
+## ConfigurationHelper.BuildConfiguration
+
+This is the function the framework uses when no `IConfiguration` was registered before `AbpApplicationBase` ran. Source: `Microsoft/Extensions/Configuration/ConfigurationHelper.cs`.
+
+Build pipeline:
+
+<Steps>
+  <Step title="Default options">
+    If the caller did not provide `AbpConfigurationBuilderOptions`, an empty one is created. If `BasePath` is empty, it is set to `Directory.GetCurrentDirectory()`.
+  </Step>
+  <Step title="JSON files">
+    `appsettings.json` (or `{FileName}.json`) — `optional: options.Optional`, `reloadOnChange: options.ReloadOnChange`. Then `appsettings.secrets.json` is always loaded with `optional: true`. Then, if `EnvironmentName` is non-empty, `appsettings.{EnvironmentName}.json` with `optional: true`.
+  </Step>
+  <Step title="User secrets — Development only">
+    If `EnvironmentName == "Development"` and either `UserSecretsId` or `UserSecretsAssembly` is set, the matching user-secrets store is added.
+  </Step>
+  <Step title="Environment variables">
+    Added with the optional `EnvironmentVariablesPrefix`.
+  </Step>
+  <Step title="Command line">
+    Added if `CommandLineArgs` is non-null.
+  </Step>
+  <Step title="Customise">
+    The optional `builderAction` callback runs last so callers can append providers (e.g. Azure Key Vault).
+  </Step>
+</Steps>
+
+`AbpConfigurationExtensions.AddAppSettingsSecretsJson` is a one-liner extension that adds `appsettings.secrets.json` to an arbitrary `IConfigurationBuilder` for callers that build their own.
+
+## Dynamic options pattern
+
+```mermaid
+sequenceDiagram
+    participant Code as Application code
+    participant Opts as IOptions&lt;SettingOptions&gt;
+    participant Mgr as MySettingOptionsManager : AbpDynamicOptionsManager&lt;SettingOptions&gt;
+    participant Db as Backing store
+
+    Code->>Mgr: options.SetAsync()
+    Mgr->>Mgr: base.Get(Options.DefaultName)
+    Mgr->>Db: OverrideOptionsAsync(name, current)
+    Db-->>Mgr: fresh values applied to current
+    Mgr-->>Code: Task complete
+    Code->>Opts: options.Value
+    Opts-->>Code: updated SettingOptions
+```
+
+`services.AddAbpDynamicOptions<TOptions, TManager>()` replaces *both* `IOptions<TOptions>` and `IOptionsSnapshot<TOptions>` with `TManager` registered as `Scoped`. That is why the cast inside `OptionsAbpDynamicOptionsManagerExtensions.ToDynamicOptions<T>` succeeds: the runtime instance is your manager. If a caller forgets to register the dynamic manager, `options.SetAsync()` throws `AbpException("Options must be derived from the AbpDynamicOptionsManager`1...")`.
+
+## AbpOptionsFactory vs BCL OptionsFactory
+
+`AbpOptionsFactory<TOptions>` (`Volo/Abp/Options/AbpOptionsFactory.cs`) carries a comment that says:
+
+> `//TODO: Derive from OptionsFactory when this is released: https://github.com/aspnet/Options/pull/258 (or completely remove this!)`
+
+The reason it exists is that until that BCL PR shipped, `OptionsFactory<T>` was sealed and its constructor enumerables were stored directly (not arrayed). `AbpOptionsFactory` materialises the `IConfigureOptions<TOptions>`, `IPostConfigureOptions<TOptions>`, and `IValidateOptions<TOptions>` collections into arrays at construction time so subsequent `Create(name)` calls are allocation-free. The class is mostly there as a base for subclasses (e.g. `AbpUnnamedOptionsManager` indirectly through `IOptions<TOptions>`).
+
+The `Create(name)` method runs:
+
+1. `CreateInstance(name)` — by default `Activator.CreateInstance<TOptions>()`.
+2. `ConfigureOptions(name, options)` — applies each `IConfigureOptions<TOptions>` or `IConfigureNamedOptions<TOptions>`.
+3. `PostConfigureOptions(name, options)` — applies each `IPostConfigureOptions<TOptions>`.
+4. `ValidateOptions(name, options)` — accumulates failures across all `IValidateOptions<TOptions>` and throws a single `OptionsValidationException(name, typeof(TOptions), failures)`.
+
+## Connections
+
+**Depends on:**
+
+- `Volo/Abp/DependencyInjection/` — `IObjectAccessor<T>` and `services.AddObjectAccessor`.
+- `Microsoft.Extensions.Options`, `Microsoft.Extensions.Options.ConfigurationExtensions`, `Microsoft.Extensions.Configuration.*`, `Microsoft.Extensions.Hosting.Abstractions`.
+
+**Depended on by:**
+
+- `AbpModule` shortcuts.
+- `Volo.Abp.Settings`, `Volo.Abp.Features`, `Volo.Abp.PermissionManagement` (use `AbpDynamicOptionsManager`).
+- Every framework module that calls `Configure<TOptions>` in `ConfigureServices`.
+
+## Gotchas & invariants
+
+<Warning>
+`services.PreConfigure<T>` does **not** register an `IConfigureOptions<T>`. It stores the action in a per-type singleton list. Code that wants to honor pre-configures must explicitly call `services.ExecutePreConfiguredActions<T>()`, or rely on a downstream `Configure<T>` that uses the resulting `T`. Forgetting this is the most common cause of "my `PreConfigure` doesn't run".
+</Warning>
+
+- **`AbpUnnamedOptionsManager` is non-thread-safe by design.** The class caches `_value` without a lock. The trade-off is documented: "Prevent deadlocks when accessing options in multiple threads." First write wins; subsequent reads see the cached value. Use it only when configuration values do not change after first read.
+- **`ConfigurationHelper.BuildConfiguration` only loads user secrets when `EnvironmentName == "Development"`.** Comparison is case-sensitive — see `ConfigurationHelper.cs`. Setting `ASPNETCORE_ENVIRONMENT=development` (lowercase) silently skips secrets.
+- **`appsettings.secrets.json` is *always* added with `optional: true`.** Even if the rest of the configuration files are required. This is the file name `AbpConfigurationExtensions.AddAppSettingsSecretsJson` defaults to (via `AbpHostingHostBuilderExtensions.AppSettingsSecretJsonPath`).
+- **`AddAbpDynamicOptions` registers as `Scoped`.** Long-running singletons that capture the manager will hold a stale snapshot. The intended consumers are scoped services (web requests, EF Core operations, background unit-of-work scopes).
+- **`AbpModule.Configure<TOptions>(IConfiguration)` uses the standard BCL binding.** Property names must match (case-insensitive). No type conversion magic beyond what `Microsoft.Extensions.Configuration.Binder` provides.
+- **`GetConfiguration()` throws if absent.** `GetConfigurationOrNull()` is the safe variant. A common Init-time pattern is to call `GetConfigurationOrNull()` to detect the host builder is wiring `IConfiguration` lazily.
+- **`PostConfigureAll<TOptions>` runs against every named instance.** If you have multiple JWT bearer schemes or multiple `OpenIdConnectOptions` instances, `PostConfigureAll<JwtBearerOptions>(o => …)` mutates *all* of them.
+- **`PreConfigureActionList<TOptions>` is invoked manually via `ExecutePreConfiguredActions`.** Most modules call it inside `ConfigureServices` against an instance they then pass to an external API (e.g. AspNetCore's `AddJwtBearer`). The framework does not run pre-configure actions automatically when `IOptions<TOptions>` is resolved from the container.
+
+## Worked example
+
+A typical module configures an option via the configuration root:
+
+```csharp
+public class MyAppModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext ctx)
+    {
+        var config = ctx.Services.GetConfiguration();
+        Configure<MyOptions>(config.GetSection("My"));    // bind from JSON
+        PreConfigure<JwtBearerOptions>(o =>               // before MVC consumes it
+        {
+            o.Authority = config["Auth:Authority"];
+        });
+        PostConfigure<MyOptions>(o =>                     // last word
+        {
+            o.Validate();
+        });
+    }
+}
+```
+
+Inside the module, `ctx.Configuration` is equivalent to `ctx.Services.GetConfiguration()` — both go through the same code path.
+
+## Related pages
+
+<CardGroup cols={2}>
+  <Card title="Modularity" icon="layer-group" href="/core/modularity">
+    Where `ServiceConfigurationContext` lives.
+  </Card>
+  <Card title="Dependency Injection" icon="plug" href="/core/dependency-injection">
+    `IObjectAccessor<T>` powers `PreConfigureActionList` storage.
+  </Card>
+  <Card title="Reflection & Internal" icon="microscope" href="/core/reflection-and-internal">
+    `InternalServiceCollectionExtensions` builds the default configuration on demand.
+  </Card>
+  <Card title="Exception Handling" icon="triangle-exclamation" href="/core/exception-handling">
+    `OptionsValidationException` and `AbpException` from `GetConfiguration`.
+  </Card>
+</CardGroup>

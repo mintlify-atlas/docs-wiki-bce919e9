@@ -1,0 +1,232 @@
+---
+title: "SkiaSharp Provider for ABP Framework Image Resizing"
+sidebarTitle: "SkiaSharp"
+description: "Fast native image resize in ABP Framework with SkiaSharp: AbpImagingSkiaSharpModule, SkiaSharpImageResizerContributor and SkiaSharpResizerOptions tuning."
+---
+
+The ABP Framework `Volo.Abp.Imaging.SkiaSharp` package wraps Google's [SkiaSharp](https://github.com/mono/SkiaSharp) bindings so the `IImageResizer` coordinator gains a native, very fast resize path on JPEG, PNG and WebP. The package only ships **resize** capability — there is no Skia-based `IImageCompressorContributor`. Pair it with `Volo.Abp.Imaging.ImageSharp` or `Volo.Abp.Imaging.MagickNet` if you need compression as well.
+
+## Package layout
+
+Three files under `framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/`:
+
+| File | Purpose |
+| --- | --- |
+| `AbpImagingSkiaSharpModule.cs` | Module class, depends on `AbpImagingAbstractionsModule` |
+| `SkiaSharpImageResizerContributor.cs` | The `IImageResizerContributor` implementation |
+| `SkiaSharpResizerOptions.cs` | `SKSamplingOptions` plus output `Quality` (0–100) |
+
+## AbpImagingSkiaSharpModule
+
+```csharp
+[DependsOn(typeof(AbpImagingAbstractionsModule))]
+public class AbpImagingSkiaSharpModule : AbpModule
+{
+}
+```
+
+(`framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/AbpImagingSkiaSharpModule.cs`)
+
+No `ConfigureServices` body — the contributor is registered via `[ITransientDependency]`. Depend on the module from your application and the resize chain picks up the Skia contributor automatically.
+
+## SkiaSharpResizerOptions
+
+```csharp
+public class SkiaSharpResizerOptions
+{
+    public SKSamplingOptions SKSamplingOptions { get; set; }
+    public int               Quality           { get; set; }
+
+    public SkiaSharpResizerOptions()
+    {
+        SKSamplingOptions = SKSamplingOptions.Default;
+        Quality           = 75;
+    }
+}
+```
+
+(`framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/SkiaSharpResizerOptions.cs`)
+
+- `SKSamplingOptions` — the new sampling abstraction from SkiaSharp 3.x. Replaces the old `SKBitmapResizeMethod` enum. Defaults to `SKSamplingOptions.Default`, which is bilinear with no mipmaps — fast and good enough for thumbnails.
+- `Quality` — output quality (0–100). Passed to `SKImage.Encode(format, quality)` so it has effect on JPEG (lossy) and WebP (when not in lossless mode). PNG ignores it.
+
+Use higher-fidelity sampling for hero images:
+
+```csharp
+Configure<SkiaSharpResizerOptions>(o =>
+{
+    o.SKSamplingOptions = new SKSamplingOptions(SKCubicResampler.Mitchell);
+    o.Quality = 90;
+});
+```
+
+`SKCubicResampler.Mitchell` is the standard "Mitchell-Netravali" cubic — better than bilinear but a bit slower. `SKCubicResampler.CatmullRom` is sharper. Use `SKSamplingOptions.Default` for the lowest CPU.
+
+## SkiaSharpImageResizerContributor
+
+The contributor file is at `framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/SkiaSharpImageResizerContributor.cs`. It is `[ITransientDependency]` and implements `IImageResizerContributor`. Notice the order of the two overloads: the `byte[]` one delegates to the `Stream` one (the inverse of what ImageSharp does).
+
+### Supported formats
+
+```csharp
+protected virtual bool CanResize(string? mimeType) => mimeType switch
+{
+    MimeTypes.Image.Jpeg => true,
+    MimeTypes.Image.Png  => true,
+    MimeTypes.Image.Webp => true,
+    _ => false
+};
+```
+
+GIF, BMP and TIFF return `Unsupported` — fall back to another provider for those.
+
+### Two-stream decoding trick
+
+Skia needs to decode the image twice — once to a `SKBitmap` (so the pixel buffer can be resized in place), once to a `SKCodec` (so the original encoded format can be queried for the output encoder). Because a `Stream` can only be read once if it is not seekable, the contributor copies the input into two independent `MemoryStream`s:
+
+```csharp
+protected virtual async Task<(MemoryStream, MemoryStream)> CreateMemoryStream(Stream stream)
+{
+    var streamPosition = stream.Position;
+
+    var memoryBitmapStream  = new MemoryStream();
+    var memorySkCodecStream = new MemoryStream();
+
+    await stream.CopyToAsync(memoryBitmapStream);
+    stream.Position = streamPosition;
+    await stream.CopyToAsync(memorySkCodecStream);
+    stream.Position = streamPosition;
+
+    memoryBitmapStream.Position  = 0;
+    memorySkCodecStream.Position = 0;
+
+    return (memoryBitmapStream, memorySkCodecStream);
+}
+```
+
+The position is restored to its initial value so the higher-level coordinator can still `SeekToBegin` the original stream for the next contributor in the chain.
+
+### Resize execution
+
+```csharp
+using var original = SKBitmap.Decode(memoryBitmapStream);
+using var resized  = original.Resize(
+    new SKImageInfo((int)resizeArgs.Width, (int)resizeArgs.Height),
+    Options.SKSamplingOptions);
+using var image    = SKImage.FromBitmap(resized);
+using var codec    = SKCodec.Create(memorySkCodecStream);
+
+var memoryStream = new MemoryStream();
+using var skData = image.Encode(codec.EncodedFormat, Options.Quality);
+skData.SaveTo(memoryStream);
+return new ImageResizeResult<Stream>(memoryStream, ImageProcessState.Done);
+```
+
+Step by step:
+
+1. `SKBitmap.Decode` — decompresses into a pixel buffer.
+2. `original.Resize` — generates a new bitmap at the target `SKImageInfo` using `SKSamplingOptions`.
+3. `SKImage.FromBitmap` — wraps the resized bitmap.
+4. `SKCodec.Create` — opens the codec from the second copy so `codec.EncodedFormat` returns the original format (`SKEncodedImageFormat.Jpeg`, `Png` or `Webp`).
+5. `image.Encode(format, quality)` — re-encodes; produces an `SKData` blob.
+6. `skData.SaveTo` — writes the bytes to a `MemoryStream` returned as `Result`.
+
+### Ignoring `ImageResizeMode`
+
+Unlike the ImageSharp and Magick.NET contributors, `SkiaSharpImageResizerContributor` does **not** consult `ImageResizeArgs.Mode`. It calls `SKBitmap.Resize(SKImageInfo, …)` directly with the exact width/height — which behaves like `ImageResizeMode.Stretch` (no aspect-ratio preservation).
+
+If you need crop / box-pad / min / max behavior with SkiaSharp, you can override `TryResizeAsync` in a subclass or simply pre-compute the target `(width, height)` before calling `IImageResizer.ResizeAsync`, e.g. by computing aspect-ratio-preserving dimensions on the caller side.
+
+<Warning>
+Passing `Width = 0` or `Height = 0` to the SkiaSharp contributor creates an `SKImageInfo` with a zero dimension and the resize call will throw. Always provide both dimensions, or guard your caller code.
+</Warning>
+
+## Pipeline visualized
+
+```mermaid
+flowchart LR
+    A[Stream / byte[] in] --> B{CanResize?<br/>(mimeType)}
+    B -->|no| Z[Unsupported -> original]
+    B -->|yes / unknown| C[CreateMemoryStream<br/>two copies]
+    C --> D[SKBitmap.Decode]
+    C --> E[SKCodec.Create]
+    D --> F[original.Resize(<br/>SKImageInfo, SKSamplingOptions)]
+    F --> G[SKImage.FromBitmap]
+    G --> H[image.Encode(<br/>codec.EncodedFormat, Quality)]
+    E -.format.-> H
+    H --> I[SKData.SaveTo MemoryStream]
+    I --> J[Done -> new stream]
+```
+
+## Setup recipe
+
+```csharp
+[DependsOn(typeof(AbpImagingSkiaSharpModule))]
+public class MyImagingModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext ctx)
+    {
+        Configure<SkiaSharpResizerOptions>(o =>
+        {
+            o.SKSamplingOptions = new SKSamplingOptions(SKCubicResampler.Mitchell);
+            o.Quality = 85;
+        });
+
+        // Optionally combine with ImageSharp compression
+    }
+}
+```
+
+### Calling the resizer
+
+```csharp
+public class ThumbnailService : ITransientDependency
+{
+    private readonly IImageResizer _resizer;
+    public ThumbnailService(IImageResizer resizer) => _resizer = resizer;
+
+    public async Task<byte[]> CreateThumbnailAsync(byte[] source)
+    {
+        var result = await _resizer.ResizeAsync(
+            source,
+            new ImageResizeArgs(width: 256, height: 256),
+            MimeTypes.Image.Jpeg);
+
+        return result.State == ImageProcessState.Done ? result.Result : source;
+    }
+}
+```
+
+The coordinator dispatches to the SkiaSharp contributor first (assuming SkiaSharp is the last registered); the file lands as a 256×256 JPEG encoded at `Quality = 85` (or whatever you configured).
+
+## Stacking SkiaSharp with ImageSharp
+
+A common production setup uses SkiaSharp for resizing (faster) and ImageSharp for compression (the SkiaSharp module has no compressor). Reference both modules:
+
+```csharp
+[DependsOn(
+    typeof(AbpImagingSkiaSharpModule),
+    typeof(AbpImagingImageSharpModule)
+)]
+public class MyImagingModule : AbpModule { }
+```
+
+The `ImageResizer` coordinator picks the first contributor whose `TryResizeAsync` returns a non-`Unsupported` state — `SkiaSharpImageResizerContributor` typically wins for JPEG/PNG/WebP; `ImageSharpImageResizerContributor` handles GIF/BMP/TIFF. The `ImageCompressor` only has the ImageSharp contributor registered, so JPEG/PNG/WebP get compressed and GIF/BMP/TIFF pass through unchanged.
+
+## Native dependencies
+
+SkiaSharp ships native libraries per runtime ID. The provider relies on `SkiaSharp.NativeAssets.Linux`, `SkiaSharp.NativeAssets.Win32`, etc., being pulled in by the consuming application. Container images need the right glibc / Alpine variant — confirm by running `nm` against `libSkiaSharp.so` if you hit `DllNotFoundException` at startup.
+
+## Performance notes
+
+- The two-stream copy doubles the input's RAM footprint while decoding. For a 5 MB JPEG this is negligible; for a 100 MB camera RAW it is not. Consider pre-cropping or chunked decoding for huge inputs.
+- `SKBitmap.Resize` is single-threaded but uses native code; it is several times faster than ImageSharp's `Mutate(x => x.Resize(...))` for the same input.
+- Use `SKSamplingOptions.Default` for thumbnails and `SKCubicResampler.Mitchell` for hero images; `SKCubicResampler.CatmullRom` produces sharper edges at the cost of mild ringing.
+
+## Reference
+
+| Type | File |
+| --- | --- |
+| `AbpImagingSkiaSharpModule` | `framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/AbpImagingSkiaSharpModule.cs` |
+| `SkiaSharpImageResizerContributor` | `framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/SkiaSharpImageResizerContributor.cs` |
+| `SkiaSharpResizerOptions` | `framework/src/Volo.Abp.Imaging.SkiaSharp/Volo/Abp/Imaging/SkiaSharpResizerOptions.cs` |

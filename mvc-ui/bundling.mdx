@@ -1,0 +1,453 @@
+---
+title: "ABP Framework Bundling Pipeline for MVC UI Applications"
+sidebarTitle: "Bundling"
+description: "Contributor-based CSS/JS bundling pipeline: AbpBundlingOptions, BundleManager, IBundleContributor and the abp-script and abp-style TagHelpers."
+---
+
+The ABP Framework MVC UI bundling pipeline is a *contributor-based* asset pipeline that replaces the legacy `bundleconfig.json` / WebOptimizer style of asset declaration. It is split across three packages so the same model is reusable from Blazor and other non-MVC hosts:
+
+- `Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions` — pure model classes (`AbpBundlingOptions`, `BundleConfiguration`, `IBundleContributor`, …) plus the `AbpAspNetCoreMvcUiBundlingAbstractionsModule`. No ASP.NET Core dependencies.
+- `Volo.Abp.AspNetCore.Bundling` — generic host-side runtime: `IBundleManager`, `BundleManagerBase`, `BundleCache`, `IBundler`, `IStyleBundler`, `IScriptBundler`.
+- `Volo.Abp.AspNetCore.Mvc.UI.Bundling` — MVC UI-specific concretizations: `BundleManager`, `ScriptBundler`, `StyleBundler`, the `<abp-script>`, `<abp-style>`, `<abp-script-bundle>`, `<abp-style-bundle>` TagHelpers, the `IWebRequestResources` per-request collector, and `AbpAspNetCoreMvcUiBundlingModule` which initializes global static assets.
+
+This page walks each one in turn.
+
+## The model: AbpBundlingOptions
+
+The root configuration type is `AbpBundlingOptions` (`framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/Volo/Abp/AspNetCore/Mvc/UI/Bundling/AbpBundlingOptions.cs`):
+
+```csharp
+public class AbpBundlingOptions
+{
+    public BundleConfigurationCollection StyleBundles { get; }
+    public BundleConfigurationCollection ScriptBundles { get; }
+    public HashSet<string> MinificationIgnoredFiles { get; }
+    public string BundleFolderName { get; } = "__bundles";
+    public BundlingMode Mode { get; set; } = BundlingMode.Auto;
+    public bool DeferScriptsByDefault { get; set; }
+    public List<string> DeferScripts { get; }
+    public bool PreloadStylesByDefault { get; set; }
+    public List<string> PreloadStyles { get; }
+    public AbpBundlingGlobalAssetsOptions GlobalAssets { get; set; }
+    public BundleParameterDictionary Parameters { get; set; }
+}
+```
+
+- `StyleBundles` and `ScriptBundles` are the two named collections every module contributes to.
+- `MinificationIgnoredFiles` is a hash set of file paths to copy verbatim even when minification is on (handy for already-minified vendor libraries that confuse the minifier).
+- `BundleFolderName` is the wwwroot subfolder under which dynamically-generated bundle outputs are placed; default `"__bundles"`.
+- `Mode` is a `BundlingMode` enum.
+- `DeferScriptsByDefault` / `DeferScripts` / `PreloadStylesByDefault` / `PreloadStyles` toggle `<script defer>` and `<link rel="preload">` on the rendered tags.
+- `GlobalAssets` (`AbpBundlingGlobalAssetsOptions`) configures the optional "global combined" CSS/JS that `AbpAspNetCoreMvcUiBundlingModule` writes at startup.
+- `Parameters` is a `BundleParameterDictionary` (a `Dictionary<string, string>` with helper properties like `InteractiveAuto` used by the Blazor InteractiveAuto pipeline).
+
+### BundlingMode
+
+```csharp
+public enum BundlingMode
+{
+    None,              // No bundling, no minification
+    Auto,              // None in dev, BundleAndMinify elsewhere
+    Bundle,            // Bundled, not minified
+    BundleAndMinify    // Bundled and minified
+}
+```
+
+`BundleManager.IsBundlingEnabled()` (`Volo.Abp.AspNetCore.Mvc.UI.Bundling/BundleManager.cs`) interprets `Auto` as `!HostingEnvironment.IsDevelopment()` so local development always serves individual files for easy debugging, while production minifies into one output.
+
+### Global assets options
+
+```csharp
+public class AbpBundlingGlobalAssetsOptions
+{
+    public bool Enabled { get; set; }
+    public string? GlobalStyleBundleName { get; set; }
+    public string? GlobalScriptBundleName { get; set; }
+    public string JavaScriptFileName { get; set; } = "global.js";
+    public string CssFileName { get; set; } = "global.css";
+}
+```
+
+When `Enabled = true`, `AbpAspNetCoreMvcUiBundlingModule.OnApplicationInitializationAsync` runs the named bundles once at startup, concatenates the resulting file contents and pushes them into the `IDynamicFileProvider` as `"/wwwroot/" + CssFileName` and `"/wwwroot/" + JavaScriptFileName`. The host then serves `/global.css` and `/global.js` directly from memory.
+
+## BundleConfiguration and contributors
+
+A single bundle is a `BundleConfiguration` (`BundleConfiguration.cs`):
+
+```csharp
+public class BundleConfiguration
+{
+    public string Name { get; }
+    public BundleContributorCollection Contributors { get; }
+    public List<string> BaseBundles { get; }
+}
+```
+
+`Contributors` is the list of `IBundleContributor` instances or `Type`s that will be invoked when the bundle is requested. `BaseBundles` lets one bundle inherit from one or more other bundles by name — the engine merges contributor lists transitively.
+
+The `BundleConfigurationCollection` (`BundleConfigurationCollection.cs`) supports both *eager* (`Add(name, configureAction)`) and *lazy* (`Configure(name, configureAction)`) configuration. The lazy variant is necessary because many bundles are created at runtime from a `<abp-style-bundle name="myBundle">` TagHelper, after the module's `ConfigureServices` has already finished. `Configure` enqueues an action that is replayed when the named bundle is finally created:
+
+```csharp
+public BundleConfigurationCollection Configure(string bundleName, Action<BundleConfiguration> configureAction)
+{
+    if (_bundles.TryGetValue(bundleName, out var bundle))
+        configureAction.Invoke(bundle);                           // already created → run now
+    else
+    {
+        var actions = _lazyBundleConfigurationActions
+            .GetOrAdd(bundleName, () => new List<Action<BundleConfiguration>>());
+        lock (actions) actions.Add(configureAction);              // queue for later
+    }
+    return this;
+}
+
+public BundleConfigurationCollection ConfigureAll(Action<BundleConfiguration> configureAction) { … }
+```
+
+`ConfigureAll` queues an action against every bundle, eager and lazy alike.
+
+### IBundleContributor
+
+```csharp
+public interface IBundleContributor
+{
+    Task PreConfigureBundleAsync(BundleConfigurationContext context);
+    Task ConfigureBundleAsync(BundleConfigurationContext context);
+    Task PostConfigureBundleAsync(BundleConfigurationContext context);
+    Task ConfigureDynamicResourcesAsync(BundleConfigurationContext context);
+}
+```
+
+`BundleContributor` is the abstract base; each `Async` method delegates to a synchronous protected method (`PreConfigureBundle`, `ConfigureBundle`, `PostConfigureBundle`, `ConfigureDynamicResources`) so the typical contributor only overrides the sync method.
+
+The `ConfigureDynamicResources` step is *per-request* — files added through it are not cached as part of the bundle output. A contributor uses it to inject per-tenant theming, per-culture CSS, or anything else whose URL depends on the current `HttpContext`.
+
+### BundleContext and BundleFile
+
+`BundleConfigurationContext` (`BundleConfigurationContext.cs`) is what contributors receive:
+
+```csharp
+public class BundleConfigurationContext : IBundleConfigurationContext
+{
+    public List<BundleFile> Files { get; }
+    public IFileProvider FileProvider { get; }
+    public IServiceProvider ServiceProvider { get; }
+    public IAbpLazyServiceProvider LazyServiceProvider { get; }
+    public BundleParameterDictionary Parameters { get; set; }
+}
+```
+
+Contributors mutate `Files` directly. The `IFileProvider` is the same composite virtual file provider Razor uses, so contributors can `FileProvider.GetFileInfo("/libs/jquery/jquery.js")` to verify a referenced file actually exists.
+
+`BundleFile` is the file descriptor:
+
+```csharp
+public class BundleFile : IEquatable<BundleFile>, IComparable<BundleFile>
+{
+    public string FileName { get; }
+    public bool IsExternalFile { get; }
+
+    public BundleFile(string fileName)
+    {
+        FileName = fileName;
+        IsExternalFile = fileName.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                      || fileName.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static implicit operator BundleFile(string fileName) => new BundleFile(fileName);
+}
+```
+
+The implicit conversion from `string` means contributors usually just write `context.Files.AddRange(new BundleFile[] { "/libs/abp/x.js", "/libs/abp/y.js" })`. External (HTTP) files bypass the bundler — they end up as `<script src="https://…">` directly.
+
+### Helper extensions
+
+`BundleConfigurationExtensions` (`BundleConfigurationExtensions.cs`) is the fluent surface most consumers use:
+
+```csharp
+options.ScriptBundles
+    .Configure(StandardBundles.Scripts.Global, bundle =>
+    {
+        bundle
+            .AddFiles("/scripts/my-app.js")
+            .AddExternalFiles("https://cdn.example.com/lib.js")
+            .AddContributors(typeof(MyExtraScriptContributor))
+            .AddBaseBundles("AnotherBundle");
+    });
+```
+
+The `AddContributors(params Type[])` overload adds a type that will be resolved from DI when the bundle is materialized — this is the standard way modules register their script/style contributions in `ConfigureServices`. `BundleFileContributor` (`BundleFileContributor.cs`) is a ready-made `BundleContributor` whose only job is to add a fixed file list — used internally by `AddFiles`.
+
+## Materializing a bundle: BundleManager
+
+`IBundleManager` (`framework/src/Volo.Abp.AspNetCore.Bundling/Volo/Abp/AspNetCore/Bundling/IBundleManager.cs`) is the runtime interface:
+
+```csharp
+public interface IBundleManager
+{
+    Task<IReadOnlyList<BundleFile>> GetStyleBundleFilesAsync(string bundleName);
+    Task<IReadOnlyList<BundleFile>> GetScriptBundleFilesAsync(string bundleName);
+}
+```
+
+Its abstract base `BundleManagerBase` (`Volo.Abp.AspNetCore.Bundling/BundleManagerBase.cs`) does the heavy lifting in `GetBundleFilesAsync(BundleConfigurationCollection bundles, string bundleName, IBundler bundler)`:
+
+```csharp
+var contributors = GetContributors(bundles, bundleName);
+var bundleFiles = await GetBundleFilesAsync(contributors);
+var dynamicResources = await GetDynamicResourcesAsync(contributors);
+
+if (!IsBundlingEnabled())
+    return bundleFiles.Union(dynamicResources).ToImmutableList();
+
+// otherwise: split into local segments, run bundler on each, merge with external + dynamic
+```
+
+The MVC concrete subclass — `BundleManager` (`framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling/BundleManager.cs`) — overrides `GetBundleFilesAsync`/`GetDynamicResourcesAsync` to *also* feed every produced `BundleFile` into the request-scoped `IWebRequestResources` collector, so the layout's later `<abp-script>` / `<abp-style>` calls know what is already on the page and avoid duplicates:
+
+```csharp
+protected async override Task<List<BundleFile>> GetBundleFilesAsync(List<IBundleContributor> contributors)
+{
+    return RequestResources.TryAdd(await base.GetBundleFilesAsync(contributors));
+}
+
+public override bool IsBundlingEnabled() => Options.Mode switch
+{
+    BundlingMode.None             => false,
+    BundlingMode.Bundle           => true,
+    BundlingMode.BundleAndMinify  => true,
+    BundlingMode.Auto             => !HostingEnvironment.IsDevelopment(),
+    _ => throw new AbpException($"Unhandled {nameof(BundlingMode)}: {Options.Mode}")
+};
+```
+
+The cache for the produced output is `IBundleCache` / `BundleCache` (`framework/src/Volo.Abp.AspNetCore.Bundling/BundleCache.cs`), a singleton `ConcurrentDictionary<string, BundleCacheItem>` keyed by bundle name.
+
+### IBundler, ScriptBundler, StyleBundler
+
+The actual file-merging is delegated to an `IBundler`:
+
+```csharp
+public interface IBundler
+{
+    string FileExtension { get; }
+    BundleResult Bundle(IBundlerContext context);
+}
+
+public interface IScriptBundler : IBundler { }
+public interface IStyleBundler  : IBundler { }
+```
+
+`ScriptBundler` (`Volo.Abp.AspNetCore.Mvc.UI.Bundling/Scripts/ScriptBundler.cs`) sets `FileExtension => "js"` and uses `IJavascriptMinifier` from `Volo.Abp.Minify`. Each file content is appended with `EnsureEndsWith(';')` and a newline so concatenated minified scripts don't accidentally merge.
+
+`StyleBundler` (`Volo.Abp.AspNetCore.Mvc.UI.Bundling/Styles/StyleBundler.cs`) sets `FileExtension => "css"` and uses `ICssMinifier`. Its `ProcessBeforeAddingToTheBundle` rewrites relative URL references (`url(./fonts/foo.woff)`) using `CssRelativePath.Adjust` so paths still resolve after the bundle file's URL changes.
+
+Both inherit from `MvcUiBundlerBase` (`MvcUiBundlerBase.cs`) which resolves files via `WebHostEnvironment.WebRootFileProvider.GetFileInfo(file)`.
+
+## The TagHelpers
+
+The Razor side of the pipeline is implemented as four TagHelpers under `Volo.Abp.AspNetCore.Mvc.UI.Bundling/TagHelpers/`.
+
+### `<abp-script>` and `<abp-style>`
+
+These add a single file to a (possibly anonymous) bundle from inside Razor:
+
+```csharp
+[HtmlTargetElement("abp-script", TagStructure = TagStructure.NormalOrSelfClosing)]
+public class AbpScriptTagHelper : AbpBundleItemTagHelper<AbpScriptTagHelper, AbpScriptTagHelperService>, IBundleItemTagHelper
+{
+    [HtmlAttributeName("defer")] public bool Defer { get; set; }
+    protected override string GetFileExtension() => "js";
+}
+
+[HtmlTargetElement("abp-style", TagStructure = TagStructure.NormalOrSelfClosing)]
+public class AbpStyleTagHelper  : AbpBundleItemTagHelper<AbpStyleTagHelper, AbpStyleTagHelperService>, IBundleItemTagHelper
+{
+    [HtmlAttributeName("preload")] public bool Preload { get; set; }
+    protected override string GetFileExtension() => "css";
+}
+```
+
+Usage:
+
+```razor
+<abp-script src="/scripts/customer-list.js" defer="true" />
+<abp-style  src="/styles/customer-list.css" preload="true" />
+```
+
+The service implementations (`AbpScriptTagHelperService`, `AbpStyleTagHelperService`) defer to `AbpTagHelperResourceService` to register the file and to `AbpTagHelperScriptService` / `AbpTagHelperStyleService` which finally render `<script>` / `<link>` elements respecting `IWebRequestResources` (so the same script is not emitted twice in one page).
+
+### `<abp-script-bundle>` and `<abp-style-bundle>`
+
+These render an entire bundle by name. The `Global` bundle wired by `AbpAspNetCoreMvcUiThemeSharedModule` is invoked exactly this way from a theme's `_Layout.cshtml`:
+
+```csharp
+[HtmlTargetElement("abp-script-bundle", TagStructure = TagStructure.NormalOrSelfClosing)]
+public class AbpScriptBundleTagHelper : AbpBundleTagHelper<AbpScriptBundleTagHelper, AbpScriptBundleTagHelperService>, IBundleTagHelper
+{
+    [HtmlAttributeName("defer")] public bool Defer { get; set; }
+}
+
+[HtmlTargetElement("abp-style-bundle", TagStructure = TagStructure.NormalOrSelfClosing)]
+public class AbpStyleBundleTagHelper  : AbpBundleTagHelper<AbpStyleBundleTagHelper,  AbpStyleBundleTagHelperService>, IBundleTagHelper
+{
+    [HtmlAttributeName("preload")] public bool Preload { get; set; }
+}
+```
+
+`AbpBundleTagHelper<TTagHelper, TService>` (in `AbpBundleTagHelper.cs`) defines the shared `Name` property:
+
+```csharp
+public abstract class AbpBundleTagHelper<TTagHelper, TService> : AbpTagHelper<TTagHelper, TService>, IBundleTagHelper
+{
+    public string? Name { get; set; }
+    public virtual string? GetNameOrNull() => Name;
+}
+```
+
+Usage in a layout:
+
+```razor
+<head>
+    <abp-style-bundle name="@StandardBundles.Styles.Global" />
+</head>
+<body>
+    @RenderBody()
+    <abp-script-bundle name="@StandardBundles.Scripts.Global" defer="true" />
+</body>
+```
+
+A consumer can also configure the bundle inline:
+
+```razor
+<abp-style-bundle name="Customers.IndexPage">
+    <abp-style src="/styles/customers/index.css" />
+</abp-style-bundle>
+```
+
+When the bundle does not yet exist, `AbpBundleTagHelperService` calls `Options.StyleBundles.TryAdd(name)` to create it lazily — that is why `BundleConfigurationCollection.Configure` had to support deferred configuration.
+
+## End-to-end flow
+
+```mermaid
+sequenceDiagram
+    participant Layout as _Layout.cshtml
+    participant ScriptTag as &lt;abp-script-bundle name=&quot;Global&quot;/&gt;
+    participant Service as AbpScriptBundleTagHelperService
+    participant Mgr as BundleManager
+    participant Cache as IBundleCache
+    participant Bundler as ScriptBundler
+    participant Min as IJavascriptMinifier
+    participant FS as IDynamicFileProvider
+    participant Browser
+
+    Layout->>ScriptTag: render
+    ScriptTag->>Service: ProcessAsync(ctx, out)
+    Service->>Mgr: GetScriptBundleFilesAsync("Global")
+    Mgr->>Mgr: GetContributors(Options.ScriptBundles, "Global")
+    Mgr->>Mgr: foreach Contributor.ConfigureBundleAsync(ctx)
+    alt Bundling enabled
+        Mgr->>Cache: GetOrAdd("Global", factory)
+        Cache->>Bundler: Bundle(ctx)
+        Bundler->>Bundler: concat + ProcessBeforeAddingToTheBundle
+        Bundler->>Min: Minify(...) (if BundleAndMinify)
+        Bundler-->>Cache: BundleResult
+        Cache->>FS: add /wwwroot/__bundles/Global.js
+        Mgr-->>Service: list of one BundleFile
+    else Bundling disabled
+        Mgr-->>Service: each individual BundleFile
+    end
+    Service->>Service: render <script src=...> per file
+    Service-->>Browser: HTML
+```
+
+## IWebRequestResources
+
+`IWebRequestResources` (`framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling/Resources/IWebRequestResources.cs`) is the request-scoped collector that prevents duplicate `<script>` and `<link>` tags when a single layout invokes multiple bundles that share dependencies (every theme's `Global` bundle plus a feature-specific bundle that also depends on jQuery):
+
+```csharp
+public interface IWebRequestResources
+{
+    List<BundleFile> TryAdd(List<BundleFile> resources);
+}
+```
+
+`WebRequestResources` (concrete implementation) maintains an in-request set; `BundleManager.GetBundleFilesAsync` filters every returned list through it so already-emitted files do not appear twice in the rendered HTML.
+
+## Static "global" assets at startup
+
+`AbpAspNetCoreMvcUiBundlingModule.OnApplicationInitializationAsync` (`Volo.Abp.AspNetCore.Mvc.UI.Bundling/AbpAspNetCoreMvcUiBundlingModule.cs`) iterates `bundlingOptions.GlobalAssets`, runs `BundleManager.GetStyleBundleFilesAsync(GlobalStyleBundleName)` / `GetScriptBundleFilesAsync(GlobalScriptBundleName)`, reads each resulting file via `WebHostEnvironment.WebRootFileProvider`, concatenates them with `CssRelativePath.Adjust` (in dev mode only — production output is already adjusted by the bundler), and finally calls:
+
+```csharp
+dynamicFileProvider.AddOrUpdate(new InMemoryFileInfo(
+    "/wwwroot/" + bundlingOptions.GlobalAssets.CssFileName,
+    Encoding.UTF8.GetBytes(styles),
+    bundlingOptions.GlobalAssets.CssFileName));
+```
+
+The same module also enables `AbpMvcLibsOptions.CheckLibs = true` outside data-migration environments to verify `npm`-installed libraries are present at startup, plus prepends an `IWebContentFileProvider` to `WebRootFileProvider` to serve assets out of embedded files when the physical wwwroot is missing.
+
+The module dependency chain is:
+
+```csharp
+[DependsOn(
+    typeof(AbpAspNetCoreMvcUiBootstrapModule),
+    typeof(AbpAspNetCoreBundlingModule)
+)]
+public class AbpAspNetCoreMvcUiBundlingModule : AbpModule
+```
+
+with `AbpAspNetCoreBundlingModule` itself declaring `[DependsOn(typeof(AbpAspNetCoreMvcUiBundlingAbstractionsModule), typeof(AbpMinifyModule), typeof(AbpVirtualFileSystemModule))]`. Minification (`Volo.Abp.Minify`) supplies `IJavascriptMinifier`, `ICssMinifier` and the `IMinifier` abstraction.
+
+## Worked example: contributing to the Global bundle
+
+```csharp
+public class MyExtraScriptContributor : BundleContributor
+{
+    public override void ConfigureBundle(BundleConfigurationContext context)
+    {
+        context.Files.AddIfNotContains(
+            x => x.FileName == "/scripts/my-extra.js",
+            () => new BundleFile("/scripts/my-extra.js"));
+    }
+}
+
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpBundlingOptions>(options =>
+    {
+        options.ScriptBundles
+            .Configure(StandardBundles.Scripts.Global, bundle =>
+                bundle.AddContributors(typeof(MyExtraScriptContributor)));
+    });
+}
+```
+
+The contributor will be invoked the first time any page asks for the `Global` script bundle. In development its file is rendered as a standalone `<script src="/scripts/my-extra.js">`. In production `ScriptBundler` merges it with the rest of the `Global` bundle's contents, minifies the result with `IJavascriptMinifier`, and writes it under `/wwwroot/__bundles/Global.js` through `IDynamicFileProvider`.
+
+## Minification
+
+The minification path is driven by `IMinifier` from `Volo.Abp.Minify` (via `IJavascriptMinifier` / `ICssMinifier`). `BundleManagerBase.IsMinificationEnabled()` is overridden by `BundleManager.IsMinficationEnabled()` to read `Options.Mode == BundleAndMinify` (with `Auto` again falling back to non-development). A `MinifierType` enum lives in `Volo.Abp.Minify` and is the place to plug NUglify / WebMarkupMin / a custom minifier implementation.
+
+`AbpBundlingOptions.MinificationIgnoredFiles` is consulted by the bundler before minification — a file whose path matches is appended verbatim. The default contributors stuff already-minified vendor libs (jQuery's `jquery.min.js` etc.) into that set.
+
+## How extensions and overrides happen
+
+`AbpBundleContributorOptions` (`AbpBundleContributorOptions.cs`) is a parallel options object that lets *other contributors* extend a given contributor's output without touching the original module:
+
+```csharp
+public class AbpBundleContributorOptions
+{
+    public ConcurrentDictionary<Type, BundleContributorCollection> AllExtensions { get; }
+    public BundleContributorCollection Extensions<TContributor>() { … }
+    public BundleContributorCollection Extensions(Type contributorType) { … }
+}
+```
+
+A theme can do `options.Extensions<JQueryScriptContributor>().Add<MyJQueryPluginContributor>()` and `BundleManagerBase.GetContributors` will splice the extension contributors into the configuration list right after the base contributor runs. This is what every concrete theme uses to add per-theme tweaks to a vendor package's output.
+
+## Where to read next
+
+- The Theme Shared page shows the actual two `Global` contributors (`SharedThemeGlobalStyleContributor` and `SharedThemeGlobalScriptContributor`) that make up every ABP theme's default bundles.
+- The Widgets page covers how `WidgetResourcesViewModel`, `WidgetScriptsViewComponent` and `WidgetStylesViewComponent` push per-widget resources through the same bundling pipeline.
+- The Blazor bundling page shows how the same abstractions package is reused on the Blazor side via `Volo.Abp.AspNetCore.Components.WebAssembly.Theming.Bundling` and the MAUI Blazor equivalents.

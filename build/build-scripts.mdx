@@ -1,0 +1,340 @@
+---
+title: "Build Scripts: build-all, build-all-release, and test-all"
+sidebarTitle: "Build Scripts"
+description: "The build/ PowerShell scripts behind ABP Framework: solution enumeration, dev vs release builds, xUnit testing with coverage, and bin/obj cleanup."
+---
+
+The four PowerShell files under `/home/daytona/repos/abpframework/abp/build/` are how the ABP Framework monorepo turns ~30 separate solutions into a single repeatable build. They are also exactly what the `build-and-test.yml` GitHub Actions workflow shells out to, so anything you can reproduce locally is what CI sees. This page walks through each script in the order they are dot-sourced.
+
+## `build/common.ps1` — the Solution Roster
+
+`common.ps1` is sourced at the top of every other script in this folder. Its only job is to populate `$solutionPaths` with the relative paths that downstream loops will iterate over. The pattern is:
+
+```powershell
+$full = $args[0]
+
+# COMMON PATHS
+$rootFolder = (Get-Item -Path "./" -Verbose).FullName
+
+# List of solutions used only in development mode
+$solutionPaths = @(
+        "../framework",
+        "../modules/basic-theme",
+        "../modules/users",
+        "../modules/permission-management",
+        ...
+        "../modules/blob-storing-database"
+    )
+```
+
+The script captures the current working directory into `$rootFolder` *before* it does anything else, because every downstream loop will `Set-Location` into a child solution and rely on `$rootFolder` to come back home. The base list covers fifteen solutions — the framework itself plus the always-shipping modules: `basic-theme`, `users`, `permission-management`, `setting-management`, `feature-management`, `identity`, `identityserver`, `openiddict`, `tenant-management`, `audit-logging`, `background-jobs`, `account`, `cms-kit`, and `blob-storing-database`.
+
+### The `-f` Switch
+
+When the first argument is `-f`, an extended set is appended for a *full* build. This is the difference between someone hacking on a single module and a release engineer running the full pipeline:
+
+```powershell
+if ($full -eq "-f")
+{
+    $solutionPaths += (
+        "../modules/client-simulation",
+        "../modules/virtual-file-explorer",
+        "../modules/docs",
+        "../modules/blogging",
+        "../templates/module/aspnet-core",
+        "../templates/app/aspnet-core",
+        "../templates/console",
+        "../templates/app-nolayers/aspnet-core",
+        "../abp_io/AbpIoLocalization",
+        "../source-code"
+    )
+    if ($env:OS -eq "Windows_NT") {
+        $solutionPaths += "../templates/wpf"
+    }
+}
+```
+
+The `templates/wpf` solution is only added when `$env:OS -eq "Windows_NT"` because it depends on Windows-only project SDKs. The four added templates correspond to the four `abp new` starter shapes that the CLI generates — `module`, `app`, `console`, `app-nolayers` — so the templates are *literally* built as part of the release to keep them honest. `abp_io/AbpIoLocalization` and `source-code` are internal solutions used by the abp.io website.
+
+### The Development-Mode Warning
+
+If `-f` is not provided, `common.ps1` prints a yellow-on-red warning to keep developers from accidentally shipping an incomplete build:
+
+```powershell
+}else{
+    Write-host ""
+    Write-host ":::::::::::::: !!! You are in development mode !!! ::::::::::::::" -ForegroundColor red -BackgroundColor  yellow
+    Write-host ""
+}
+```
+
+That banner appears every time `build-all.ps1` or `test-all.ps1` is run without `-f`, which makes the dev/release distinction impossible to miss in the console.
+
+<Note>
+  There is a *second* `common.ps1` in the repo at `nupkg/common.ps1`. That one is consumed by `deploy/*.ps1` and defines `Write-Info`, `Get-Current-Version`, `Get-Current-Branch`, and the master `$projects` list. The `build/common.ps1` covered here only enumerates *solutions* for `dotnet build`/`dotnet test`.
+</Note>
+
+## `build/build-all.ps1` — Developer Build
+
+`build-all.ps1` is what a contributor runs to verify their change before opening a PR. It's only 17 lines:
+
+```powershell
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+# Build all solutions
+Write-Host $solutionPaths
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+The interesting details: the `$full` value is forwarded to `common.ps1` so `pwsh ./build-all.ps1 -f` propagates through; the build runs `dotnet build` with no explicit configuration (so it picks up `Debug` by default); the `if (-Not $?)` check uses PowerShell's automatic last-status variable so the script exits with `$LASTEXITCODE` on the first failure rather than chugging through twelve more solutions; and the final `Set-Location $rootFolder` ensures that even after a successful build the developer's prompt is back where it started.
+
+### How GitHub Actions Calls It
+
+`/.github/workflows/build-and-test.yml` runs this exact script without `-f`:
+
+```yaml
+- name: Build All
+  run: ./build-all.ps1
+  working-directory: ./build
+  shell: pwsh
+```
+
+Which means CI on `dev`/PRs only builds the base fifteen solutions — fast enough for the 50-minute `timeout-minutes` budget. The optional template and `source-code` solutions are validated only when a release engineer runs the `-f` variant locally.
+
+## `build/build-all-release.ps1` — Release Build
+
+`build-all-release.ps1` is what `deploy/1-fetch-and-build.ps1` invokes after `git pull`. It hardcodes `-f` and Release configuration:
+
+```powershell
+$full = $args[0]
+
+. ".\common.ps1" -f
+
+# Build all solutions
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build --configuration Release -- /maxcpucount
+    if (-Not $?) {
+        Write-Host ("Build failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+Two things differ from `build-all.ps1`. First, `common.ps1` is dot-sourced with `-f` regardless of what the caller passed, locking the release build to the full solution list. Second, `dotnet build --configuration Release -- /maxcpucount` runs in Release configuration and forwards `/maxcpucount` to MSBuild after the `--` separator so it parallelises across CPU cores. Release configuration also activates the `Fody`/`ConfigureAwait.Fody` PackageReferences guarded by `configureawait.props`:
+
+```xml
+<ItemGroup Condition="'$(Configuration)' == 'Release'">
+    <PackageReference Include="ConfigureAwait.Fody" PrivateAssets="All" />
+    <PackageReference Include="Fody">
+        <PrivateAssets>All</PrivateAssets>
+        <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+</ItemGroup>
+```
+
+so a Release build of the framework actually rewrites every `await` to add `.ConfigureAwait(false)` at the IL level. That's why `deploy/1-fetch-and-build.ps1` calls `.\build-all-release.ps1` rather than the development script — the IL output is what later gets packed into `*.nupkg`.
+
+### Where the Version Comes From
+
+The Release build doesn't pick a version of its own — it inherits the `<Version>` value from `common.props`. `deploy/1-fetch-and-build.ps1` rewrites that XML element *before* calling `build-all-release.ps1`:
+
+```powershell
+$commonPropsFilePath = resolve-path "../common.props"
+$commonPropsXmlCurrent = [xml](Get-Content $commonPropsFilePath )
+$currentVersion = $commonPropsXmlCurrent.Project.PropertyGroup.Version.Trim()
+...
+$commonPropsXmlCurrent.Project.PropertyGroup.Version = $newVersion
+$commonPropsXmlCurrent.Save( $commonPropsFilePath )
+```
+
+So `build/build-all-release.ps1` is intentionally version-agnostic: whatever `common.props` says becomes the assembly informational version and, indirectly, the `*.nupkg` filename via `nupkg/pack.ps1`.
+
+<Warning>
+  Running `build/build-all-release.ps1` directly will produce Release artifacts under each project's `bin/Release/`, but it will *not* roll the version. If you need to test a release build with a custom version, edit `common.props` first or call `deploy/1-fetch-and-build.ps1` which prompts you for it.
+</Warning>
+
+## `build/test-all.ps1` — Coverage-Collecting Test Run
+
+`test-all.ps1` is the third script GitHub Actions runs. It iterates the same `$solutionPaths` and shells out to `dotnet test`:
+
+```powershell
+$full = $args[0]
+
+. ".\common.ps1" $full
+
+# Test all solutions
+
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"
+    if (-Not $?) {
+        Write-Host ("Test failed for the solution: " + $solutionPath)
+        Set-Location $rootFolder
+        exit $LASTEXITCODE
+    }
+}
+
+Set-Location $rootFolder
+```
+
+The three `dotnet test` flags matter:
+
+| Flag | Why it's there |
+|---|---|
+| `--no-build` | The CI/release flow has already run `build-all.ps1` (or `build-all-release.ps1`), so re-building wastes 20+ minutes. |
+| `--no-restore` | Same reasoning for NuGet restore — the build step already populated `~/.nuget/packages`, which the workflow has additionally cached. |
+| `--collect:"XPlat Code Coverage"` | Activates the data collector that ships with the .NET SDK; writes Cobertura XML into `TestResults/<guid>/coverage.cobertura.xml` for every test project. |
+
+The CI workflow uploads those XML files to Codecov:
+
+```yaml
+- name: Codecov
+  if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+  uses: codecov/codecov-action@v5
+  with:
+    use_oidc: true
+    fail_ci_if_error: true
+```
+
+And `codecov.yml` at the repo root configures the report:
+
+```yaml
+codecov:
+  branch: dev
+  require_ci_to_pass: yes
+  allow_coverage_offsets: true
+  status:
+    project:
+      default:
+        threshold: 1%
+```
+
+So tests pass even if coverage drops by up to 1% — useful when refactoring shuffles untestable boilerplate around.
+
+### The `common.test.props` Sidecar
+
+Every test project imports `common.test.props`, which keeps the test runtime config consistent across hundreds of csproj files:
+
+```xml
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <NoWarn>$(NoWarn);CS1591;CS0436</NoWarn>
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+    <GenerateAssemblyConfigurationAttribute>false</GenerateAssemblyConfigurationAttribute>
+    <GenerateAssemblyCompanyAttribute>false</GenerateAssemblyCompanyAttribute>
+    <GenerateAssemblyProductAttribute>false</GenerateAssemblyProductAttribute>
+  </PropertyGroup>
+</Project>
+```
+
+`GenerateRuntimeConfigurationFiles=true` is what makes xUnit assemblies executable in `dotnet test` without an explicit `<OutputType>Exe</OutputType>`. The suppressed assembly attributes prevent duplicate-attribute errors when multiple test projects merge.
+
+## Build Inputs Outside `build/`
+
+The four PowerShell scripts on their own don't tell the whole story — they rely on three repo-root MSBuild property files plus a Central Package Management manifest. Briefly:
+
+<CardGroup cols={2}>
+  <Card title="common.props" icon="file-code">
+    Drives package metadata for every shipping project. Sets `<Version>10.4.0-rc.2</Version>`, `<PackageLicenseExpression>LGPL-3.0-only</PackageLicenseExpression>`, `<PackageIconUrl>https://abp.io/assets/abp_nupkg.png</PackageIconUrl>`, packs `NuGet.md` as the README, and pulls `Microsoft.SourceLink.GitHub`.
+  </Card>
+  <Card title="Directory.Packages.props" icon="file-code">
+    Central Package Management. `<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>` plus one `<PackageVersion>` per dep — for example `<PackageVersion Include="Autofac" Version="9.1.0" />`, `<PackageVersion Include="MudBlazor" Version="8.0.0" />`, `<PackageVersion Include="AWSSDK.S3" Version="4.0.7.2" />`.
+  </Card>
+  <Card title="configureawait.props" icon="file-code">
+    Adds `ConfigureAwait.Fody` + `Fody` *only* in Release configuration. That is why `build-all.ps1` (Debug) and `build-all-release.ps1` (Release) produce different IL even for identical source.
+  </Card>
+  <Card title="NuGet.Config" icon="file-code">
+    Single `<add key="nuget.org" value="https://api.nuget.org/v3/index.json" />` entry. No private feeds. Means every transitive package must be on nuget.org for the build to succeed.
+  </Card>
+</CardGroup>
+
+The `common.props` file also pulls a non-obvious feature: it embeds any `*generate-proxy.json` file as a resource when the assembly name ends with `HttpApi.Client`:
+
+```xml
+<ItemGroup Condition="$(AssemblyName.EndsWith('HttpApi.Client'))">
+    <EmbeddedResource Include="**\*generate-proxy.json" />
+    <Content Remove="**\*generate-proxy.json" />
+</ItemGroup>
+```
+
+so the `abp generate-proxy` CLI can find them at runtime via reflection.
+
+## `delete-bin-obj.ps1` — Workspace Reset
+
+The repo root holds one more script that pairs with the build/* set: `delete-bin-obj.ps1`. It's a one-pass recursive cleanup:
+
+```powershell
+Clear-Host
+Write-Host "Deleting all BIN and OBJ folders..." -ForegroundColor Cyan
+Get-ChildItem -Path . -Include bin,obj -Recurse -Directory | ForEach-Object {
+    if ($_.FullName -notmatch "\\node_modules\\") {
+        Write-Host "Deleting:" $_.FullName -ForegroundColor Yellow
+        Remove-Item $_.FullName -Recurse -Force
+    } else {
+        Write-Host "Skipping:" $_.FullName -ForegroundColor Magenta
+    }
+}
+
+Write-Host "BIN and OBJ folders have been successfully deleted." -ForegroundColor Green
+```
+
+The `-notmatch "\\node_modules\\"` guard exists because the Angular packages under `npm/ng-packs/` legitimately contain `bin/` and `obj/` directories inside `node_modules/` (third-party tooling), and `Remove-Item -Recurse -Force` on those would leave Yarn in an inconsistent state. The colour-coded output makes it visually obvious which directories were touched vs skipped.
+
+<Tip>
+  Run `delete-bin-obj.ps1` whenever you switch branches between `dev` and a `rel-*` branch — the central package versions in `Directory.Packages.props` can differ enough that leftover `obj/project.assets.json` files will produce confusing restore errors.
+</Tip>
+
+## Putting It All Together
+
+A typical contributor session looks like:
+
+```powershell
+cd build
+.\build-all.ps1           # dev-mode build, base 15 solutions
+.\test-all.ps1            # xUnit + coverage on the same set
+cd ..
+.\delete-bin-obj.ps1      # if you're about to switch branches
+```
+
+A release engineer instead runs:
+
+```powershell
+cd deploy
+.\_run_all.ps1            # which calls 1-fetch-and-build.ps1 →
+                          # which calls ..\build\build-all-release.ps1 (with -f, Release, /maxcpucount)
+```
+
+Either way, `build/common.ps1` is the source of truth for which solutions belong to the build, and changing that one file is enough to add a new module to both the developer loop *and* the release pipeline.
+
+## Reading Order
+
+<CardGroup cols={2}>
+  <Card title="Overview" icon="map" href="/build/overview">
+    The high-level pipeline diagram and directory map.
+  </Card>
+  <Card title="Deploy Scripts" icon="rocket" href="/build/deploy-scripts">
+    What happens after `build-all-release.ps1` finishes — `dotnet pack`, `dotnet nuget push`, `npm publish`, and the GitHub release POST.
+  </Card>
+</CardGroup>

@@ -1,0 +1,318 @@
+---
+title: "Account Web for OpenIddict: Login, Cancel & Windows Auth"
+sidebarTitle: "OpenIddict Host"
+description: "Inside Volo.Abp.Account.Web.OpenIddict: OpenIddictSupportedLoginModel, the OpenIddict server transaction handoff, Windows authentication, module wiring."
+---
+
+`modules/account/src/Volo.Abp.Account.Web.OpenIddict/` is the host package that turns the shared Razor Pages from `Volo.Abp.Account.Web` into an OpenID Connect login UI driven by the OpenIddict server. It is intentionally tiny — the only real source files are the module class, one page model, and a `_ViewImports.cshtml` — because the pattern is to *replace page models, not pages*.
+
+## Module wiring
+
+`Volo.Abp.Account.Web.OpenIddict/AbpAccountWebOpenIddictModule.cs` is declared as:
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountWebModule),
+    typeof(AbpOpenIddictAspNetCoreModule)
+)]
+public class AbpAccountWebOpenIddictModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpAccountWebOpenIddictModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAccountWebOpenIddictModule>();
+        });
+    }
+}
+```
+
+The two `DependsOn` lines do all the heavy lifting: pulling `AbpAccountWebModule` means every Razor Page from `Pages/Account/*` is available, and pulling `AbpOpenIddictAspNetCoreModule` (from `Volo.Abp.OpenIddict.AspNetCore`) registers the OpenIddict server and the `AbpOpenIddictRequestHelper` service that the page model below consumes. There is **no `AbpAccountOpenIddictWebOptions`** class in the source tree — the OpenIddict host does not need extra options of its own; everything lives in the shared `AbpAccountOptions` class from `Volo.Abp.Account.Web/AbpAccountOptions.cs`.
+
+The `_ViewImports.cshtml` at `Pages/_ViewImports.cshtml` brings in `Volo.Abp.AspNetCore.Mvc.UI.Bootstrap.TagHelpers` and the page-model namespace so the host's overridden models bind correctly in the shared `.cshtml` files.
+
+## `OpenIddictSupportedLoginModel`
+
+`Volo.Abp.Account.Web.OpenIddict/Pages/Account/OpenIddictSupportedLoginModel.cs` is the centerpiece of this package. It is exposed *as* `LoginModel` via:
+
+```csharp
+[ExposeServices(typeof(LoginModel))]
+public class OpenIddictSupportedLoginModel : LoginModel
+{
+    protected AbpOpenIddictRequestHelper OpenIddictRequestHelper { get; }
+    // ...
+}
+```
+
+This means every time ASP.NET Core resolves `LoginModel` to bind the shared `Login.cshtml` view, dependency injection returns an instance of `OpenIddictSupportedLoginModel` instead. The view does not care.
+
+The constructor injects everything the base class needs plus `AbpOpenIddictRequestHelper`:
+
+```csharp
+public OpenIddictSupportedLoginModel(
+    IAuthenticationSchemeProvider schemeProvider,
+    IOptions<AbpAccountOptions> accountOptions,
+    IOptions<IdentityOptions> identityOptions,
+    IdentityDynamicClaimsPrincipalContributorCache identityDynamicClaimsPrincipalContributorCache,
+    AbpOpenIddictRequestHelper openIddictRequestHelper,
+    IWebHostEnvironment webHostEnvironment)
+    : base(schemeProvider, accountOptions, identityOptions,
+           identityDynamicClaimsPrincipalContributorCache, webHostEnvironment)
+{
+    OpenIddictRequestHelper = openIddictRequestHelper;
+}
+```
+
+### `OnGetAsync` — extracting the OpenIddict request
+
+```csharp
+public async override Task<IActionResult> OnGetAsync()
+{
+    LoginInput = new LoginInputModel();
+
+    var request = await OpenIddictRequestHelper.GetFromReturnUrlAsync(ReturnUrl);
+    if (request?.ClientId != null)
+    {
+        // TODO: Find a proper cancel way.
+        // ShowCancelButton = true;
+
+        LoginInput.UserNameOrEmailAddress = request.LoginHint;
+
+        var tenant = request.GetParameter(TenantResolverConsts.DefaultTenantKey)?.ToString();
+        if (!string.IsNullOrEmpty(tenant))
+        {
+            CurrentTenant.Change(Guid.Parse(tenant));
+            Response.Cookies.Append(TenantResolverConsts.DefaultTenantKey, tenant);
+        }
+    }
+
+    return await base.OnGetAsync();
+}
+```
+
+Key bits:
+
+- **`GetFromReturnUrlAsync(ReturnUrl)`** parses the `ReturnUrl` query string — typically something like `/connect/authorize?client_id=...&login_hint=alice@example.com&__tenant=...` — into an `OpenIddictRequest` object. This is the OpenIddict equivalent of what the IdentityServer host does with `IIdentityServerInteractionService.GetAuthorizationContextAsync`.
+- **`login_hint`** pre-populates the username field so a returning user does not have to retype it.
+- **Tenant pre-selection** — if the authorize request carried `__tenant=<guid>`, the page switches `CurrentTenant` for the rest of the request and also persists the tenant key as a cookie so the post-login redirect keeps the tenant context.
+- The base class's `OnGetAsync` is then called normally, which renders the local login form (and any external providers).
+
+### `OnPostAsync` — handling the cancel action
+
+The OpenIddict host adds a "cancel" handler that did not exist in the base:
+
+```csharp
+public async override Task<IActionResult> OnPostAsync(string action)
+{
+    if (action == "Cancel")
+    {
+        var request = await OpenIddictRequestHelper.GetFromReturnUrlAsync(ReturnUrl);
+
+        var transaction = HttpContext.GetOpenIddictServerTransaction();
+        if (request?.ClientId != null && transaction != null)
+        {
+            transaction.EndpointType = OpenIddictServerEndpointType.Authorization;
+            transaction.Request = request;
+
+            var notification = new OpenIddictServerEvents.ValidateAuthorizationRequestContext(transaction);
+            transaction.SetProperty(typeof(OpenIddictServerEvents.ValidateAuthorizationRequestContext).FullName!, notification);
+
+            return Forbid(OpenIddictServerAspNetCoreDefaults.AuthenticationScheme);
+        }
+
+        return Redirect("~/");
+    }
+
+    return await base.OnPostAsync(action);
+}
+```
+
+This code is what makes a "Cancel" button on the login page return an actual OAuth `access_denied` error to the client application instead of just dropping the user on the home page. The key move is:
+
+1. Get the live OpenIddict server transaction from the HTTP context.
+2. Pin its endpoint type to `Authorization` and reattach the parsed request.
+3. Attach a fresh `ValidateAuthorizationRequestContext` so the OpenIddict server can build a proper error response.
+4. Return `Forbid(OpenIddictServerAspNetCoreDefaults.AuthenticationScheme)` — OpenIddict's middleware picks this up and emits the `error=access_denied` redirect.
+
+Note the `// TODO: Find a proper cancel way.` comment in `OnGetAsync` — the cancel button is currently disabled in the rendered UI because `ShowCancelButton` is never set. The post handler is wired up so that whenever the UI is enabled it works end-to-end.
+
+### `OnPostExternalLogin` — Windows authentication
+
+External login is mostly inherited from the base, but the OpenIddict model overrides one branch:
+
+```csharp
+public async override Task<IActionResult> OnPostExternalLogin(string provider)
+{
+    if (AccountOptions.WindowsAuthenticationSchemeName == provider)
+    {
+        return await ProcessWindowsLoginAsync();
+    }
+
+    return await base.OnPostExternalLogin(provider);
+}
+```
+
+`ProcessWindowsLoginAsync` does the IIS-integration dance: call `HttpContext.AuthenticateAsync(AccountOptions.WindowsAuthenticationSchemeName)`, harvest `ClaimTypes.PrimarySid` and `ClaimTypes.Name`, build a `ClaimsIdentity` for the `IdentityConstants.ExternalScheme` cookie, and sign in. The redirect target is the same `./Login` page with `pageHandler: "ExternalLoginCallback"`, so the standard external-login flow from the base class takes over from there.
+
+```csharp
+protected virtual async Task<IActionResult> ProcessWindowsLoginAsync()
+{
+    var result = await HttpContext.AuthenticateAsync(AccountOptions.WindowsAuthenticationSchemeName);
+    if (result.Succeeded)
+    {
+        var props = new AuthenticationProperties()
+        {
+            RedirectUri = Url.Page("./Login", pageHandler: "ExternalLoginCallback",
+                values: new { ReturnUrl, ReturnUrlHash }),
+            Items =
+            {
+                { "LoginProvider", AccountOptions.WindowsAuthenticationSchemeName }
+            }
+        };
+
+        var id = new ClaimsIdentity(AccountOptions.WindowsAuthenticationSchemeName);
+        id.AddClaim(new Claim(ClaimTypes.NameIdentifier, result.Principal.FindFirstValue(ClaimTypes.PrimarySid)));
+        id.AddClaim(new Claim(ClaimTypes.Name, result.Principal.FindFirstValue(ClaimTypes.Name)));
+
+        await HttpContext.SignInAsync(IdentityConstants.ExternalScheme, new ClaimsPrincipal(id), props);
+
+        return Redirect(props.RedirectUri!);
+    }
+
+    return Challenge(AccountOptions.WindowsAuthenticationSchemeName);
+}
+```
+
+The scheme name (`"Windows"` by default) comes from `Volo.Abp.Account.Web/AbpAccountOptions.cs`. Hosts that disable IIS integration simply leave the Windows scheme unregistered, and the `result.Succeeded` branch never fires.
+
+## Authorize / logout endpoints
+
+`Volo.Abp.Account.Web.OpenIddict` does **not** ship its own `/connect/authorize` or `/connect/logout` controllers — those belong to the OpenIddict server itself, which is registered by `AbpOpenIddictAspNetCoreModule`. The login page only ever runs because the OpenIddict server redirects to `/Account/Login?ReturnUrl=<authorize-request>` when the user is unauthenticated. After login succeeds, `RedirectSafelyAsync` (inherited from `AccountPageModel`) sends the browser back to that `ReturnUrl`, the OpenIddict middleware completes the request, and the client receives an `authorization_code`.
+
+The logout side is the same: `LogoutModel` (from the shared package) signs out via `SignInManager.SignOutAsync()`, then redirects back to the OpenIddict server's `/connect/endsession` callback if `ReturnUrl` is set.
+
+## `ConsentModel`
+
+The OpenIddict host does **not** ship a `Consent.cshtml` page either. OpenIddict handles consent at the server level — it ships its own minimal consent UI and most ABP templates set `consentType` to `implicit` for first-party clients. If a host wants to display a custom consent screen, it builds one alongside the OpenIddict server configuration; the Account module stays out of the way. (Contrast with the IdentityServer host, which *does* include a `Consent.cshtml` because IdentityServer4 requires it.)
+
+## What the `_ViewImports` and embedded files do
+
+`Pages/_ViewImports.cshtml` is short:
+
+```cshtml
+@using Microsoft.AspNetCore.Mvc.Localization
+@using Volo.Abp.AspNetCore.Mvc.UI.Bootstrap.TagHelpers
+@namespace Volo.Abp.Account.Web.OpenIddict.Pages
+```
+
+The `@namespace` ensures the page models compiled here resolve at the right namespace so the `[ExposeServices]` registration above lands on the right type. The embedded virtual file registration in `ConfigureServices` then makes any `.cshtml` files placed under `Pages/` part of the host's RCL.
+
+## Summary of overrides
+
+The OpenIddict host modifies exactly one page model and registers it as a service replacement. Everything else — `Register.cshtml`, `ForgotPassword.cshtml`, `ResetPassword.cshtml`, `Manage.cshtml`, the user menu, `AbpAccountOptions` — is inherited verbatim from `Volo.Abp.Account.Web`. That tight surface area is what makes it possible for an ABP application to migrate between OpenIddict and IdentityServer (or vice versa) by swapping a single module reference at the host level.
+
+<Tip>
+If you need to customize the OpenIddict login UI beyond what `OpenIddictSupportedLoginModel` already supports, the cleanest path is to subclass it again in your host and add `[ExposeServices(typeof(LoginModel), typeof(OpenIddictSupportedLoginModel))]` so your class wins over both registrations. See the [Web UI page](/module-account/web-ui) for the property-injected service contracts you can rely on inside the derived class.
+</Tip>
+
+## How `AbpOpenIddictRequestHelper` works
+
+`AbpOpenIddictRequestHelper` is the bridge between the URL form of the authorize request and the typed `OpenIddictRequest` object. It lives in `framework/src/Volo.Abp.OpenIddict.AspNetCore/` (not in this Account package) and is registered by `AbpOpenIddictAspNetCoreModule`. The helper does two things:
+
+- `GetFromReturnUrlAsync(string returnUrl)` — parses the query string (or form body, when the host is using `response_mode=form_post`) into an `OpenIddictRequest`. Returns `null` if the URL is not an OpenIddict authorize request, which is how the login page distinguishes between "user is in the middle of OIDC login" versus "user just clicked the login link".
+- It exposes the same helper methods OpenIddict's own controllers use internally to read parameters, so anything the OpenIddict server understands (`acr_values`, `prompt`, `max_age`, custom scopes) is visible to the login page.
+
+`OpenIddictSupportedLoginModel` only touches three fields from the parsed request: `ClientId` (used as a non-null guard), `LoginHint` (pre-fills username), and the `__tenant` parameter (sets `CurrentTenant`). Hosts that need to surface additional client metadata — e.g., show the client's logo and name on the login form — can override `OnGetAsync`, call `await OpenIddictRequestHelper.GetFromReturnUrlAsync(ReturnUrl)`, and read whichever extra properties they need.
+
+## Why the OpenIddict host does not configure authentication directly
+
+Unlike the IdentityServer host, this module does **not** override `AbpIdentityAspNetCoreOptions.ConfigureAuthentication`. The reason is that OpenIddict integrates with ASP.NET Core Identity through the standard `SignInManager<IdentityUser>` cookie scheme, exactly the way ABP's Identity module already configures it. Adding the OpenIddict-specific authentication schemes (the OpenIddict server scheme and validation scheme) is the job of the host project's `Program.cs`, not the Account-Web-OpenIddict module. The module's contribution stops at the Razor Page model layer.
+
+This separation is also why the `appsettings.json` of an OpenIddict-based template has no Account-specific section: every relevant configuration is either an OpenIddict server option (under `OpenIddict:`) or an ABP setting (consumed through `ISettingProvider`). The Account module reads them and renders the UI accordingly.
+
+## End-to-end OpenIddict login walkthrough
+
+Putting all the pieces together, here is what happens when a SPA initiates login against an ABP host running `Volo.Abp.Account.Web.OpenIddict`:
+
+<Steps>
+  <Step title="Client builds the authorize request">
+    The SPA (Angular `@abp/ng.oauth`, Blazor `OidcAuthenticationStateProvider`, or any standard library) navigates the browser to `/connect/authorize?client_id=MyApp&response_type=code&scope=openid+profile+offline_access&redirect_uri=...&code_challenge=...&state=...&__tenant=<guid>`.
+  </Step>
+  <Step title="OpenIddict sees no cookie">
+    The OpenIddict server middleware (from `Volo.Abp.OpenIddict.AspNetCore`) detects there is no `IdentityConstants.ApplicationScheme` cookie and short-circuits with a 302 to `/Account/Login?ReturnUrl=%2Fconnect%2Fauthorize%3F...`.
+  </Step>
+  <Step title="Razor Page resolves OpenIddictSupportedLoginModel">
+    ASP.NET Core MVC binds `Pages/Account/Login.cshtml` to `LoginModel`, but the DI container returns the `[ExposeServices(typeof(LoginModel))]`-decorated `OpenIddictSupportedLoginModel`. Its `OnGetAsync` parses `ReturnUrl` via `OpenIddictRequestHelper.GetFromReturnUrlAsync`, applies the `__tenant` to `CurrentTenant`, pre-fills `login_hint`, and renders the page.
+  </Step>
+  <Step title="User submits credentials">
+    The form posts to `OnPostAsync`. The base class's implementation runs `SignInManager.PasswordSignInAsync`, writes the security log, clears the dynamic-claims cache, and `RedirectSafelyAsync(ReturnUrl)` 302s back to `/connect/authorize?...`.
+  </Step>
+  <Step title="OpenIddict completes the authorize request">
+    Now that the auth cookie is present, the OpenIddict server validates the request, mints an `authorization_code`, and redirects to the client's `redirect_uri?code=...&state=...`.
+  </Step>
+  <Step title="Client exchanges code for tokens">
+    The SPA POSTs the code (plus its PKCE verifier) to `/connect/token`. OpenIddict issues the `id_token`, `access_token`, and `refresh_token` (because `offline_access` was requested). The flow is done.
+  </Step>
+</Steps>
+
+Everything *except* step 3 is OpenIddict's own work. The Account module's contribution is exactly the page model that bridges between OpenIddict's authorize request and the shared Razor Pages — a single file of about 130 lines that makes the whole self-service surface usable.
+
+## Comparing the OpenIddict and IdentityServer host packages
+
+The two host packages converge on a near-identical responsibility split. Both packages:
+
+- Depend on `AbpAccountWebModule` to inherit every Razor Page.
+- Register the assembly as an MVC application part.
+- Override exactly one or two page models with `[ExposeServices(typeof(...))]`.
+- Re-use the same `ProcessWindowsLoginAsync` implementation for IIS integration.
+
+They differ in three places:
+
+| Concern | OpenIddict host | IdentityServer4 host |
+| --- | --- | --- |
+| Authentication wiring | Inherits the default from `AbpIdentityAspNetCoreModule` | Disables it (`ConfigureAuthentication = false`) and calls `AddIdentityCookies` manually |
+| Authorize request shape | Parsed by `AbpOpenIddictRequestHelper.GetFromReturnUrlAsync` | Parsed by `IIdentityServerInteractionService.GetAuthorizationContextAsync` |
+| Consent UI | None — OpenIddict ships its own minimal consent page or hosts treat first-party clients as implicit consent | A dedicated `Pages/Consent.cshtml` shipped by the IdentityServer host package |
+| Logout flow | Inherits the base `LogoutModel` | Overrides `LogoutModel` to handle IdentityServer's `logoutId`, federated sign-out iframe URL, and `LogoutContext` |
+| Error UI | None — OpenIddict errors surface to the client app as `error=...` | A `/Account/Error` page rendered by `ErrorController` |
+
+For new applications the OpenIddict host is the recommended choice. For existing applications stuck on IdentityServer4 (which is in long-term-support mode), the `Volo.Abp.Account.Web.IdentityServer` package continues to work; see the [IdentityServer host page](/module-account/web-identityserver) for the full breakdown.
+
+## Files in this package
+
+The complete file inventory of `Volo.Abp.Account.Web.OpenIddict/` is:
+
+- `AbpAccountWebOpenIddictModule.cs` — the module class.
+- `Pages/Account/OpenIddictSupportedLoginModel.cs` — the replaced login page model.
+- `Pages/_ViewImports.cshtml` — namespace declarations for compiled pages.
+
+That is the entire package. There is no controller, no view, no JavaScript, no CSS, and no resource file — everything else is inherited verbatim from `Volo.Abp.Account.Web`. The small surface area is why migrating between OpenIddict and IdentityServer (or vice versa) only requires changing a single module reference.
+
+## Adding a custom external provider
+
+When a host needs to add (say) Azure AD as an external login, the wiring lives at the **host** level, not in this module. The recipe:
+
+```csharp
+// In the auth-server host's Module class
+context.Services
+    .AddAuthentication()
+    .AddOpenIdConnect("AzureAd", "Azure AD", options =>
+    {
+        options.Authority = "https://login.microsoftonline.com/<tenant>/v2.0";
+        options.ClientId = "...";
+        options.ClientSecret = "...";
+        options.SignInScheme = IdentityConstants.ExternalScheme;
+    });
+```
+
+That call adds an authentication scheme whose `DisplayName` is `"Azure AD"`. The shared `LoginModel.GetExternalProviders` in `Volo.Abp.Account.Web/Pages/Account/Login.cshtml.cs` picks it up automatically — any scheme with a non-null `DisplayName` is rendered as an external provider button. No change to `OpenIddictSupportedLoginModel` is required.
+
+The post-callback flow then runs through the base class's `OnGetExternalLoginCallbackAsync` (in the shared web package), which calls `SignInManager.ExternalLoginSignInAsync` and either signs the user in or redirects to `./Register?IsExternalLogin=true`. The OpenIddict-specific overrides in this package never run for that path because external login is host-agnostic.

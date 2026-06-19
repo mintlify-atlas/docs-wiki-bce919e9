@@ -1,0 +1,313 @@
+---
+title: "Volo.Abp.TestBase: Integrated Tests with a Real Host"
+sidebarTitle: "TestBase"
+description: "ABP Framework Volo.Abp.TestBase deep dive — AbpIntegratedTest, AbpAsyncIntegratedTest, AbpTestBaseModule, ITestCounter, and the xUnit usage patterns."
+---
+
+The ABP Framework ships its host-bootstrapping primitive for tests in the `Volo.Abp.TestBase` package. The package is intentionally tiny — six source files at `framework/src/Volo.Abp.TestBase/Volo/Abp/` — and intentionally runner-agnostic: nothing inside it depends on xUnit, NUnit, or MSTest. Everything is built around constructor/dispose for the synchronous flow, and `InitializeAsync`/`DisposeAsync` for the asynchronous one.
+
+This page walks through every public type the package exposes, the order in which they are invoked when a test class is instantiated, and the four virtual hooks you override when you need to customise the boot. All code references are paths under `/home/daytona/repos/abpframework/abp/framework/src/Volo.Abp.TestBase/`.
+
+## Package shape
+
+The csproj at `framework/src/Volo.Abp.TestBase/Volo.Abp.TestBase.csproj` targets `netstandard2.0;netstandard2.1;net8.0;net9.0;net10.0`, declares `Nullable=enable` with `WarningsAsErrors=Nullable`, and has a single project reference to `Volo.Abp.Core`. It does not reference `Microsoft.Extensions.Hosting`, `Microsoft.AspNetCore.*`, or any runner. The `RootNamespace` is intentionally blank so types can sit directly under `Volo.Abp` and `Volo.Abp.Testing`.
+
+The exported surface is:
+
+| Type | File | Role |
+|---|---|---|
+| `AbpTestBaseModule` | `Volo/Abp/AbpTestBaseModule.cs` | Empty module — the entry point you point your `TStartupModule` at indirectly. |
+| `AbpTestBaseWithServiceProvider` | `Volo/Abp/AbpTestBaseWithServiceProvider.cs` | Abstract base exposing `ServiceProvider` and `GetService` / `GetRequiredService` / keyed variants. |
+| `AbpIntegratedTest<TStartupModule>` | `Volo/Abp/Testing/AbpIntegratedTest.cs` | Synchronous boot in the constructor, teardown in `Dispose`. |
+| `AbpAsyncIntegratedTest<TStartupModule>` | `Volo/Abp/Testing/AbpAsyncIntegratedTest.cs` | Async boot via `InitializeAsync`, teardown via `DisposeAsync`. |
+| `ITestCounter` / `TestCounter` | `Volo/Abp/Testing/Utils/` | Singleton named counters used for asserting interceptor or hook firings. |
+
+No other types are exported. There is no logger configuration, no exception hierarchy specific to the package (any failures simply bubble up as ordinary `AbpException` or `AbpInitializationException` from the module pipeline), and no convention for fixture sharing — those concerns are pushed onto whatever runner you choose.
+
+## `AbpTestBaseModule`
+
+The module at `framework/src/Volo.Abp.TestBase/Volo/Abp/AbpTestBaseModule.cs` is literally:
+
+```csharp
+using Volo.Abp.Modularity;
+
+namespace Volo.Abp;
+
+public class AbpTestBaseModule : AbpModule
+{
+
+}
+```
+
+It exists as an explicit dependency target for higher-level test modules — most importantly `AbpAspNetCoreTestBaseModule` at `framework/src/Volo.Abp.AspNetCore.TestBase/Volo/Abp/AspNetCore/TestBase/AbpAspNetCoreTestBaseModule.cs` declares `[DependsOn(typeof(AbpTestBaseModule))]`. Inside your test project, you typically write your own module (for example `AbpAITestModule` at `framework/test/Volo.Abp.AI.Tests/Volo/Abp/AI/AbpAITestModule.cs`) that depends on `AbpTestBaseModule` plus whatever you are testing. That custom module becomes the `TStartupModule` you hand to `AbpIntegratedTest<TStartupModule>`.
+
+## `AbpTestBaseWithServiceProvider`
+
+Every test base in the ABP testing stack — including the ASP.NET Core ones in the sibling package — inherits from this class at `framework/src/Volo.Abp.TestBase/Volo/Abp/AbpTestBaseWithServiceProvider.cs`. It exposes a single mutable `IServiceProvider` and four resolution helpers:
+
+```csharp
+public abstract class AbpTestBaseWithServiceProvider
+{
+    protected IServiceProvider ServiceProvider { get; set; } = default!;
+
+    protected virtual T? GetService<T>()
+        => ServiceProvider.GetService<T>();
+
+    protected virtual T GetRequiredService<T>() where T : notnull
+        => ServiceProvider.GetRequiredService<T>();
+
+    protected virtual T? GetKeyedServices<T>(object? serviceKey)
+        => ServiceProvider.GetKeyedService<T>(serviceKey);
+
+    protected virtual T GetRequiredKeyedService<T>(object? serviceKey) where T : notnull
+        => ServiceProvider.GetRequiredKeyedService<T>(serviceKey);
+}
+```
+
+These are the only resolution entry points you should use from test code. They are `virtual`, so subclasses can intercept resolution (for example to log every requested type). All four delegate to the *current* `ServiceProvider`, which `AbpIntegratedTest<TStartupModule>` reassigns *twice* during initialisation — once after building the root provider, then again after `application.Initialize` runs, when it is swapped for `Application.ServiceProvider`. Read those swaps in order in `framework/src/Volo.Abp.TestBase/Volo/Abp/Testing/AbpIntegratedTest.cs`.
+
+## `AbpIntegratedTest<TStartupModule>`
+
+This is the synchronous boot. The class at `framework/src/Volo.Abp.TestBase/Volo/Abp/Testing/AbpIntegratedTest.cs` runs the entire ABP module pipeline in its constructor. Its declaration:
+
+```csharp
+public abstract class AbpIntegratedTest<TStartupModule>
+    : AbpTestBaseWithServiceProvider, IDisposable
+    where TStartupModule : IAbpModule
+{
+    protected IAbpApplication Application { get; }
+    protected IServiceProvider RootServiceProvider { get; }
+    protected IServiceScope TestServiceScope { get; }
+}
+```
+
+`Application` is the live `IAbpApplication` instance, `RootServiceProvider` is the singleton root, and `TestServiceScope` is the scope opened for the lifetime of the test instance. The latter is what allows scoped services (UoW, current-user accessors, …) to behave realistically across a single `[Fact]`.
+
+### Constructor flow
+
+The protected constructor in `framework/src/Volo.Abp.TestBase/Volo/Abp/Testing/AbpIntegratedTest.cs` runs the following steps, in this exact order:
+
+```csharp
+protected AbpIntegratedTest()
+{
+    var services = CreateServiceCollection();
+    BeforeAddApplication(services);
+    var application = services.AddApplication<TStartupModule>(SetAbpApplicationCreationOptions);
+    Application = application;
+    AfterAddApplication(services);
+    RootServiceProvider = CreateServiceProvider(services);
+    TestServiceScope = RootServiceProvider.CreateScope();
+    application.Initialize(TestServiceScope.ServiceProvider);
+    ServiceProvider = Application.ServiceProvider;
+    AfterInitialize();
+}
+```
+
+That is the whole entry point. Five virtual hooks are exposed, all defaulting to no-ops:
+
+| Hook | When |
+|---|---|
+| `CreateServiceCollection()` | First — returns `new ServiceCollection()` by default. Override to seed descriptors. |
+| `BeforeAddApplication(IServiceCollection)` | After `services` exist, before the module graph is registered. |
+| `SetAbpApplicationCreationOptions(AbpApplicationCreationOptions)` | Inside `AddApplication`. Override to configure logging, plugins, or `UseAutofac()`. |
+| `AfterAddApplication(IServiceCollection)` | After the module graph is registered, before the provider is built. |
+| `CreateServiceProvider(IServiceCollection)` | Build the provider; default is `services.BuildServiceProviderFromFactory()`. |
+| `AfterInitialize()` | After `application.Initialize(...)` completes and `ServiceProvider` has been swapped to `Application.ServiceProvider`. |
+
+`CreateServiceProvider` uses `BuildServiceProviderFromFactory()` rather than the standard `BuildServiceProvider()`. That extension is provided by ABP core and routes through whatever `IServiceProviderFactory` was registered — so if you called `UseAutofac()` inside `SetAbpApplicationCreationOptions`, the resulting root is Autofac-backed. The pattern is visible in `framework/test/Volo.Abp.AspNetCore.Mvc.Client.Tests/Volo/Abp/AspNetCore/Mvc/Client/AbpAspNetCoreMvcClientTestBase.cs`:
+
+```csharp
+public abstract class AbpAspNetCoreMvcClientTestBase
+    : AbpIntegratedTest<AbpAspNetCoreMvcClientTestModule>
+{
+    protected override void SetAbpApplicationCreationOptions(AbpApplicationCreationOptions options)
+    {
+        options.UseAutofac();
+    }
+}
+```
+
+### `Dispose`
+
+The `Dispose` override at `framework/src/Volo.Abp.TestBase/Volo/Abp/Testing/AbpIntegratedTest.cs` does the inverse:
+
+```csharp
+public virtual void Dispose()
+{
+    Application.Shutdown();
+    TestServiceScope.Dispose();
+    if (RootServiceProvider is IDisposable disposable)
+    {
+        disposable.Dispose();
+    }
+    Application.Dispose();
+}
+```
+
+Order matters. `Application.Shutdown()` runs every module's `OnApplicationShutdown` callback while the scope and provider are still alive. Only then is the scope disposed, then the root provider, then the `IAbpApplication` itself. Overriding `Dispose` without calling `base.Dispose()` leaks the entire module graph — including any background workers a module spawned during initialisation.
+
+### xUnit usage
+
+xUnit constructs the test class once per `[Fact]` — so the constructor of `AbpIntegratedTest<TStartupModule>` runs once per test. Implementing `IDisposable` (which the base already does) hooks xUnit's per-test teardown. The minimal pattern, lifted directly from `framework/test/Volo.Abp.AI.Tests/Volo/Abp/AI/ChatClient_Tests.cs`, is:
+
+```csharp
+public class ChatClient_Tests : AbpIntegratedTest<AbpAITestModule>
+{
+    [Fact]
+    public void Should_Resolve_ChatClient_For_Workspace()
+    {
+        var chatClient = GetRequiredService<IChatClient<WordCounter>>();
+        chatClient.ShouldNotBeNull();
+        chatClient.ShouldNotBeOfType<MockDefaultChatClient>();
+    }
+}
+```
+
+The class has no constructor — the base does the work. Resolution is via `GetRequiredService<T>()` inherited from `AbpTestBaseWithServiceProvider`. Assertion uses Shouldly. The module pointed at, `AbpAITestModule`, configures mock chat clients via `PreConfigure<AbpAIWorkspaceOptions>` (see `framework/test/Volo.Abp.AI.Tests/Volo/Abp/AI/AbpAITestModule.cs`) — that pre-configure runs because the test base went through the real `services.AddApplication<TStartupModule>(...)` call.
+
+## `AbpAsyncIntegratedTest<TStartupModule>`
+
+The async sibling at `framework/src/Volo.Abp.TestBase/Volo/Abp/Testing/AbpAsyncIntegratedTest.cs` exposes the same shape, but pushes the bootstrap into `InitializeAsync` so it can `await` each step. The signature:
+
+```csharp
+public class AbpAsyncIntegratedTest<TStartupModule> : AbpTestBaseWithServiceProvider
+    where TStartupModule : IAbpModule
+{
+    protected IAbpApplication Application { get; set; } = default!;
+    protected IServiceProvider RootServiceProvider { get; set; } = default!;
+    protected IServiceScope TestServiceScope { get; set; } = default!;
+
+    public virtual async Task InitializeAsync() { /* … */ }
+    public virtual async Task DisposeAsync() { /* … */ }
+}
+```
+
+Note three differences from the sync class. First, properties are settable — the bootstrap does not happen in the constructor, so the runner-driven `InitializeAsync` populates them after the fact. Second, `IAsyncLifetime` from xUnit is not declared explicitly — the *shape* matches, and xUnit binds it by convention if you implement the interface in your test class. Third, the hooks are async: `CreateServiceCollectionAsync`, `BeforeAddApplicationAsync`, `SetAbpApplicationCreationOptionsAsync` (returns `Task<Action<AbpApplicationCreationOptions>>`), `AfterAddApplicationAsync`, `CreateServiceProviderAsync`, and `InitializeServicesAsync`.
+
+The `InitializeAsync` body, copied from `framework/src/Volo.Abp.TestBase/Volo/Abp/Testing/AbpAsyncIntegratedTest.cs`:
+
+```csharp
+public virtual async Task InitializeAsync()
+{
+    var services = await CreateServiceCollectionAsync();
+    await BeforeAddApplicationAsync(services);
+    var application = await services.AddApplicationAsync<TStartupModule>(
+        await SetAbpApplicationCreationOptionsAsync());
+    await AfterAddApplicationAsync(services);
+
+    RootServiceProvider = await CreateServiceProviderAsync(services);
+    TestServiceScope = RootServiceProvider.CreateScope();
+    await application.InitializeAsync(TestServiceScope.ServiceProvider);
+    ServiceProvider = application.ServiceProvider;
+    Application = application;
+
+    await InitializeServicesAsync();
+}
+```
+
+There are two practical reasons to prefer the async base. First, modules that perform asynchronous initialisation work (database migrations, seed routines, distributed-cache warmups) should be exercised through the async path because `services.AddApplicationAsync` runs `PreConfigureServicesAsync` and `ConfigureServicesAsync` on every module in the graph. Second, if you must `await` something from a test fixture's setup (a docker container, an event-bus connection), you cannot do it from a constructor — only from `InitializeAsync`.
+
+`DisposeAsync` mirrors the sync version but awaits `Application.ShutdownAsync()`:
+
+```csharp
+public virtual async Task DisposeAsync()
+{
+    await Application.ShutdownAsync();
+    if (RootServiceProvider is IDisposable disposable)
+    {
+        disposable.Dispose();
+    }
+    TestServiceScope.Dispose();
+    Application.Dispose();
+}
+```
+
+To use this with xUnit, implement `IAsyncLifetime` on your test class and forward to `base.InitializeAsync()` / `base.DisposeAsync()`:
+
+```csharp
+public class MyTests : AbpAsyncIntegratedTest<MyTestModule>, IAsyncLifetime
+{
+    [Fact]
+    public async Task Should_Initialize() { /* … */ }
+}
+```
+
+xUnit will call `InitializeAsync` after construction and `DisposeAsync` after the test, satisfying the contract the base class expects.
+
+## `ITestCounter` and `TestCounter`
+
+The package ships one cross-cutting utility — a named counter registered as a singleton. From `framework/src/Volo.Abp.TestBase/Volo/Abp/Testing/Utils/TestCounter.cs`:
+
+```csharp
+public class TestCounter : ITestCounter, ISingletonDependency
+{
+    public int Increment(string name);
+    public int Decrement(string name);
+    public int Add(string name, int count);
+    public int GetValue(string name);
+    public void ResetCount(string name);
+}
+```
+
+Because it implements `ISingletonDependency`, it is auto-registered in the root container of every test that boots `AbpTestBaseModule`. The intended pattern is to inject `ITestCounter` from `framework/src/Volo.Abp.TestBase/Volo/Abp/Testing/Utils/ITestCounter.cs` into a stub interceptor or event handler under test, increment a named bucket on each invocation, then assert from the test body:
+
+```csharp
+public class MyHandler_Tests : AbpIntegratedTest<MyTestModule>
+{
+    [Fact]
+    public async Task Should_Handle_Twice()
+    {
+        var bus = GetRequiredService<ILocalEventBus>();
+        await bus.PublishAsync(new MyEvent());
+        await bus.PublishAsync(new MyEvent());
+
+        GetRequiredService<ITestCounter>().GetValue("MyHandler").ShouldBe(2);
+    }
+}
+```
+
+Methods are thread-safe — `Add` takes a `lock (_values)` — so concurrent handlers can safely increment the same key.
+
+## Service-collection hooks: practical patterns
+
+The four `Before/After/Set/AfterInitialize` hooks are how nearly every test-tweak in the framework is implemented. Two patterns dominate.
+
+The first is **register a stub before the real one runs**. You add a replacement descriptor in `BeforeAddApplication(IServiceCollection)` so that when ABP module configuration runs and tries to register its default `IClock` (or any other port), your stub already exists and the framework respects it. The framework provides `Dependency(ReplaceServices = true)` for production code, but tests can shortcut via direct descriptor manipulation. The Shouldly helpers at `framework/test/AbpTestBase/Microsoft/Extensions/DependencyInjection/ServiceCollectionShouldlyExtensions.cs` (`ShouldContainTransient`, `ShouldContainSingleton`, etc.) make it easy to assert your stub is the descriptor that survived.
+
+The second is **swap the container factory**. Override `SetAbpApplicationCreationOptions(AbpApplicationCreationOptions options)` and call `options.UseAutofac()` when the production app uses Autofac — many module behaviours (named/keyed services, mixed registration sources) only kick in under the Autofac factory. The pattern is in `framework/test/Volo.Abp.AspNetCore.Mvc.Client.Tests/Volo/Abp/AspNetCore/Mvc/Client/AbpAspNetCoreMvcClientTestBase.cs`.
+
+## `AfterInitialize` for resolving fixtures eagerly
+
+`AfterInitialize` runs after `Application.ServiceProvider` is available. The typical use is eager resolution of services that need warm-up — for instance materialising every `ILocalizationResourceContributor` to surface compile-time errors in `.json` files at boot rather than at the first `[Fact]`. The pattern is:
+
+```csharp
+protected override void AfterInitialize()
+{
+    foreach (var contributor in GetRequiredService<IEnumerable<IFooContributor>>())
+    {
+        contributor.WarmUp();
+    }
+}
+```
+
+Anything thrown from this hook causes the constructor of `AbpIntegratedTest<TStartupModule>` to fail, which xUnit reports as a *test class* failure — every `[Fact]` in the class fails with the same exception. This is usually what you want when fixture-time validation fails.
+
+## Failure modes and exceptions
+
+There is no `AbpTestException` in `Volo.Abp.TestBase`. Anything that goes wrong during boot surfaces as the same exception type the production module pipeline would throw — typically `AbpInitializationException` wrapping the original failure. Dispose-time failures propagate from `Application.ShutdownAsync()`; an exception thrown from a module's `OnApplicationShutdown` will fail the test even if every `[Fact]` succeeded, because xUnit treats `Dispose`/`DisposeAsync` exceptions as test failures.
+
+If your test class implements its own `Dispose` and forgets to call `base.Dispose()`, the `IAbpApplication` never sees `Shutdown`, scoped disposables registered as singletons in `TestServiceScope` are not released, and any spawned timers continue past test exit. The fix is invariant: override `Dispose` virtually and always invoke the base.
+
+## Choosing sync vs async
+
+Use `AbpIntegratedTest<TStartupModule>` when nothing in your module graph performs async work during configuration *and* you can assert against `[Fact]` methods that may themselves be sync or async. The sync constructor runs synchronously, but the resolved services can still be awaited from inside a test body.
+
+Use `AbpAsyncIntegratedTest<TStartupModule>` when (a) your module graph contains async pre-configure or configure steps that you want to honour in tests, (b) you need to await container-warmup work in `InitializeServicesAsync`, or (c) your runner is xUnit and you want to surface initialization failures as `InitializeAsync` errors rather than as constructor throws.
+
+Both expose the same `Application`, `RootServiceProvider`, `TestServiceScope`, `ServiceProvider`, and resolution helpers — the only API difference is how setup is sequenced.
+
+## Where this sits in the rest of the testing stack
+
+`Volo.Abp.TestBase` is the foundation. Higher in the stack, `Volo.Abp.AspNetCore.TestBase` builds an HTTP host on top — see [AspNetCore TestBase](/testing/aspnetcore-test-base) for `AbpWebApplicationFactoryIntegratedTest<TProgram>`, `TestServerAccessor`, and the `UseAbpTestServer` extension. Below the stack, plain xUnit unit tests skip both packages entirely.
+
+Almost every `*.Tests` project under `framework/test/` exercises one of these three modes. The [Framework Tests](/testing/framework-tests) page enumerates them.

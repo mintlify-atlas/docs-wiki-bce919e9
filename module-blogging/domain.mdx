@@ -1,0 +1,276 @@
+---
+title: "Blogging Domain Layer: Blog, Post, Tag, Comment Aggregates"
+sidebarTitle: "Domain"
+description: "Reference for the legacy ABP Framework Blogging module domain layer covering Blog, Post, PostTag, Tag, Comment, BlogUser, and their repositories."
+---
+
+# Blogging Domain Layer
+
+The Blogging module's domain layer is a tight set of five aggregates (`Blog`, `Post`, `Tag`, `Comment`, `BlogUser`) plus the `PostTag` join entity. All of them live under `modules/blogging/src/Volo.Blogging.Domain/Volo/Blogging/`.
+
+<Note>The Blogging module is legacy — new applications should consume the equivalent CMS Kit aggregates documented at [CMS Kit → Domain](/module-cms-kit/domain). This page documents the original ABP Framework Blogging contracts that existing applications still depend on.</Note>
+
+## Aggregate diagram
+
+```mermaid
+erDiagram
+    Blog ||--o{ Post : "BlogId"
+    Blog ||--o{ Tag : "BlogId"
+    Post ||--o{ PostTag : "PostId"
+    Tag ||--o{ PostTag : "TagId"
+    Post ||--o{ Comment : "PostId"
+    Comment }o--o| Comment : "RepliedCommentId"
+    BlogUser ||..|| Post : "audited by"
+    Blog {
+        Guid Id
+        string Name
+        string ShortName
+        string Description
+    }
+    Post {
+        Guid Id
+        Guid BlogId
+        string Title
+        string Url
+        string CoverImage
+        string Content
+        string Description
+        int ReadCount
+    }
+    Tag {
+        Guid Id
+        Guid BlogId
+        string Name
+        string Description
+        int UsageCount
+    }
+    Comment {
+        Guid Id
+        Guid PostId
+        Guid? RepliedCommentId
+        string Text
+    }
+```
+
+Every aggregate root extends `FullAuditedAggregateRoot<Guid>` (creator id, creation time, soft-delete flag, modifier, modification time, deleter). Unlike CMS Kit, Blogging does **not** implement `IMultiTenant` — it is single-tenant by design.
+
+## Blog
+
+`Blog` (`modules/blogging/src/Volo.Blogging.Domain/Volo/Blogging/Blogs/Blog.cs`):
+
+```csharp
+public class Blog : FullAuditedAggregateRoot<Guid>
+{
+    public virtual string Name { get; protected set; }
+    public virtual string ShortName { get; protected set; }
+    public virtual string Description { get; set; }
+
+    public Blog(Guid id, string name, string shortName)
+    {
+        Id = id;
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name));
+        ShortName = Check.NotNullOrWhiteSpace(shortName, nameof(shortName));
+    }
+
+    public virtual Blog SetName(string name) { /* ... */ }
+    public virtual Blog SetShortName(string shortName) { /* ... */ }
+}
+```
+
+`ShortName` is the URL fragment exposed on the reader pages (`/blog/{shortName}`). There is no automatic slug normalization — the caller chooses the literal short name.
+
+`IBlogRepository` (`Blogs/IBlogRepository.cs`):
+
+```csharp
+public interface IBlogRepository : IBasicRepository<Blog, Guid>
+{
+    Task<Blog> FindByShortNameAsync(string shortName, CancellationToken cancellationToken = default);
+}
+```
+
+That single extension method is the lookup used by the reader pages to resolve the short-name segment in the route into a blog id.
+
+## Post
+
+`Post` (`modules/blogging/src/Volo.Blogging.Domain/Volo/Blogging/Posts/Post.cs`):
+
+```csharp
+public class Post : FullAuditedAggregateRoot<Guid>
+{
+    public virtual Guid BlogId { get; protected set; }
+    public virtual string Url { get; protected set; }           // slug
+    public virtual string CoverImage { get; set; }
+    public virtual string Title { get; protected set; }
+    public virtual string Content { get; set; }
+    public virtual string Description { get; set; }
+    public virtual int ReadCount { get; protected set; }
+    public virtual Collection<PostTag> Tags { get; protected set; }
+
+    public Post(Guid id, Guid blogId, string title, string coverImage, string url) { /* ... */ }
+    public virtual Post IncreaseReadCount() { ReadCount++; return this; }
+    public virtual Post SetTitle(string title) { /* ... */ }
+    public virtual Post SetUrl(string url) { /* ... */ }
+    public virtual void AddTag(Guid tagId) => Tags.Add(new PostTag(Id, tagId));
+    public virtual void RemoveTag(Guid tagId) => Tags.RemoveAll(t => t.TagId == tagId);
+}
+```
+
+Notable behavior: `ReadCount` is bumped through a domain method called by the reader page when a post detail is rendered, which means rendering a page is a write — a non-trivial implication for caching and read replicas.
+
+`IPostRepository` (`Posts/IPostRepository.cs`):
+
+```csharp
+public interface IPostRepository : IBasicRepository<Post, Guid>
+{
+    Task<List<Post>> GetPostsByBlogId(Guid id, CancellationToken cancellationToken = default);
+    Task<bool> IsPostUrlInUseAsync(Guid blogId, string url, Guid? excludingPostId = null, CancellationToken cancellationToken = default);
+    Task<Post> GetPostByUrl(Guid blogId, string url, CancellationToken cancellationToken = default);
+    Task<List<Post>> GetOrderedList(Guid blogId, bool descending = false, CancellationToken cancellationToken = default);
+    Task<List<Post>> GetListByUserIdAsync(Guid userId, CancellationToken cancellationToken = default);
+    Task<List<Post>> GetLatestBlogPostsAsync(Guid blogId, int count, CancellationToken cancellationToken = default);
+}
+```
+
+`GetPostByUrl(blogId, url)` is the slug-resolution lookup; `IsPostUrlInUseAsync` enforces slug uniqueness within a blog at the application layer.
+
+## PostTag
+
+`PostTag` (`Posts/PostTag.cs`) is a `CreationAuditedEntity` (not an aggregate root) with composite key `(PostId, TagId)`. It is owned by `Post` and serialized inside its `Tags` collection — Entity Framework Core / Mongo manage it as part of the parent's persistence boundary.
+
+## Tag
+
+`Tag` (`modules/blogging/src/Volo.Blogging.Domain/Volo/Blogging/Tagging/Tag.cs`):
+
+```csharp
+public class Tag : FullAuditedAggregateRoot<Guid>
+{
+    public virtual Guid BlogId { get; protected set; }
+    public virtual string Name { get; protected set; }
+    public virtual string Description { get; protected set; }
+    public virtual int UsageCount { get; protected internal set; }
+
+    public virtual void IncreaseUsageCount(int number = 1) { /* ... */ }
+    public virtual void DecreaseUsageCount(int number = 1) { /* clamp at 0 */ }
+}
+```
+
+Tags are scoped to a `BlogId` — the same name can exist in different blogs and they are different rows. `UsageCount` is maintained by the application layer when posts add or remove tags and is what powers the tag cloud sizing on the public site.
+
+`ITagRepository` (`Tagging/ITagRepository.cs`):
+
+```csharp
+public interface ITagRepository : IBasicRepository<Tag, Guid>
+{
+    Task<List<Tag>> GetListAsync(Guid blogId, CancellationToken cancellationToken = default);
+    Task<Tag> GetByNameAsync(Guid blogId, string name, CancellationToken cancellationToken = default);
+    Task<Tag> FindByNameAsync(Guid blogId, string name, CancellationToken cancellationToken = default);
+    Task<List<Tag>> GetListAsync(IEnumerable<Guid> ids, CancellationToken cancellationToken = default);
+    Task DecreaseUsageCountOfTagsAsync(List<Guid> id, CancellationToken cancellationToken = default);
+}
+```
+
+`DecreaseUsageCountOfTagsAsync` is the bulk-decrement helper called when a post is deleted — it touches every tag the post used to carry in a single round trip.
+
+## Comment
+
+`Comment` (`modules/blogging/src/Volo.Blogging.Domain/Volo/Blogging/Comments/Comment.cs`):
+
+```csharp
+public class Comment : FullAuditedAggregateRoot<Guid>
+{
+    public virtual Guid PostId { get; protected set; }
+    public virtual Guid? RepliedCommentId { get; protected set; }
+    public virtual string Text { get; protected set; }
+
+    public void SetText(string text) =>
+        Text = Check.NotNullOrWhiteSpace(text, nameof(text));
+}
+```
+
+Threading is encoded as a self-reference via `RepliedCommentId` — the same pattern CMS Kit later adopted. The `CreatorId` (inherited from `FullAuditedAggregateRoot`) plays the role of "author".
+
+`ICommentRepository` (`Comments/ICommentRepository.cs`):
+
+```csharp
+public interface ICommentRepository : IBasicRepository<Comment, Guid>
+{
+    Task<List<Comment>> GetListOfPostAsync(Guid postId, CancellationToken cancellationToken = default);
+    Task<int> GetCommentCountOfPostAsync(Guid postId, CancellationToken cancellationToken = default);
+    Task<List<Comment>> GetRepliesOfComment(Guid id, CancellationToken cancellationToken = default);
+    Task DeleteOfPost(Guid id, CancellationToken cancellationToken = default);
+}
+```
+
+`DeleteOfPost(postId)` removes every comment of a post — called from `IPostAppService.DeleteAsync` so a post deletion does not leave orphan comments.
+
+## BlogUser
+
+`BlogUser` (`modules/blogging/src/Volo.Blogging.Domain/Volo/Blogging/Users/BlogUser.cs`) mirrors the identity user inside the blogging database the same way `CmsUser` does in CMS Kit. Maintenance happens through `BlogUserSynchronizer` (subscribes to identity user changes) and `IBlogUserLookupService` (default `BlogUserLookupService`, `Users/BlogUserLookupService.cs`) which performs find-or-create on demand. `IBlogUserRepository` (`Users/IBlogUserRepository.cs`) is the standard repository contract.
+
+## Persistence
+
+`BloggingDbContext` (`modules/blogging/src/Volo.Blogging.EntityFrameworkCore/Volo/Blogging/EntityFrameworkCore/BloggingDbContext.cs`):
+
+```csharp
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpBloggingDbProperties.ConnectionStringName)]
+public class BloggingDbContext : AbpDbContext<BloggingDbContext>, IBloggingDbContext
+{
+    public DbSet<BlogUser> Users { get; set; }
+    public DbSet<Blog> Blogs { get; set; }
+    public DbSet<Post> Posts { get; set; }
+    public DbSet<Tag> Tags { get; set; }
+    public DbSet<PostTag> PostTags { get; set; }
+    public DbSet<Comment> Comments { get; set; }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        builder.ConfigureBlogging();
+    }
+}
+```
+
+`[IgnoreMultiTenancy]` is what makes the Blogging tables sit outside ABP's tenant filter — every Blogging row is global. EF Core repositories live next to the entities at `modules/blogging/src/Volo.Blogging.EntityFrameworkCore/Volo/Blogging/<area>/EfCore*Repository.cs`. The Mongo variant mirrors the same shape under `Volo.Blogging.MongoDB/Volo/Blogging/MongoDB/`.
+
+## BloggingDomainModule
+
+```csharp
+[DependsOn(
+    typeof(BloggingDomainSharedModule),
+    typeof(AbpDddDomainModule),
+    typeof(AbpMapperlyModule),
+    typeof(AbpCachingModule)
+)]
+public class BloggingDomainModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMapperlyObjectMapper<BloggingDomainModule>();
+        Configure<AbpDistributedEntityEventOptions>(options =>
+        {
+            options.EtoMappings.Add<Blog, BlogEto>(typeof(BloggingDomainModule));
+            options.EtoMappings.Add<Comment, CommentEto>(typeof(BloggingDomainModule));
+            options.EtoMappings.Add<Post, PostEto>(typeof(BloggingDomainModule));
+            options.EtoMappings.Add<Tag, TagEto>(typeof(BloggingDomainModule));
+        });
+    }
+}
+```
+
+The ETO mappings let host applications subscribe to the standard ABP distributed-event bus envelopes (`EntityCreatedEto<PostEto>` and friends) without needing to reference the Blogging domain assembly.
+
+## Caching helpers
+
+`PostCacheItem` (`Posts/PostCacheItem.cs`) is the cached-list element; `PostCacheInvalidator` (`Posts/PostCacheInvalidator.cs`) reacts to `PostChangedEvent` to invalidate the cache. The cache itself is wired by the Application module as `IDistributedCache<List<PostCacheItem>>`.
+
+## Where to next
+
+<CardGroup cols={2}>
+<Card title="Admin" icon="screwdriver-wrench" href="/module-blogging/admin">
+The blog-container management app service.
+</Card>
+<Card title="Web UI" icon="window" href="/module-blogging/web">
+Reader, author, and admin Razor pages built on these aggregates.
+</Card>
+</CardGroup>

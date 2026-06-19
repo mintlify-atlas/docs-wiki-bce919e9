@@ -1,0 +1,303 @@
+---
+title: "ABP GDPR: Personal Data Export and Deletion Contracts"
+sidebarTitle: "GDPR"
+description: "Use Volo.Abp.Gdpr.Abstractions to describe personal-data export and erasure flows with ETO messages, GdprDataInfo dictionaries, and provider contexts."
+---
+
+<Note>
+  In this snapshot the only Gdpr package present is
+  `framework/src/Volo.Abp.Gdpr.Abstractions/`. The parent brief referenced
+  `Volo.Abp.Gdpr` and `IPersonalData*Provider` interfaces — those concrete
+  contracts (`IPersonalDataProvider`, deletion providers) are **not** in this
+  source tree. They live in a commercial GDPR module released separately. This
+  page documents the abstractions that ship with the open-source framework:
+  the `GdprDataInfo` bag, `GdprUserDataProviderContext`, and the three event
+  transfer object (ETO) types under
+  `framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/`.
+</Note>
+
+## Overview
+
+The ABP Framework defines a small set of *abstractions* that downstream
+modules use to coordinate a GDPR personal-data request: the request itself,
+the prepared payload, and the deletion command. They are deliberately
+generic — a `Dictionary<string, string>` carries the exported data, a
+context object carries the user identifier, and three serializable ETOs are
+broadcast over the distributed event bus. The commercial GDPR module and any
+custom personal-data provider you write build on top of these contracts so
+that data subject requests from a tenant administration UI can fan out across
+modules and gather data from each one without tight coupling.
+
+The full namespace surface lives in
+`framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/`:
+
+- `AbpGdprAbstractionsModule.cs`
+- `GdprDataInfo.cs`
+- `GdprUserDataProviderContext.cs`
+- `GdprUserDataRequestedEto.cs`
+- `GdprUserDataPreparedEto.cs`
+- `GdprUserDataDeletionRequestedEto.cs`
+
+There are no DI registrations in the abstractions package — the contracts are
+plain CLR types meant to be consumed by other modules. The module file only
+exists so consumers can express `[DependsOn(typeof(AbpGdprAbstractionsModule))]`.
+
+## The module
+
+`framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/AbpGdprAbstractionsModule.cs`
+is intentionally empty:
+
+```csharp framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/AbpGdprAbstractionsModule.cs
+using Volo.Abp.Modularity;
+
+namespace Volo.Abp.Gdpr;
+
+public class AbpGdprAbstractionsModule : AbpModule
+{
+}
+```
+
+The module declares no dependencies, configures no services, and provides no
+options. Its sole purpose is to make the assembly discoverable so other
+modules can take a typed dependency on it.
+
+## `GdprDataInfo`
+
+The payload type, `framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprDataInfo.cs`,
+is a transparent extension of the string dictionary:
+
+```csharp framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprDataInfo.cs
+[Serializable]
+public class GdprDataInfo : Dictionary<string, string>
+{
+}
+```
+
+The `[Serializable]` attribute is important — `GdprDataInfo` is shipped
+inside ETO messages on the distributed event bus, so it must round-trip
+through the configured serializer. By staying a `Dictionary<string, string>`
+the type is intentionally open: each personal-data provider chooses its own
+keys (e.g. `"Email"`, `"FullName"`, `"OrderHistory"`), and the consumer of
+the prepared event can iterate the dictionary without needing a strongly
+typed view of every module's schema.
+
+For larger or nested payloads, the convention is to serialise the structured
+data into a string value (typically JSON) and store it under a key like
+`"orders.json"` — keeping the contract a flat dictionary keeps the wire
+format identical across modules.
+
+## `GdprUserDataProviderContext`
+
+The simple context type at
+`framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprUserDataProviderContext.cs`
+is the parameter object passed to personal-data providers:
+
+```csharp framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprUserDataProviderContext.cs
+public class GdprUserDataProviderContext
+{
+    public Guid UserId { get; set; }
+}
+```
+
+Just a `UserId`. The `Guid` shape lines up with the `Guid` user identifiers
+used throughout `Volo.Abp.Identity`. Providers receive the context, look up
+their own data for that user, and append entries to a `GdprDataInfo`.
+
+The reason the context lives in a class rather than being passed as a raw
+`Guid` is forward-compatibility: future framework versions can add properties
+(culture, requesting administrator, correlation token, etc.) without
+breaking existing provider signatures.
+
+## The distributed events
+
+GDPR coordination in ABP is event-driven. Three event transfer objects
+encode the three steps of a request lifecycle:
+
+| Step                    | ETO type                                                           |
+| ----------------------- | ------------------------------------------------------------------ |
+| User data was requested | `GdprUserDataRequestedEto`                                         |
+| A provider has its data | `GdprUserDataPreparedEto`                                          |
+| Erasure was requested   | `GdprUserDataDeletionRequestedEto`                                 |
+
+All three are `[Serializable]` so they can be transmitted by any registered
+distributed event bus provider (in-process, RabbitMQ, Azure Service Bus,
+Kafka, …) without bespoke serialisation code.
+
+### `GdprUserDataRequestedEto`
+
+`framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprUserDataRequestedEto.cs`
+is published when an administrator opens a GDPR data export request:
+
+```csharp framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprUserDataRequestedEto.cs
+[Serializable]
+public class GdprUserDataRequestedEto
+{
+    public Guid UserId { get; set; }
+    public Guid RequestId { get; set; }
+}
+```
+
+The pair `(UserId, RequestId)` is the correlation key: `UserId` identifies
+the data subject; `RequestId` identifies the request itself so that multiple
+prepared-data events can later be correlated back to the original request
+even if several requests are inflight at the same time.
+
+### `GdprUserDataPreparedEto`
+
+`framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprUserDataPreparedEto.cs`
+is published by each personal-data provider after it has gathered its share
+of the user's data:
+
+```csharp framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprUserDataPreparedEto.cs
+[Serializable]
+public class GdprUserDataPreparedEto
+{
+    public Guid RequestId { get; set; }
+    public string Provider { get; set; } = default!;
+    public GdprDataInfo Data { get; set; } = default!;
+}
+```
+
+Three fields, each load-bearing:
+
+- **`RequestId`** correlates the prepared payload with the original
+  `GdprUserDataRequestedEto.RequestId`. A central GDPR coordinator aggregates
+  every prepared event for the same `RequestId` into one export file.
+- **`Provider`** names the provider that produced the payload (for example
+  `"Identity"`, `"Audit"`, `"Cms"`). This becomes the section header in the
+  export and lets administrators see which modules contributed.
+- **`Data`** carries the actual key-value bag.
+
+The `default!` initialisers exist because the type is a mutable DTO with
+non-nullable reference properties; consumers always set both before
+publishing.
+
+### `GdprUserDataDeletionRequestedEto`
+
+`framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprUserDataDeletionRequestedEto.cs`
+is the erasure counterpart:
+
+```csharp framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/GdprUserDataDeletionRequestedEto.cs
+[Serializable]
+public class GdprUserDataDeletionRequestedEto
+{
+    public Guid UserId { get; set; }
+}
+```
+
+Unlike the export event, the deletion event does not carry a `RequestId`
+because the response is not aggregated — each handler is expected to
+delete or anonymise its own data and is not required to acknowledge.
+
+The recommended pattern in handlers is to make the deletion idempotent (so
+re-publishing the event has no extra effect) and to respect tenant boundaries
+by deleting only data the current tenant owns, even when the request crosses
+tenant filters.
+
+## Putting it together
+
+Even though the open-source abstractions do not ship a concrete
+`IPersonalDataProvider`, the contracts above are everything a custom or
+commercial provider needs:
+
+<Steps>
+  <Step title="Subscribe to the requested event">
+    A provider module declares
+    `IDistributedEventHandler<GdprUserDataRequestedEto>` and listens for
+    requests. The handler reads `UserId` from the ETO defined in
+    `GdprUserDataRequestedEto.cs`.
+  </Step>
+  <Step title="Collect data using the context shape">
+    Internally the provider constructs a
+    `GdprUserDataProviderContext` (or a similar parameter object) carrying
+    the `UserId` and queries its own repositories.
+  </Step>
+  <Step title="Publish prepared data">
+    The provider fills a `GdprDataInfo` dictionary (from
+    `GdprDataInfo.cs`) and publishes a `GdprUserDataPreparedEto`
+    (from `GdprUserDataPreparedEto.cs`) carrying the original
+    `RequestId`, its own `Provider` name, and the dictionary.
+  </Step>
+  <Step title="Handle deletion separately">
+    A separate handler for `GdprUserDataDeletionRequestedEto` performs
+    erasure for the same `UserId`, again from the type defined in
+    `GdprUserDataDeletionRequestedEto.cs`.
+  </Step>
+</Steps>
+
+## Schema considerations
+
+Because `GdprDataInfo` is a `Dictionary<string, string>`, the contract is
+"key + scalar string value". Two pragmatic patterns emerge:
+
+<CardGroup cols={2}>
+  <Card title="Flat keys" icon="list">
+    Use stable, lower-snake-case keys like `"email"`, `"phone_number"`,
+    `"full_name"`. Each key maps to a single line in the export.
+  </Card>
+  <Card title="Embedded JSON" icon="brackets-curly">
+    Use keys like `"orders.json"` whose value is a JSON-serialised list
+    when one entry would otherwise blow up the dictionary. Consumers can
+    deserialise on demand.
+  </Card>
+</CardGroup>
+
+The contract intentionally does not enforce either approach; choose the one
+that maps best to the data subject's mental model of "their data".
+
+## Multi-tenancy
+
+The ETO types in
+`framework/src/Volo.Abp.Gdpr.Abstractions/Volo/Abp/Gdpr/` do not carry a
+`TenantId`. Subscribers should rely on the ABP distributed event bus's
+implicit `ICurrentTenant` propagation (where supported by the configured
+provider) or include the tenant identifier inside the `GdprDataInfo`
+payload when cross-tenant correlation matters. For deletion, handlers that
+query data with `IRepository<T>` will naturally scope to the current tenant
+because of the `IMultiTenant` filter applied by the framework — no extra
+work required.
+
+## Versioning the contracts
+
+Because the events flow over the distributed event bus and may be processed
+by older subscribers, keep these rules in mind when extending the contracts:
+
+1. Never remove a property from any of the three ETO types
+   (`GdprUserDataRequestedEto`, `GdprUserDataPreparedEto`,
+   `GdprUserDataDeletionRequestedEto`).
+2. Never rename `GdprDataInfo` keys that downstream consumers may already
+   index by.
+3. Add new properties to `GdprUserDataProviderContext` rather than creating
+   parallel context types — the class shape is the extension point.
+
+## When you need more than the abstractions
+
+The contracts in `Volo.Abp.Gdpr.Abstractions` are the *minimum* surface
+required to participate in a GDPR workflow. Concrete personal-data provider
+interfaces (e.g. an `IPersonalDataProvider` registered with a manager), the
+aggregation UI, and the request entity itself live in a separate module
+shipped with ABP's commercial offering. Until that module is referenced,
+your application can still:
+
+- Publish `GdprUserDataRequestedEto` from any custom UI you build.
+- Implement handlers that collect data and publish
+  `GdprUserDataPreparedEto`.
+- Forward `GdprUserDataDeletionRequestedEto` to your own erasure code.
+
+All three types are stable, public, and forward-compatible — exactly the
+contract surface the abstractions package is meant to expose.
+
+## Related concerns
+
+<CardGroup cols={2}>
+  <Card title="Distributed events" icon="paper-plane">
+    The ETO classes in `Volo/Abp/Gdpr/` are designed to flow over
+    `IDistributedEventBus`. See the events documentation for handler
+    registration patterns.
+  </Card>
+  <Card title="Identity" icon="user">
+    `GdprUserDataProviderContext.UserId` and
+    `GdprUserDataDeletionRequestedEto.UserId` reference the `Guid` user
+    identifiers issued by `Volo.Abp.Identity`.
+  </Card>
+</CardGroup>

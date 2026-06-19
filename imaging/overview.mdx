@@ -1,0 +1,248 @@
+---
+title: "Imaging Abstractions Overview for ABP Framework Apps"
+sidebarTitle: "Overview"
+description: "Resize and compress images in ABP Framework through IImageResizer, IImageCompressor and the contributor chain shared by ImageSharp, SkiaSharp and Magick.NET."
+---
+
+The ABP Framework `Volo.Abp.Imaging.Abstractions` module defines a tiny, allocation-friendly pipeline for resizing and compressing images. Applications inject `IImageResizer` and `IImageCompressor` and call a single method; the actual pixel-level work is delegated to one or more "contributor" implementations registered by provider modules — `Volo.Abp.Imaging.ImageSharp`, `Volo.Abp.Imaging.SkiaSharp` and `Volo.Abp.Imaging.MagickNet`. Switch providers (or stack them) without touching the call site.
+
+## Package map
+
+```
+Volo.Abp.Imaging.Abstractions     ← interfaces, DTOs, default coordinators
+├── Volo.Abp.Imaging.ImageSharp   ← contributors backed by SixLabors.ImageSharp
+├── Volo.Abp.Imaging.SkiaSharp    ← contributors backed by SkiaSharp
+├── Volo.Abp.Imaging.MagickNet    ← contributors backed by Magick.NET (ImageMagick)
+└── Volo.Abp.Imaging.AspNetCore   ← MVC action filters: [ResizeImage], [CompressImage]
+```
+
+| Provider | Resize | Compress | Notes |
+| --- | --- | --- | --- |
+| ImageSharp (`framework/src/Volo.Abp.Imaging.ImageSharp/`) | ✔ JPEG/PNG/GIF/BMP/TIFF/WebP | ✔ JPEG/PNG/WebP | Pure managed; cross-platform; no native deps |
+| SkiaSharp (`framework/src/Volo.Abp.Imaging.SkiaSharp/`) | ✔ JPEG/PNG/WebP | ✘ | Native; very fast; uses Google's Skia |
+| Magick.NET (`framework/src/Volo.Abp.Imaging.MagickNet/`) | ✔ JPEG/PNG/GIF/BMP/TIFF/WebP | ✔ JPEG/PNG/GIF | Native; ImageMagick; widest format support |
+
+## AbpImagingAbstractionsModule
+
+`AbpImagingAbstractionsModule` (`framework/src/Volo.Abp.Imaging.Abstractions/Volo/Abp/Imaging/AbpImagingAbstractionsModule.cs`) depends only on `AbpThreadingModule`:
+
+```csharp
+[DependsOn(typeof(AbpThreadingModule))]
+public class AbpImagingAbstractionsModule : AbpModule { }
+```
+
+It does not register `IImageResizer` / `IImageCompressor` explicitly because the default coordinators (`ImageResizer`, `ImageCompressor`) use `[ITransientDependency]`.
+
+## Public abstractions
+
+### IImageResizer / IImageCompressor
+
+Two-overload interfaces — `byte[]` and `Stream` — defined in `IImageResizer.cs` and `IImageCompressor.cs`:
+
+```csharp
+public interface IImageResizer
+{
+    Task<ImageResizeResult<Stream>> ResizeAsync(
+        Stream stream, ImageResizeArgs args,
+        string? mimeType = null, CancellationToken ct = default);
+
+    Task<ImageResizeResult<byte[]>> ResizeAsync(
+        byte[] bytes, ImageResizeArgs args,
+        string? mimeType = null, CancellationToken ct = default);
+}
+
+public interface IImageCompressor
+{
+    Task<ImageCompressResult<Stream>> CompressAsync(
+        Stream stream, string? mimeType = null,
+        CancellationToken ct = default);
+
+    Task<ImageCompressResult<byte[]>> CompressAsync(
+        byte[] bytes, string? mimeType = null,
+        CancellationToken ct = default);
+}
+```
+
+Both methods accept an optional MIME type for short-circuiting. Without it, providers fall back to format-sniffing — slower but always correct.
+
+### Results and state
+
+Every operation returns an `ImageProcessResult<T>` (abstract base in `ImageProcessResult.cs`):
+
+```csharp
+public abstract class ImageProcessResult<T>
+{
+    public T Result { get; }
+    public ImageProcessState State { get; }
+}
+```
+
+`ImageResizeResult<T>` and `ImageCompressResult<T>` are the two concrete subclasses (`ImageResizeResult.cs` / `ImageCompressResult.cs`). The result is a `Stream` or `byte[]` carrying the processed bytes — or the original payload when the contributor declined.
+
+`ImageProcessState` (`ImageProcessState.cs`) is a three-value enum:
+
+| Value | Meaning |
+| --- | --- |
+| `Done = 1` | Processed successfully; `Result` holds the new bytes |
+| `Canceled = 2` | The contributor decided the result wasn't beneficial (e.g. compressed output was larger than input); `Result` holds the original |
+| `Unsupported = 3` | The contributor doesn't handle this MIME type / format; the next contributor in the chain gets a turn |
+
+The state is the contract the coordinator uses to walk the contributor chain.
+
+### ImageResizeArgs and ImageResizeMode
+
+`ImageResizeArgs` (`ImageResizeArgs.cs`) carries `Width`, `Height` (both `uint`, validated non-negative in the property setter), and an `ImageResizeMode`:
+
+```csharp
+public ImageResizeArgs(uint? width = null, uint? height = null, ImageResizeMode? mode = null);
+```
+
+`ImageResizeMode` (`ImageResizeMode.cs`) is the cross-provider enum:
+
+| Value | Behavior |
+| --- | --- |
+| `None = 0` | Use width/height as-is; default fallback when no mode is configured |
+| `Stretch = 1` | Distort to match the target exactly |
+| `BoxPad = 2` | Resize within a box, pad with transparent background |
+| `Min = 3` | Choose the smaller dimension to maintain aspect ratio |
+| `Max = 4` | Choose the larger dimension to maintain aspect ratio |
+| `Crop = 5` | Center-crop after resizing |
+| `Pad = 6` | Like `BoxPad` but preserves aspect ratio differently |
+| `Default = 7` | Resolved at runtime to `ImageResizeOptions.DefaultResizeMode` |
+
+When `ImageResizeArgs.Mode == ImageResizeMode.Default`, the `ImageResizer` coordinator replaces it with the value of `ImageResizeOptions.DefaultResizeMode` (`ImageResizeOptions.cs`) — which itself defaults to `ImageResizeMode.None`.
+
+## Coordinators and the contributor chain
+
+`ImageResizer` (`framework/src/Volo.Abp.Imaging.Abstractions/Volo/Abp/Imaging/ImageResizer.cs`) and `ImageCompressor` (`ImageCompressor.cs`) are the default `[ITransientDependency]` implementations. Both follow the same chain-of-responsibility pattern.
+
+### Constructor injection
+
+```csharp
+public ImageResizer(
+    IEnumerable<IImageResizerContributor> imageResizerContributors,
+    IOptions<ImageResizeOptions> imageResizeOptions,
+    ICancellationTokenProvider cancellationTokenProvider)
+{
+    ImageResizerContributors    = imageResizerContributors.Reverse();
+    CancellationTokenProvider   = cancellationTokenProvider;
+    ImageResizeOptions          = imageResizeOptions.Value;
+}
+```
+
+The order of contributors is reversed twice (once in the constructor, once in the loop) — so registrations declared last via `ITransientDependency` take precedence and the chain walks them first. Combine this with `[ExposeServices]` to layer contributors per format if needed.
+
+### Loop semantics
+
+```csharp
+foreach (var contributor in ImageResizerContributors.Reverse())
+{
+    var result = await contributor.TryResizeAsync(stream, resizeArgs, mimeType, ct);
+    SeekToBegin(stream);
+
+    if (result.State == ImageProcessState.Unsupported) continue;
+    return result;
+}
+
+return new ImageResizeResult<Stream>(stream, ImageProcessState.Unsupported);
+```
+
+A contributor returning `Unsupported` lets the next one try; any other state stops the loop. If all contributors decline, the coordinator returns `Unsupported` with the unchanged input.
+
+`SeekToBegin(stream)` resets the position so the next contributor can re-read from byte zero. The coordinator also wraps non-seekable streams in a `MemoryStream` before iterating (essential for piping form uploads or HTTP request bodies).
+
+### CancellationTokenProvider
+
+`ICancellationTokenProvider.FallbackToProvider(cancellationToken)` uses ABP's ambient token (e.g. one from `IAbpAspNetCoreCancellationTokenProvider`) when the caller did not pass one explicitly. The token comes from `framework/src/Volo.Abp.Threading/Volo/Abp/Threading/`.
+
+## Contributor interfaces
+
+The provider modules implement two interfaces in `IImageResizerContributor.cs` / `IImageCompressorContributor.cs`:
+
+```csharp
+public interface IImageResizerContributor
+{
+    Task<ImageResizeResult<Stream>>  TryResizeAsync(Stream, ImageResizeArgs, string? mimeType, CancellationToken);
+    Task<ImageResizeResult<byte[]>>  TryResizeAsync(byte[],  ImageResizeArgs, string? mimeType, CancellationToken);
+}
+
+public interface IImageCompressorContributor
+{
+    Task<ImageCompressResult<Stream>> TryCompressAsync(Stream, string? mimeType, CancellationToken);
+    Task<ImageCompressResult<byte[]>> TryCompressAsync(byte[],  string? mimeType, CancellationToken);
+}
+```
+
+Concrete implementations: `ImageSharpImageResizerContributor`, `ImageSharpImageCompressorContributor` (`framework/src/Volo.Abp.Imaging.ImageSharp/Volo/Abp/Imaging/`), `SkiaSharpImageResizerContributor` (`framework/src/Volo.Abp.Imaging.SkiaSharp/`), `MagickImageResizerContributor` and `MagickImageCompressorContributor` (`framework/src/Volo.Abp.Imaging.MagickNet/`). Each one is registered as `ITransientDependency`.
+
+## Pipeline overview
+
+```mermaid
+flowchart TB
+    A[Application code]
+    A -->|IImageResizer.ResizeAsync| B[ImageResizer coordinator]
+    A -->|IImageCompressor.CompressAsync| C[ImageCompressor coordinator]
+    B --> D{Iterate IImageResizerContributor[]}
+    C --> E{Iterate IImageCompressorContributor[]}
+    D -->|Unsupported| D
+    D -->|Done / Canceled| F[ImageResizeResult]
+    E -->|Unsupported| E
+    E -->|Done / Canceled| G[ImageCompressResult]
+    D -->|fallthrough| H[ImageResizeResult(Unsupported, original)]
+    E -->|fallthrough| I[ImageCompressResult(Unsupported, original)]
+```
+
+## Provider matrix
+
+| Feature | ImageSharp | SkiaSharp | Magick.NET |
+| --- | --- | --- | --- |
+| Module class | `AbpImagingImageSharpModule` | `AbpImagingSkiaSharpModule` | `AbpImagingMagickNetModule` |
+| Resize contributor | `ImageSharpImageResizerContributor` | `SkiaSharpImageResizerContributor` | `MagickImageResizerContributor` |
+| Compress contributor | `ImageSharpImageCompressorContributor` | (none) | `MagickImageCompressorContributor` |
+| Resize options | (none) | `SkiaSharpResizerOptions` (`SKSamplingOptions`, `Quality`) | (none) |
+| Compress options | `ImageSharpCompressOptions` (`JpegEncoder`, `PngEncoder`, `WebpEncoder`, `DefaultQuality=75`) | n/a | `MagickNetCompressOptions` (`OptimalCompression`, `IgnoreUnsupportedFormats`, `Lossless`) |
+| Default native deps | None | libskia (per RID) | ImageMagick (per RID) |
+
+ImageSharp is the safest default for cross-platform deployments; SkiaSharp is the fastest pure-resize option; Magick.NET handles the widest format set (including 16-bit TIFF, animated GIF reencoding) at the cost of a native dependency.
+
+## ImageResizeOptions
+
+`ImageResizeOptions` (`ImageResizeOptions.cs`) holds the global resize defaults:
+
+```csharp
+public class ImageResizeOptions
+{
+    public ImageResizeMode DefaultResizeMode { get; set; } = ImageResizeMode.None;
+}
+```
+
+Configure it from your module:
+
+```csharp
+Configure<ImageResizeOptions>(o => o.DefaultResizeMode = ImageResizeMode.Crop);
+```
+
+After this, any caller passing `ImageResizeMode.Default` (or omitting the mode) gets `Crop` behavior.
+
+## When the result is Unsupported
+
+If you build a pipeline of one provider that does not understand a MIME type, the result `Stream` is the original input — the caller is responsible for handling that case (return the file as-is, log a warning, etc.). The `[ResizeImage]` / `[CompressImage]` ASP.NET Core filters in `Volo.Abp.Imaging.AspNetCore` (see [AspNetCore Imaging](./aspnetcore-imaging)) silently preserve the original file when the contributor reports `Unsupported` or `Canceled`.
+
+## Choosing a provider
+
+- Need pure-managed builds (single-file deploy, no native libs)? Pick **ImageSharp**.
+- Need pure raw-speed resize on JPEG/PNG/WebP? Pick **SkiaSharp** and add ImageSharp for compression.
+- Need exotic formats (animated GIF, 16-bit TIFF, multi-frame PSD)? Pick **Magick.NET**.
+- Need different providers for resize vs compress? Stack both modules — the coordinators walk every registered contributor.
+
+## Reference
+
+| Type | File |
+| --- | --- |
+| `AbpImagingAbstractionsModule` | `framework/src/Volo.Abp.Imaging.Abstractions/Volo/Abp/Imaging/AbpImagingAbstractionsModule.cs` |
+| `IImageResizer` / `ImageResizer` | `framework/src/Volo.Abp.Imaging.Abstractions/Volo/Abp/Imaging/IImageResizer.cs`, `ImageResizer.cs` |
+| `IImageCompressor` / `ImageCompressor` | `framework/src/Volo.Abp.Imaging.Abstractions/Volo/Abp/Imaging/IImageCompressor.cs`, `ImageCompressor.cs` |
+| `IImageResizerContributor` / `IImageCompressorContributor` | `framework/src/Volo.Abp.Imaging.Abstractions/Volo/Abp/Imaging/IImageResizerContributor.cs`, `IImageCompressorContributor.cs` |
+| `ImageResizeArgs` / `ImageResizeMode` / `ImageResizeOptions` | `framework/src/Volo.Abp.Imaging.Abstractions/Volo/Abp/Imaging/ImageResizeArgs.cs`, `ImageResizeMode.cs`, `ImageResizeOptions.cs` |
+| `ImageProcessResult` / `ImageProcessState` | `framework/src/Volo.Abp.Imaging.Abstractions/Volo/Abp/Imaging/ImageProcessResult.cs`, `ImageProcessState.cs` |
+| `ImageResizeResult` / `ImageCompressResult` | `framework/src/Volo.Abp.Imaging.Abstractions/Volo/Abp/Imaging/ImageResizeResult.cs`, `ImageCompressResult.cs` |

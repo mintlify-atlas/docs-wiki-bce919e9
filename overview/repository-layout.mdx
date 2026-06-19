@@ -1,0 +1,406 @@
+---
+title: "ABP Framework Repository Layout and Directory Tree"
+sidebarTitle: "Repository Layout"
+description: "Annotated tour of the abpframework/abp monorepo: framework packages, prebuilt modules, solution templates, npm packages, deploy scripts, and bundles."
+---
+
+The ABP Framework repository is a single monorepo containing the framework runtime, eighteen feature modules, multiple solution templates, an npm workspace, ABP Studio source-code bundles, build automation, and the tooling that pushes packages to NuGet and the npm registry. This page is an annotated map of every top-level directory and the most useful sub-trees inside them. Every entry is grounded in real files so you can grep from the path and find the code immediately.
+
+## Top-level directories
+
+The repository root contains the following directories and key files:
+
+| Path | Purpose |
+| --- | --- |
+| `framework/` | Core framework — all `Volo.Abp.*` runtime, DDD, data, HTTP, and UI packages. |
+| `modules/` | 18 pre-built feature modules (identity, openiddict, tenant-management, cms-kit, …). |
+| `templates/` | Solution scaffolds (`app`, `app-nolayers`, `module`, `console`, `maui`, `wpf`). |
+| `npm/` | Yarn/Lerna workspace for Angular packages (`ng-packs/`) and MVC JS packs (`packs/`). |
+| `studio/source-codes/` | `*.SourceCode` packages consumed by ABP Studio's "source-code module" feature. |
+| `tools/` | Helper executables: `nuget/nuget.exe`, `github-changelog-generator/`, `localization-key-synchronizer/`. |
+| `build/` | PowerShell scripts that build/test all solutions (`build-all.ps1`, `test-all.ps1`, `common.ps1`). |
+| `deploy/` | Numbered release pipeline scripts (`1-fetch-and-build.ps1` through `8-download-release-zip.ps1`, `_run_all.ps1`). |
+| `apiSpec/` | Manual API spec docs (e.g. `Microsoft_AspNetCore_Routing_AbpEndpointRouterOptions.md`). |
+| `docs/` | Per-language documentation roots; configured by `docs/docs-langs.json`. |
+| `test/` | Shared cross-cutting integration tests. |
+| `source-code/` | Aggregated source-code solution used by ABP Studio's monorepo builds. |
+| `abp_io/` | Sources for the abp.io site assets such as `abp_io/AbpIoLocalization/`. |
+| `nupkg/` | Output and scripts (`pack.ps1`, `push_packages.ps1`) shared by deploy scripts. |
+| `ai-rules/` | Coding/AI assistant rules consumed by the ABP AI tooling. |
+| `Directory.Build.props` | Marks `*.Tests` / `*.TestBase` projects as `IsTestProject` and adds `coverlet.collector`. |
+| `Directory.Packages.props` | Central package management — every `<PackageVersion>` entry that the whole repo shares. |
+| `common.props` | Version (`<Version>10.4.0-rc.2</Version>`), `LangVersion`, NuGet metadata. |
+| `common.test.props` | Common settings for test projects. |
+| `configureawait.props` | Adds `ConfigureAwait.Fody` only in `Release` configuration. |
+| `global.json` | Pins the .NET SDK (`10.0.100`) with `rollForward: latestFeature`. |
+| `NuGet.Config` | Restricts package sources to `nuget.org` for restore reproducibility. |
+| `NuGet.md` | Shared readme packed into every `.nupkg`. |
+| `latest-versions.json` | Compatibility matrix used by the docs site and CLI. |
+| `codecov.yml` | Codecov gating: `branch: dev`, 1 % threshold, coverage offsets allowed. |
+| `delete-bin-obj.ps1` | Convenience script that cleans build outputs. |
+
+<Note>
+The repo uses **central package management**. `Directory.Packages.props` sets `<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>` and `<CentralPackageFloatingVersionsEnabled>true</CentralPackageFloatingVersionsEnabled>`, so individual `.csproj` files declare `<PackageReference Include="…" />` without versions and inherit the version from the props file.
+</Note>
+
+## `framework/` — the runtime
+
+`framework/` ships the ABP Framework itself. It has the following structure:
+
+```
+framework/
+├── NuGet.md
+├── Volo.Abp.abpmdl          # ABP Studio module manifest (JSON)
+├── Volo.Abp.abpsln          # ABP Studio solution manifest (JSON)
+├── Volo.Abp.sln.DotSettings # ReSharper/Rider settings
+├── Volo.Abp.slnx            # .NET 9 XML solution file (177 src + many test projects)
+├── src/                     # 177 production packages
+└── test/                    # cross-package integration tests
+```
+
+`framework/Volo.Abp.slnx` lists every project in the framework. Builds use this slnx; ABP Studio uses the `abpmdl` / `abpsln` pair, which group packages and solutions in JSON.
+
+### Package families under `framework/src/`
+
+There are 177 projects in `framework/src/`. They cluster into families by prefix. The biggest families:
+
+<Tabs>
+  <Tab title="AspNetCore (44)">
+    | Path | Notes |
+    | --- | --- |
+    | `framework/src/Volo.Abp.AspNetCore/` | Pipeline plumbing, controllers, default middleware |
+    | `framework/src/Volo.Abp.AspNetCore.Abstractions/` | Public surface used by HTTP packages |
+    | `framework/src/Volo.Abp.AspNetCore.Authentication.JwtBearer/` | JWT bearer authentication adapter |
+    | `framework/src/Volo.Abp.AspNetCore.Authentication.OAuth/` | OAuth adapter |
+    | `framework/src/Volo.Abp.AspNetCore.Authentication.OpenIdConnect/` | OIDC adapter |
+    | `framework/src/Volo.Abp.AspNetCore.Bundling/` | Server-side bundling root |
+    | `framework/src/Volo.Abp.AspNetCore.Components/` | Blazor shared base |
+    | `framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor/` | .NET MAUI Blazor host |
+    | `framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor.Bundling/` | MAUI Blazor bundling |
+    | `framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor.Theming/` | MAUI Blazor theming |
+    | `framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor.Theming.Bundling/` | MAUI theming bundling |
+    | `framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor.Theming.MudBlazor/` | MAUI + MudBlazor |
+    | `framework/src/Volo.Abp.AspNetCore.Components.MauiBlazor.Theming.MudBlazor.Bundling/` | MAUI + MudBlazor bundling |
+    | `framework/src/Volo.Abp.AspNetCore.Components.Server/` | Blazor Server |
+    | `framework/src/Volo.Abp.AspNetCore.Components.Server.Theming/` | Blazor Server theming |
+    | `framework/src/Volo.Abp.AspNetCore.Components.Server.Theming.MudBlazor/` | Server + MudBlazor |
+    | `framework/src/Volo.Abp.AspNetCore.Components.Web/` | Shared web Blazor |
+    | `framework/src/Volo.Abp.AspNetCore.Components.Web.Theming/` | Shared web theming |
+    | `framework/src/Volo.Abp.AspNetCore.Components.Web.Theming.MudBlazor/` | Web + MudBlazor |
+    | `framework/src/Volo.Abp.AspNetCore.Components.WebAssembly/` | Blazor WebAssembly |
+    | `framework/src/Volo.Abp.AspNetCore.Components.WebAssembly.Theming/` | WASM theming |
+    | `framework/src/Volo.Abp.AspNetCore.Components.WebAssembly.Theming.Bundling/` | WASM theming bundling |
+    | `framework/src/Volo.Abp.AspNetCore.Components.WebAssembly.Theming.MudBlazor/` | WASM + MudBlazor |
+    | `framework/src/Volo.Abp.AspNetCore.Components.WebAssembly.Theming.MudBlazor.Bundling/` | WASM + MudBlazor bundling |
+    | `framework/src/Volo.Abp.AspNetCore.MultiTenancy/` | HTTP tenant resolution |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc/` | MVC controllers, dynamic API |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.Client/` | Client-side MVC helpers |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.Client.Common/` | Shared client constants |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.Contracts/` | Shared DTOs/contracts |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.Dapr/` | Dapr-aware MVC bits |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.Dapr.EventBus/` | Dapr event bus controller |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.NewtonsoftJson/` | Optional Newtonsoft.Json formatter |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.UI/` | UI base for MVC |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bootstrap/` | Bootstrap helpers |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling/` | Bundling implementation |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Bundling.Abstractions/` | Bundling abstractions |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.MultiTenancy/` | UI tenant switcher |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Packages/` | UI package descriptors |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared/` | Shared theme primitives |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Theme.Shared.Demo/` | Demo widgets |
+    | `framework/src/Volo.Abp.AspNetCore.Mvc.UI.Widgets/` | View component widgets |
+    | `framework/src/Volo.Abp.AspNetCore.Serilog/` | Serilog enrichment |
+    | `framework/src/Volo.Abp.AspNetCore.SignalR/` | SignalR integration |
+    | `framework/src/Volo.Abp.AspNetCore.TestBase/` | ASP.NET Core test base |
+  </Tab>
+  <Tab title="BlobStoring (9)">
+    | Path | Provider |
+    | --- | --- |
+    | `framework/src/Volo.Abp.BlobStoring/` | Core abstractions, `BlobContainer.cs` |
+    | `framework/src/Volo.Abp.BlobStoring.Aliyun/` | Alibaba Cloud OSS |
+    | `framework/src/Volo.Abp.BlobStoring.Aws/` | AWS S3 |
+    | `framework/src/Volo.Abp.BlobStoring.Azure/` | Azure Blob Storage |
+    | `framework/src/Volo.Abp.BlobStoring.Bunny/` | bunny.net Storage |
+    | `framework/src/Volo.Abp.BlobStoring.FileSystem/` | Local filesystem |
+    | `framework/src/Volo.Abp.BlobStoring.Google/` | Google Cloud Storage |
+    | `framework/src/Volo.Abp.BlobStoring.Memory/` | In-memory (tests / dev) |
+    | `framework/src/Volo.Abp.BlobStoring.Minio/` | MinIO |
+  </Tab>
+  <Tab title="EntityFrameworkCore (8)">
+    | Path | Notes |
+    | --- | --- |
+    | `framework/src/Volo.Abp.EntityFrameworkCore/` | Core integration |
+    | `framework/src/Volo.Abp.EntityFrameworkCore.MySQL/` | Official MySQL provider |
+    | `framework/src/Volo.Abp.EntityFrameworkCore.MySQL.Pomelo/` | Pomelo MySQL provider |
+    | `framework/src/Volo.Abp.EntityFrameworkCore.Oracle/` | Oracle (Oracle.EntityFrameworkCore) |
+    | `framework/src/Volo.Abp.EntityFrameworkCore.Oracle.Devart/` | Oracle (Devart) |
+    | `framework/src/Volo.Abp.EntityFrameworkCore.PostgreSql/` | Npgsql |
+    | `framework/src/Volo.Abp.EntityFrameworkCore.SqlServer/` | SQL Server |
+    | `framework/src/Volo.Abp.EntityFrameworkCore.Sqlite/` | SQLite |
+  </Tab>
+  <Tab title="EventBus (7)">
+    | Path | Transport |
+    | --- | --- |
+    | `framework/src/Volo.Abp.EventBus/` | Local + distributed core |
+    | `framework/src/Volo.Abp.EventBus.Abstractions/` | Public contracts |
+    | `framework/src/Volo.Abp.EventBus.Azure/` | Azure Service Bus |
+    | `framework/src/Volo.Abp.EventBus.Dapr/` | Dapr pub/sub |
+    | `framework/src/Volo.Abp.EventBus.Kafka/` | Confluent.Kafka |
+    | `framework/src/Volo.Abp.EventBus.RabbitMQ/` | RabbitMQ.Client |
+    | `framework/src/Volo.Abp.EventBus.Rebus/` | Rebus |
+  </Tab>
+  <Tab title="BackgroundJobs (6) / BackgroundWorkers (4)">
+    | Path | Backend |
+    | --- | --- |
+    | `framework/src/Volo.Abp.BackgroundJobs/` | Built-in in-process job manager |
+    | `framework/src/Volo.Abp.BackgroundJobs.Abstractions/` | Public contracts |
+    | `framework/src/Volo.Abp.BackgroundJobs.HangFire/` | Hangfire backend |
+    | `framework/src/Volo.Abp.BackgroundJobs.Quartz/` | Quartz backend |
+    | `framework/src/Volo.Abp.BackgroundJobs.RabbitMQ/` | RabbitMQ backend |
+    | `framework/src/Volo.Abp.BackgroundJobs.TickerQ/` | TickerQ backend |
+    | `framework/src/Volo.Abp.BackgroundWorkers/` | Periodic worker base |
+    | `framework/src/Volo.Abp.BackgroundWorkers.Hangfire/` | Hangfire-scheduled workers |
+    | `framework/src/Volo.Abp.BackgroundWorkers.Quartz/` | Quartz-scheduled workers |
+    | `framework/src/Volo.Abp.BackgroundWorkers.TickerQ/` | TickerQ-scheduled workers |
+  </Tab>
+  <Tab title="Http (9)">
+    | Path | Notes |
+    | --- | --- |
+    | `framework/src/Volo.Abp.Http/` | HTTP plumbing |
+    | `framework/src/Volo.Abp.Http.Abstractions/` | Shared HTTP types |
+    | `framework/src/Volo.Abp.Http.Client/` | Dynamic / static client proxying |
+    | `framework/src/Volo.Abp.Http.Client.Dapr/` | Dapr-aware HTTP client |
+    | `framework/src/Volo.Abp.Http.Client.IdentityModel/` | Duende.IdentityModel token handling |
+    | `framework/src/Volo.Abp.Http.Client.IdentityModel.MauiBlazor/` | MAUI token flow |
+    | `framework/src/Volo.Abp.Http.Client.IdentityModel.Web/` | MVC token flow |
+    | `framework/src/Volo.Abp.Http.Client.IdentityModel.WebAssembly/` | WASM token flow |
+    | `framework/src/Volo.Abp.Http.Client.Web/` | MVC HTTP client glue |
+  </Tab>
+</Tabs>
+
+Other notable families:
+
+- **DDD core (4 projects)** — `framework/src/Volo.Abp.Ddd.Domain.Shared/`, `framework/src/Volo.Abp.Ddd.Domain/`, `framework/src/Volo.Abp.Ddd.Application.Contracts/`, `framework/src/Volo.Abp.Ddd.Application/`.
+- **JSON (4)** — `framework/src/Volo.Abp.Json/`, `Volo.Abp.Json.Abstractions/`, `Volo.Abp.Json.Newtonsoft/`, `Volo.Abp.Json.SystemTextJson/`.
+- **Imaging (5)** — `framework/src/Volo.Abp.Imaging.Abstractions/`, `Volo.Abp.Imaging.AspNetCore/`, `Volo.Abp.Imaging.ImageSharp/`, `Volo.Abp.Imaging.MagickNet/`, `Volo.Abp.Imaging.SkiaSharp/`.
+- **TextTemplating (4)** — `framework/src/Volo.Abp.TextTemplating/`, `Volo.Abp.TextTemplating.Core/`, `Volo.Abp.TextTemplating.Razor/`, `Volo.Abp.TextTemplating.Scriban/`.
+- **Validation & Authorization** — `framework/src/Volo.Abp.Validation/`, `Volo.Abp.Validation.Abstractions/`, `Volo.Abp.FluentValidation/`, `Volo.Abp.Authorization/`, `Volo.Abp.Authorization.Abstractions/`.
+- **Caching** — `framework/src/Volo.Abp.Caching/`, `Volo.Abp.Caching.StackExchangeRedis/`.
+- **Mapping** — `framework/src/Volo.Abp.AutoMapper/`, `Volo.Abp.Mapperly/`, `Volo.Abp.LuckyPenny.AutoMapper/`, `Volo.Abp.ObjectMapping/`.
+- **CLI** — `framework/src/Volo.Abp.Cli/`, `framework/src/Volo.Abp.Cli.Core/`.
+- **Standalone services** — `framework/src/Volo.Abp.Emailing/`, `Volo.Abp.MailKit/`, `Volo.Abp.Sms/`, `Volo.Abp.Sms.Aliyun/`, `Volo.Abp.Sms.TencentCloud/`, `Volo.Abp.Ldap/`, `Volo.Abp.AI/`.
+
+## `modules/` — pre-built feature modules
+
+The 18 directories under `modules/` each ship one logical product feature. Every directory follows the same shape as `framework/`: an `*.abpmdl` + `*.abpsln` + `*.slnx` + `src/` + `test/` layout.
+
+| Path | One-line description |
+| --- | --- |
+| `modules/account/` | Login/register/forgot-password UI and the account application service. |
+| `modules/audit-logging/` | Audit-log persistence, EF/Mongo stores, Web/Blazor management UI. |
+| `modules/background-jobs/` | Persistent job store and management UI (separate from the runtime in `framework/src/Volo.Abp.BackgroundJobs`). |
+| `modules/basic-theme/` | The "Basic" Bootstrap theme used by the unlicensed templates. |
+| `modules/blob-storing-database/` | Database-backed `BlobContainer` provider. |
+| `modules/blogging/` | Lightweight blogging engine consumed by abp.io. |
+| `modules/client-simulation/` | Tooling for stress-testing API surfaces. |
+| `modules/cms-kit/` | Comments, ratings, reactions, tags, pages, menus, blogs. |
+| `modules/docs/` | The documentation engine that powers abp.io/docs. |
+| `modules/feature-management/` | UI and stores for `IFeatureProvider` overrides per edition/tenant. |
+| `modules/identity/` | Users, roles, organisation units, claims, sessions, security logs. |
+| `modules/identityserver/` | Legacy IdentityServer4 integration (kept for migration). |
+| `modules/openiddict/` | OpenIddict-based authorisation server (current default). |
+| `modules/permission-management/` | Permission grant storage and admin UI. |
+| `modules/setting-management/` | Per-user/tenant/global setting store and admin UI. |
+| `modules/tenant-management/` | Tenant CRUD, connection-string editor, hosting helpers. |
+| `modules/users/` | Shared user abstractions and lookup services. |
+| `modules/virtual-file-explorer/` | Browser for the in-memory virtual file system, useful during development. |
+
+Each module lays out a five-tier pyramid. For example, `modules/identity/src/` contains `Volo.Abp.Identity.Domain.Shared/`, `Volo.Abp.Identity.Domain/`, `Volo.Abp.Identity.Application.Contracts/`, `Volo.Abp.Identity.Application/`, `Volo.Abp.Identity.HttpApi/`, `Volo.Abp.Identity.HttpApi.Client/`, `Volo.Abp.Identity.EntityFrameworkCore/`, `Volo.Abp.Identity.MongoDB/`, `Volo.Abp.Identity.Web/`, `Volo.Abp.Identity.AspNetCore/`, `Volo.Abp.Identity.Blazor/`, `Volo.Abp.Identity.Blazor.Server/`, `Volo.Abp.Identity.Blazor.WebAssembly/`, `Volo.Abp.Identity.Blazor.MudBlazor/`, `Volo.Abp.Identity.Blazor.MudBlazor.Server/`, `Volo.Abp.Identity.Blazor.MudBlazor.WebAssembly/`, `Volo.Abp.Identity.Installer/`, and `Volo.Abp.PermissionManagement.Domain.Identity/`.
+
+## `templates/` — solution scaffolds
+
+`templates/` ships every starter solution the CLI / ABP Studio can generate. Each template is a real, buildable solution that the build pipeline compiles to verify regressions.
+
+```
+templates/
+├── Directory.Packages.props      # central package versions (mirrors repo root)
+├── NuGet.Config
+├── app/                          # Default layered application
+│   ├── angular/                  # Angular SPA front-end
+│   └── aspnet-core/              # Backend + MVC/Blazor/WebApp variants
+├── app-nolayers/                 # Single-project (no DDD layering) app
+│   ├── angular/
+│   └── aspnet-core/
+├── console/                      # Pure console host
+│   ├── MyCompanyName.MyProjectName.slnx
+│   ├── common.props
+│   └── src/MyCompanyName.MyProjectName/
+├── maui/                         # .NET MAUI client
+├── module/                       # Reusable module template (mirrors modules/<name>)
+│   ├── angular/
+│   └── aspnet-core/{src, host, test, database}/
+├── wpf/                          # WPF client
+└── zip-templates.ps1             # Packs each template into a .zip for CLI consumption
+```
+
+### `templates/app/aspnet-core/src/` projects
+
+The canonical full template generates 22 projects:
+
+| Project | Role |
+| --- | --- |
+| `MyCompanyName.MyProjectName.Application/` | Application services |
+| `MyCompanyName.MyProjectName.Application.Contracts/` | DTOs + interfaces |
+| `MyCompanyName.MyProjectName.AuthServer/` | OpenIddict-based auth server host |
+| `MyCompanyName.MyProjectName.Blazor/` | Blazor WebAssembly client |
+| `MyCompanyName.MyProjectName.Blazor.Client/` | Blazor InteractiveWebAssembly client |
+| `MyCompanyName.MyProjectName.Blazor.Server/` | Blazor Server host |
+| `MyCompanyName.MyProjectName.Blazor.Server.Tiered/` | Tiered Blazor Server (separate AuthServer/Api) |
+| `MyCompanyName.MyProjectName.Blazor.WebApp/` | Blazor Web App (.NET 8+ unified) |
+| `MyCompanyName.MyProjectName.Blazor.WebApp.Client/` | Web App client assembly |
+| `MyCompanyName.MyProjectName.Blazor.WebApp.Tiered/` | Tiered Web App host |
+| `MyCompanyName.MyProjectName.Blazor.WebApp.Tiered.Client/` | Tiered Web App client assembly |
+| `MyCompanyName.MyProjectName.DbMigrator/` | Console seeder / migration runner |
+| `MyCompanyName.MyProjectName.Domain/` | Aggregates, repositories, domain services |
+| `MyCompanyName.MyProjectName.Domain.Shared/` | Enums, constants, consts |
+| `MyCompanyName.MyProjectName.EntityFrameworkCore/` | EF Core DbContext + repositories |
+| `MyCompanyName.MyProjectName.HttpApi/` | Controllers that expose application services |
+| `MyCompanyName.MyProjectName.HttpApi.Client/` | Generated HTTP client proxies |
+| `MyCompanyName.MyProjectName.HttpApi.Host/` | API gateway host |
+| `MyCompanyName.MyProjectName.HttpApi.HostWithIds/` | API + AuthServer combined (single-host tiered) |
+| `MyCompanyName.MyProjectName.MongoDB/` | MongoDB repositories (alternative to EF) |
+| `MyCompanyName.MyProjectName.Web/` | MVC / Razor Pages UI |
+| `MyCompanyName.MyProjectName.Web.Host/` | Tiered MVC host |
+
+### Other templates
+
+- `templates/app-nolayers/aspnet-core/` ships flat hosts: `MyCompanyName.MyProjectName.Mvc/`, `MyCompanyName.MyProjectName.Mvc.Mongo/`, `MyCompanyName.MyProjectName.Host/`, `MyCompanyName.MyProjectName.Host.Mongo/`, `MyCompanyName.MyProjectName.Blazor.Server/`, `MyCompanyName.MyProjectName.Blazor.Server.Mongo/`, `MyCompanyName.MyProjectName.Blazor.WebAssembly/`, plus `migrate-database.ps1`.
+- `templates/console/` is a single-project console host: `templates/console/src/MyCompanyName.MyProjectName/` plus `MyCompanyName.MyProjectName.slnx` and `common.props`.
+- `templates/module/aspnet-core/src/` mirrors `modules/<name>/src/`: `MyCompanyName.MyProjectName.Domain.Shared/`, `Domain/`, `Application.Contracts/`, `Application/`, `HttpApi/`, `HttpApi.Client/`, `EntityFrameworkCore/`, `MongoDB/`, `Web/`, `Blazor/`, `Blazor.Server/`, `Blazor.WebAssembly/`, `Blazor.WebAssembly.Bundling/`, `Installer/`.
+- `templates/module/aspnet-core/host/` adds `AuthServer/`, `Blazor.Host/`, `Blazor.Host.Client/`, `Blazor.Server.Host/`, `Host.Shared/`, `HttpApi.Host/`, `Web.Host/`, `Web.Unified/`.
+- `templates/module/aspnet-core/test/` adds `Application.Tests/`, `Domain.Tests/`, `EntityFrameworkCore.Tests/`, `HttpApi.Client.ConsoleTestApp/`, `MongoDB.Tests/`, `TestBase/`.
+- `templates/maui/src/MyCompanyName.MyProjectName/` is the MAUI client; `templates/wpf/src/MyCompanyName.MyProjectName/` is the WPF client.
+
+## `npm/` — JavaScript and Angular workspace
+
+`npm/lerna.json` declares the Lerna workspace (`"packages": ["packs/*"]`, `"npmClient": "yarn"`, `"version": "10.4.0-rc.2"`). `npm/package.json` adds dev scripts (`update-gulp`, `replace-with-tilde`, `update`).
+
+### `npm/ng-packs/` — Angular monorepo
+
+`npm/ng-packs/` is a separate Nx workspace (see `npm/ng-packs/nx.json`, `npm/ng-packs/tsconfig.base.json`, `npm/ng-packs/jest.preset.js`, `npm/ng-packs/vitest.config.mts`).
+
+| Package | Notes |
+| --- | --- |
+| `npm/ng-packs/packages/account/` | `@abp/ng.account` UI |
+| `npm/ng-packs/packages/account-core/` | `@abp/ng.account.core` core |
+| `npm/ng-packs/packages/cms-kit/` | `@abp/ng.cms-kit` |
+| `npm/ng-packs/packages/components/` | Shared Angular components |
+| `npm/ng-packs/packages/core/` | `@abp/ng.core` runtime |
+| `npm/ng-packs/packages/feature-management/` | Feature UI |
+| `npm/ng-packs/packages/generators/` | Code generators |
+| `npm/ng-packs/packages/identity/` | Identity UI |
+| `npm/ng-packs/packages/oauth/` | OAuth wiring |
+| `npm/ng-packs/packages/permission-management/` | Permission grant UI |
+| `npm/ng-packs/packages/schematics/` | Angular schematics |
+| `npm/ng-packs/packages/setting-management/` | Settings UI |
+| `npm/ng-packs/packages/tenant-management/` | Tenant UI |
+| `npm/ng-packs/packages/theme-basic/` | Basic theme for Angular |
+| `npm/ng-packs/packages/theme-shared/` | Shared theme primitives |
+
+### `npm/packs/` — MVC JavaScript packs
+
+`npm/packs/` packages wrap third-party JS for the MVC/Blazor Bootstrap UI. They are published under names like `@abp/jquery`, `@abp/bootstrap`, `@abp/lodash`, etc. The directory currently includes (alphabetical): `anchor-js`, `aspnetcore.components.server.basictheme`, `aspnetcore.components.server.theming`, `aspnetcore.mvc.ui`, `aspnetcore.mvc.ui.theme.basic`, `aspnetcore.mvc.ui.theme.shared`, `blogging`, `bootstrap`, `bootstrap-datepicker`, `bootstrap-daterangepicker`, `chart.js`, `clipboard`, `cms-kit`, `cms-kit.admin`, `cms-kit.public`, `codemirror`, `core`, `cropperjs`, `datatables.net`, `datatables.net-bs4`, `datatables.net-bs5`, `docs`, `flag-icon-css`, `flag-icons`, `font-awesome`, `highlight.js`, `jquery`, `jquery-form`, `jquery-validation`, `jquery-validation-unobtrusive`, `jstree`, `lodash`, `luxon`, `malihu-custom-scrollbar-plugin`, `markdown-it`, `moment`, `owl.carousel`, `popper.js`, `prismjs`, `qrcode`, `select2`, `signalr`, `slugify`, `star-rating-svg`, `sweetalert2`, `timeago`, `toastr`, `tui-editor`, `uppy`, `utils`, `vee-validate`, `virtual-file-explorer`, `vue`, `zxcvbn`, plus the helper script `npm-check-updates.ps1`.
+
+## `build/` — local CI scripts
+
+`build/` runs the same builds CI does. The scripts all share `build/common.ps1` for solution paths.
+
+```powershell
+# build/build-all.ps1
+$full = $args[0]
+. ".\common.ps1" $full
+foreach ($solutionPath in $solutionPaths) {
+    $solutionAbsPath = (Join-Path $rootFolder $solutionPath)
+    Set-Location $solutionAbsPath
+    dotnet build
+    if (-Not $?) { Set-Location $rootFolder; exit $LASTEXITCODE }
+}
+Set-Location $rootFolder
+```
+
+`build/common.ps1` defines the solution list (`../framework`, `../modules/basic-theme`, `../modules/users`, …) and adds the templates and extras (`../templates/app/aspnet-core`, `../templates/console`, `../source-code`) when invoked with the `-f` flag. `build/test-all.ps1` repeats the loop calling `dotnet test --no-build --no-restore --collect:"XPlat Code Coverage"`. `build/build-all-release.ps1` is the Release-config variant used by the deploy pipeline.
+
+## `deploy/` — release pipeline
+
+`deploy/` contains the numbered release pipeline plus `deploy/_run_all.ps1` that orchestrates the eight steps in order:
+
+<Steps>
+  <Step title="1-fetch-and-build.ps1">
+    Updates `common.props` `<Version>`, switches to the requested branch, runs `build/build-all-release.ps1`.
+  </Step>
+  <Step title="2-nuget-pack.ps1">
+    Calls `nupkg/pack.ps1` to produce `.nupkg` files for every package.
+  </Step>
+  <Step title="3-nuget-push.ps1">
+    Reads `nuget-api-key.txt` (or prompts) and pushes packages via `nupkg/push_packages.ps1`.
+  </Step>
+  <Step title="4-npm-publish-mvc.ps1">
+    Publishes `npm/packs/*` via `npm/publish-mvc.ps1`.
+  </Step>
+  <Step title="5-npm-publish-angular.ps1">
+    Publishes `npm/ng-packs/packages/*` via `npm/publish-ng.ps1`.
+  </Step>
+  <Step title="6-git-commit.ps1">
+    Commits version bumps and tags the release.
+  </Step>
+  <Step title="7-publish-github-release.ps1">
+    Creates the GitHub release using `deploy/new-github-release-function.psm1`.
+  </Step>
+  <Step title="8-download-release-zip.ps1">
+    Downloads the GitHub-generated source zip for archival.
+  </Step>
+</Steps>
+
+`deploy/plink.exe` ships with the scripts to allow SSH operations on Windows release agents.
+
+## `studio/source-codes/` — ABP Studio source bundles
+
+Each directory under `studio/source-codes/` is a self-contained source-code copy of one module that ABP Studio can drop into a customer's solution when they "open module source code". The current bundles:
+
+| Bundle | Source module |
+| --- | --- |
+| `studio/source-codes/Volo.Abp.Account.SourceCode/` | `modules/account/` |
+| `studio/source-codes/Volo.Abp.AuditLogging.SourceCode/` | `modules/audit-logging/` |
+| `studio/source-codes/Volo.Abp.BackgroundJobs.SourceCode/` | `modules/background-jobs/` |
+| `studio/source-codes/Volo.Abp.BasicTheme.SourceCode/` | `modules/basic-theme/` |
+| `studio/source-codes/Volo.Abp.BlobStoring.Database.SourceCode/` | `modules/blob-storing-database/` |
+| `studio/source-codes/Volo.Abp.FeatureManagement.SourceCode/` | `modules/feature-management/` |
+| `studio/source-codes/Volo.Abp.Identity.SourceCode/` | `modules/identity/` |
+| `studio/source-codes/Volo.Abp.IdentityServer.SourceCode/` | `modules/identityserver/` |
+| `studio/source-codes/Volo.Abp.OpenIddict.SourceCode/` | `modules/openiddict/` |
+| `studio/source-codes/Volo.Abp.PermissionManagement.SourceCode/` | `modules/permission-management/` |
+| `studio/source-codes/Volo.Abp.SettingManagement.SourceCode/` | `modules/setting-management/` |
+| `studio/source-codes/Volo.Abp.TenantManagement.SourceCode/` | `modules/tenant-management/` |
+| `studio/source-codes/Volo.Abp.Users.SourceCode/` | `modules/users/` |
+| `studio/source-codes/Volo.Abp.VirtualFileExplorer.SourceCode/` | `modules/virtual-file-explorer/` |
+| `studio/source-codes/Volo.Blogging.SourceCode/` | `modules/blogging/` |
+| `studio/source-codes/Volo.ClientSimulation.SourceCode/` | `modules/client-simulation/` |
+| `studio/source-codes/Volo.CmsKit.SourceCode/` | `modules/cms-kit/` |
+| `studio/source-codes/Volo.Docs.SourceCode/` | `modules/docs/` |
+
+## `tools/`
+
+`tools/nuget/nuget.exe` is the classic `nuget.exe` used by deploy scripts that still need it (most use `dotnet pack` / `dotnet nuget push`). `tools/github-changelog-generator/` contains `generator.exe`, a `config.yaml`, a `src/` folder with the source, and a `README.md` describing how to regenerate the release notes. `tools/localization-key-synchronizer/` is a .NET tool (`LocalizationKeySynchronizer.exe`, `LocalizationKeySynchronizer.slnx`, `src/`, `README.md`) that compares localisation JSON resources between cultures and reports drift. `tools/smtp-prober-email-sender.exe` is a utility for verifying SMTP setups during deployment.
+
+## `docs/`, `apiSpec/`, `source-code/`, `nupkg/`, `abp_io/`, `ai-rules/`
+
+- `docs/docs-langs.json` declares which language codes the docs site renders.
+- `apiSpec/` holds hand-curated API spec markdown like `apiSpec/Microsoft_AspNetCore_Routing_AbpEndpointRouterOptions.md`.
+- `source-code/` is a meta-solution that aggregates framework + modules for ABP Studio's "open source code as a single solution" feature.
+- `nupkg/` contains `common.ps1`, `pack.ps1`, and `push_packages.ps1` invoked by the `deploy/` scripts.
+- `abp_io/` hosts content for the abp.io website (for example `abp_io/AbpIoLocalization/`).
+- `ai-rules/` contains markdown rule sets consumed by the ABP AI tooling.
+
+<Tip>
+For navigation: think of the repo as **framework runtime (`framework/`) + opinionated extensions (`modules/`) + scaffolds that wire them up (`templates/`) + JS counterparts (`npm/`) + build/publish glue (`build/` & `deploy/`)**. Every directory above slots into one of those buckets.
+</Tip>

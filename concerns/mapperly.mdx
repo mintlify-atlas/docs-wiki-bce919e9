@@ -1,0 +1,311 @@
+---
+title: "ABP Mapperly: Compile-Time Object Mapping Provider"
+sidebarTitle: "Mapperly"
+description: "Wire compile-time Mapperly mappers into the ABP IObjectMapper pipeline with conventional registration, extra-property propagation, and collection handling."
+---
+
+## Overview
+
+The ABP Framework ships an alternative auto object mapping provider built on
+[Mapperly](https://mapperly.riok.app/) source-generated mappers. The integration
+lives at `framework/src/Volo.Abp.Mapperly/` and replaces the default
+`IAutoObjectMappingProvider` so that any call to `IObjectMapper.Map<TSource, TDestination>`
+is resolved by a compile-time generated Mapperly mapper instead of AutoMapper's
+runtime reflection engine. The module's entry point
+`Volo/Abp/Mapperly/AbpMapperlyModule.cs` depends on `AbpObjectMappingModule`,
+`AbpObjectExtendingModule`, and `AbpAuditingModule`, so the same `IObjectMapper`
+contract that the rest of ABP uses continues to flow through your application.
+
+The module performs two configuration steps in `AbpMapperlyModule`: it registers
+the custom conventional registrar `AbpMapperlyConventionalRegistrar` in
+`PreConfigureServices`, and it invokes
+`services.AddMapperlyObjectMapper()` from `ConfigureServices`
+(see `Microsoft/Extensions/DependencyInjection/AbpAutoMapperServiceCollectionExtensions.cs`).
+Together these guarantee every Mapperly mapper class in your assemblies is
+discovered and that the framework's `IAutoObjectMappingProvider` is replaced
+with `MapperlyAutoObjectMappingProvider`.
+
+## Why Mapperly?
+
+<Card title="Compile-time mapping" icon="bolt">
+  Mapperly emits the mapping code at build time, so there is no reflection at
+  runtime and no startup-time profile validation step. The
+  `framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapperBase.cs` base classes
+  expose two virtual hooks — `BeforeMap` and `AfterMap` — that let you wrap the
+  generated implementation without giving up the performance benefit.
+</Card>
+
+<Card title="Drop-in replacement" icon="repeat">
+  `AbpAutoMapperServiceCollectionExtensions.AddMapperlyObjectMapper` simply
+  calls `services.Replace(...)` to swap the registered
+  `IAutoObjectMappingProvider`. Existing application services that depend on
+  `IObjectMapper` keep working — only the underlying engine changes.
+</Card>
+
+## The mapper contracts
+
+The two interfaces in
+`framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/IAbpMapperlyMapper.cs` shape
+every mapping in the system:
+
+```csharp framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/IAbpMapperlyMapper.cs
+public interface IAbpMapperlyMapper<in TSource, TDestination>
+{
+    TDestination Map(TSource source);
+    void Map(TSource source, TDestination destination);
+    void BeforeMap(TSource source);
+    void AfterMap(TSource source, TDestination destination);
+}
+
+public interface IAbpReverseMapperlyMapper<TSource, TDestination>
+    : IAbpMapperlyMapper<TSource, TDestination>
+{
+    TSource ReverseMap(TDestination destination);
+    void ReverseMap(TDestination destination, TSource source);
+    void BeforeReverseMap(TDestination destination);
+    void AfterReverseMap(TDestination destination, TSource source);
+}
+```
+
+`IAbpMapperlyMapper<TSource, TDestination>` is one-way; `IAbpReverseMapperlyMapper<TSource, TDestination>`
+extends it for two-way mappings. The `BeforeMap` / `AfterMap` (and their
+reverse equivalents) are virtual no-op extension points your concrete mapper
+can override to run logic around the Mapperly-generated body.
+
+### `MapperBase` and `TwoWayMapperBase`
+
+The abstract base in
+`framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapperBase.cs` saves you from
+implementing the lifecycle members by hand:
+
+```csharp framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapperBase.cs
+public abstract class MapperBase<TSource, TDestination>
+    : IAbpMapperlyMapper<TSource, TDestination>, ITransientDependency
+{
+    public abstract TDestination Map(TSource source);
+    public abstract void Map(TSource source, TDestination destination);
+    public virtual void BeforeMap(TSource source) { }
+    public virtual void AfterMap(TSource source, TDestination destination) { }
+}
+
+public abstract class TwoWayMapperBase<TSource, TDestination>
+    : MapperBase<TSource, TDestination>,
+      IAbpReverseMapperlyMapper<TSource, TDestination>
+{
+    public abstract TSource ReverseMap(TDestination destination);
+    public abstract void ReverseMap(TDestination destination, TSource source);
+    public virtual void BeforeReverseMap(TDestination destination) { }
+    public virtual void AfterReverseMap(TDestination destination, TSource source) { }
+}
+```
+
+Both bases implement `ITransientDependency` so they participate in ABP's
+conventional registration, and they leave only the `Map` / `ReverseMap` bodies
+as `abstract` — exactly the members Mapperly's `[Mapper]` source generator
+will fill in for you.
+
+## Conventional registration
+
+`framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/AbpMapperlyConventionalRegistrar.cs`
+extends `DefaultConventionalRegistrar` so that a class is only picked up when
+it implements `IAbpMapperlyMapper<,>` (or its reverse variant) and so that the
+mapper's exposed service types include those generic interfaces:
+
+```csharp framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/AbpMapperlyConventionalRegistrar.cs
+protected override bool IsConventionalRegistrationDisabled(Type type)
+{
+    return !type.GetInterfaces().Any(x =>
+            x.IsGenericType &&
+            typeof(IAbpMapperlyMapper<,>) == x.GetGenericTypeDefinition()) ||
+           base.IsConventionalRegistrationDisabled(type);
+}
+
+protected override List<Type> GetExposedServiceTypes(Type type)
+{
+    var exposedServiceTypes = base.GetExposedServiceTypes(type);
+    var mapperlyInterfaces = type.GetInterfaces().Where(x =>
+        x.IsGenericType && (
+            typeof(IAbpMapperlyMapper<,>) == x.GetGenericTypeDefinition() ||
+            typeof(IAbpReverseMapperlyMapper<,>) == x.GetGenericTypeDefinition()));
+    return exposedServiceTypes.Union(mapperlyInterfaces).Distinct().ToList();
+}
+```
+
+Because the registrar is added during `PreConfigureServices` in
+`AbpMapperlyModule`, mapper classes are picked up by the standard
+`AddAssemblyOf<T>()` discovery used by every ABP module — no manual
+`services.AddSingleton(...)` call is required.
+
+## The provider implementation
+
+`framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapperlyAutoObjectMappingProvider.cs`
+is what `IObjectMapper` calls under the hood. Its two `Map` overloads
+(`Map<TSource, TDestination>(object source)` and
+`Map<TSource, TDestination>(TSource, TDestination)`) implement a small
+resolution dance:
+
+1. Try collection mapping via `TryToMapCollection`, which resolves the element
+   types through `ObjectMappingHelper.IsCollectionGenericType` and reuses a
+   cached compiled delegate built by `CreateMapDelegate`.
+2. Look up an `IAbpMapperlyMapper<TSource, TDestination>` from the
+   `IServiceProvider`. If found, invoke `BeforeMap`, the generated `Map`,
+   optionally `TryMapExtraProperties`, then `AfterMap`.
+3. Otherwise try `IAbpReverseMapperlyMapper<TDestination, TSource>` so that
+   two-way mappers can satisfy the reverse direction as well.
+4. If neither resolves, throw an `AbpException` built by
+   `GetNoMapperFoundException<TSource, TDestination>()` with a multi-line
+   diagnostic message pointing back to the docs.
+
+The provider keeps a static `ConcurrentDictionary<string, Func<...>> MapCache`
+and a list of reflected `MapMethods`, so the per-call cost for collection
+mapping is a single delegate invocation after the first warm-up.
+
+There is also a typed variant
+`MapperlyAutoObjectMappingProvider<TContext>` that inherits from the non-generic
+provider and is registered via the overload
+`AddMapperlyObjectMapper<TContext>` in
+`AbpAutoMapperServiceCollectionExtensions.cs`. ABP uses contextual providers to
+let separate bounded contexts opt into different mapping engines.
+
+## Extra-property mapping
+
+Because `AbpMapperlyModule` depends on `AbpObjectExtendingModule`, the provider
+in `MapperlyAutoObjectMappingProvider.cs` cooperates with the
+`IHasExtraProperties` abstraction. Two protected helpers handle it:
+
+- `GetExtraProperties<TDestination>(destination)` clones the destination's
+  `ExtraProperties` into a new `ExtraPropertyDictionary` (defined in
+  `framework/src/Volo.Abp.ObjectExtending/Volo/Abp/Data/ExtraPropertyDictionary.cs`)
+  so that the mapper sees the original snapshot.
+- `TryMapExtraProperties(...)` reads the
+  `MapExtraPropertiesAttribute` from the mapper class and delegates to
+  `MapExtraProperties`, which in turn calls
+  `ExtensibleObjectMapper.MapExtraPropertiesTo` from
+  `framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ExtensibleObjectMapper.cs`.
+
+The attribute itself, declared in
+`framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapExtraPropertiesAttribute.cs`,
+is the on/off switch:
+
+```csharp framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapExtraPropertiesAttribute.cs
+[AttributeUsage(AttributeTargets.Class)]
+public class MapExtraPropertiesAttribute : Attribute
+{
+    public MappingPropertyDefinitionChecks DefinitionChecks { get; set; }
+        = MappingPropertyDefinitionChecks.Null;
+
+    public string[]? IgnoredProperties { get; set; }
+
+    public bool MapToRegularProperties { get; set; }
+}
+```
+
+`DefinitionChecks` reuses the `MappingPropertyDefinitionChecks` enum from
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/MappingPropertyDefinitionChecks.cs`,
+`IgnoredProperties` filters specific property names out of the copy, and
+`MapToRegularProperties` calls `SetExtraPropertiesToRegularProperties()` on the
+destination so dynamic extra properties get flushed into matching CLR
+properties.
+
+If the attribute is **not** present, `TryMapExtraProperties` simply returns
+early — Mapperly mappers without it never touch `ExtraProperties`.
+
+## Collection mapping
+
+`MapperlyAutoObjectMappingProvider.TryToMapCollection<TSource, TDestination>`
+in `MapperlyAutoObjectMappingProvider.cs` resolves the per-element mapper
+generically:
+
+```csharp framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapperlyAutoObjectMappingProvider.cs
+var mapperType = typeof(IAbpMapperlyMapper<,>)
+    .MakeGenericType(sourceArgumentType, destinationArgumentType);
+var mapper = ServiceProvider.GetService(mapperType);
+if (mapper == null)
+{
+    mapperType = typeof(IAbpReverseMapperlyMapper<,>)
+        .MakeGenericType(destinationArgumentType, sourceArgumentType);
+    mapper = ServiceProvider.GetService(mapperType);
+    ...
+}
+```
+
+When the destination is an array, the provider builds the array via
+`Array.CreateInstance(destinationArgumentType, sourceList.Count)` and returns a
+new instance — the existing array is left untouched. For mutable generic
+collections, the destination instance is cleared and refilled in-place, mirroring
+the behaviour of the AutoMapper provider so application code can switch
+providers without observing a change in semantics.
+
+## Failure mode
+
+When no mapper is registered for the requested type pair,
+`GetNoMapperFoundException` in
+`framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapperlyAutoObjectMappingProvider.cs`
+throws an `AbpException` containing the source and destination type names,
+their full names, and the remediation steps:
+
+> Define a mapping class for these types:
+> - Use `MapperBase<TSource, TDestination>` for one-way mapping.
+> - Use `TwoWayMapperBase<TDestination, TSource>` for two-way mapping.
+
+The exception message ends with a link to the public ABP docs at
+`https://abp.io/docs/latest/framework/infrastructure/object-to-object-mapping#mapperly-integration`,
+so the same diagnostic appears in logs and in dev tools.
+
+## Wiring a mapper into an application module
+
+```csharp
+[Mapper]
+public partial class BookToBookDtoMapper
+    : MapperBase<Book, BookDto>
+{
+    public override partial BookDto Map(Book source);
+    public override partial void Map(Book source, BookDto destination);
+}
+```
+
+The class lives in your application module's assembly. Because
+`MapperBase<TSource, TDestination>` implements `ITransientDependency` and the
+`AbpMapperlyConventionalRegistrar` (see `AbpMapperlyConventionalRegistrar.cs`)
+adds `IAbpMapperlyMapper<Book, BookDto>` to the exposed services list, ABP
+registers the class automatically when your module declares
+`[DependsOn(typeof(AbpMapperlyModule))]`. The Mapperly source generator emits
+the partial `Map` bodies during build, so the runtime cost is a virtual call
+plus the generated assignment sequence.
+
+To make `IObjectMapper.Map<Book, BookDto>(entity)` resolve through Mapperly,
+you do not need to call `AddMapperlyObjectMapper` yourself — `ConfigureServices`
+in `AbpMapperlyModule` already calls it for the non-generic provider.
+
+<Tip>
+  Use `TwoWayMapperBase<Book, BookDto>` (declared in `MapperBase.cs`) when
+  you also need `Map<BookDto, Book>` — the provider's reverse-mapper lookup in
+  `MapperlyAutoObjectMappingProvider.cs` will resolve it.
+</Tip>
+
+## Cohabiting with AutoMapper
+
+Because `AddMapperlyObjectMapper` replaces the single
+`IAutoObjectMappingProvider` registration, the Mapperly provider is the only
+auto provider once `AbpMapperlyModule` is loaded — including for assemblies
+that previously relied on the AutoMapper integration. If a project needs
+contextual overrides (for example a tenant-scoped DbContext that should still
+use AutoMapper) the contextual overload
+`AddMapperlyObjectMapper<TContext>` in
+`AbpAutoMapperServiceCollectionExtensions.cs` lets you replace only the
+typed provider while leaving the global one alone.
+
+## Related building blocks
+
+<CardGroup cols={2}>
+  <Card title="Object Extending" href="/concerns/object-extending">
+    The `ObjectExtensionManager` referenced from `ExtensibleObjectMapper.cs` is
+    documented separately; pair it with `[MapExtraProperties]` to copy
+    dynamic columns through Mapperly mappers.
+  </Card>
+  <Card title="Object mapping core" icon="diagram-project">
+    `IObjectMapper` and `IAutoObjectMappingProvider` are defined in
+    `framework/src/Volo.Abp.ObjectMapping/`. `MapperlyAutoObjectMappingProvider`
+    implements the latter directly.
+  </Card>
+</CardGroup>

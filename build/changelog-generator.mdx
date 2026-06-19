@@ -1,0 +1,563 @@
+---
+title: "GitHub Changelog Generator: Milestones Into Grouped Markdown"
+sidebarTitle: "Changelog Generator"
+description: "A Go-based CLI bundled with the ABP Framework that turns a GitHub milestone (or tag range) into label-grouped Markdown release notes."
+---
+
+When the ABP Framework cuts a release, the human-readable changelog is produced by a small Go program that scans GitHub for closed issues and pull requests in a milestone, groups them by label, and pipes the result to Markdown on stdout. Its source, binary, and configuration all live under `/home/daytona/repos/abpframework/abp/tools/github-changelog-generator/`.
+
+## Layout
+
+```text
+tools/github-changelog-generator/
+├── README.md                # invocation guide
+├── config.yaml              # repo, milestone, and label groups
+├── generator.exe            # ~10 MB prebuilt Windows binary
+└── src/
+    └── GithubChangelogGenerator/
+        ├── go.mod
+        ├── go.sum
+        ├── main.go
+        ├── cmd/
+        │   ├── generate.go
+        │   ├── helpers.go
+        │   ├── root.go
+        │   └── version.go
+        ├── config/
+        │   └── config.yaml
+        ├── internal/
+        │   ├── config.go
+        │   └── issues.go
+        └── pkg/
+            └── repo.go
+```
+
+`generator.exe` is the committed binary; `src/GithubChangelogGenerator/` is the Go module. The duplicate `config.yaml` in `src/.../config/` is the seed copy shipped with the source; the one at the folder root is the working copy that operators edit.
+
+## Invocation
+
+`tools/github-changelog-generator/README.md` is the user-facing reference. The canonical incantation:
+
+```text
+.\generator.exe generate [flags] > changelog.md
+```
+
+with flags:
+
+```text
+  -h, --help               help for generate
+  -m, --milestone string   milestone title to get issues and pull requests for
+  -r, --repo string        repository name to generate the Changelog for, in the form user/repo
+      --since-tag string   issues and pull requests since tag
+  -s, --state string       state of the issues and pull requests to get (open,closed or all)
+  -t, --token string       personal access token
+      --until-tag string   issues and pull requests until tag
+
+Global Flags:
+      --config string   config file (default is config.yaml)
+```
+
+The example from the README is the way it's actually used:
+
+```text
+.\generator.exe generate -r abpframework/abp -m "0.19" > changelog.md
+```
+
+The output is redirected to stdout, which means an operator can pipe it into `clip`, paste it directly into the GitHub release description box, or attach it as an asset.
+
+## `config.yaml`
+
+The committed `config.yaml` is what the binary picks up by default. It's set up for an ABP release rather than generic GitHub usage:
+
+```yaml
+---
+repo: abpframework/abp
+# token:
+milestone: 0.18.1
+# since-tag: 0.18.0
+# until-tag: 0.17.0
+state: closed
+groups:
+  - labels:
+      - breaking change
+    title: "Breaking Changes"
+
+  - labels:
+      - feature
+    title: "Features"
+
+  - labels:
+      - enhancement
+    title: "Enhancements"
+
+  - labels:
+      - bug
+    title: "Bug Fixes"
+
+  - labels:
+    title: "Others"
+
+#template: |-
+#  {{if .Milestone}}## {{.Milestone.GetTitle}} ({{.Milestone.GetClosedAt.Format "2006-01-02"}}){{end -}}
+#  ...
+```
+
+Five groups in a deliberate order: **Breaking Changes** first (so they're visible at the top of release notes), **Features**, **Enhancements**, **Bug Fixes**, **Others**. The last group has an empty `labels:` list, which is the convention the source code uses for the "anything without a matching label" bucket. The `state: closed` value tells the generator to skip open issues and PRs, which is what you want for a release that's already shipped. Commented-out keys (`token`, `since-tag`, `until-tag`, `template`) show the available knobs without enabling them.
+
+<Note>
+  The `token` field is commented out in the repo copy because the binary also accepts `-t`/`--token` on the command line. For unattended runs, populate `token` with a fine-grained PAT that has `repo:public_repo` scope.
+</Note>
+
+## Configuration Schema
+
+`tools/github-changelog-generator/src/GithubChangelogGenerator/internal/config.go` defines the strongly-typed view of `config.yaml`:
+
+```go
+package internal
+
+type Config struct {
+    Repo      string   `mapstructure:"repo"`
+    Token     string   `mapstructure:"token"`
+    Milestone string   `mapstructure:"milestone"`
+    SinceTag  string   `mapstructure:"since-tag"`
+    UntilTag  string   `mapstructure:"until-tag"`
+    State     string   `mapstructure:"state"`
+    Groups    []*Group `mapstructure:"groups"`
+    Template  string   `mapstructure:"template"`
+}
+
+type Group struct {
+    Labels []string `mapstructure:"labels"`
+    Title  string   `mapstructure:"title"`
+}
+```
+
+`mapstructure` tags are how `viper.Unmarshal` projects YAML keys (which use dashes) into Go struct fields (which use camelCase). The corresponding helper `AllLabels` flattens groups for the label-matching loop:
+
+```go
+func AllLabels(groups []*Group) map[int][]string {
+    allLabels := make(map[int][]string)
+    for i, group := range groups {
+        if allLabels[i] == nil {
+            allLabels[i] = make([]string, 0)
+        }
+        allLabels[i] = append(allLabels[i], group.Labels...)
+    }
+    return allLabels
+}
+```
+
+The map is keyed by group *index* (not by label), which is how the grouping algorithm preserves the YAML order — important because that order is exactly the order in which sections appear in the generated Markdown.
+
+## Cobra/Viper Wiring
+
+`tools/github-changelog-generator/src/GithubChangelogGenerator/main.go` is two lines:
+
+```go
+package main
+
+import "GithubChangelogGenerator/cmd"
+
+func main() {
+    cmd.Execute()
+}
+```
+
+The CLI framework is the de-facto Go combo of `cobra` (commands) plus `viper` (config). `cmd/root.go` sets up the top-level command:
+
+```go
+var rootCmd = &cobra.Command{
+    Use:   "GithubChangelogGenerator",
+    Short: "Changelog generator",
+    Long:  `This application is a tool to generate changelog from a Github milestone.`,
+}
+
+func init() {
+    cobra.OnInitialize(initConfig)
+    rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is config.yaml)")
+}
+
+func initConfig() {
+    if cfgFile != "" {
+        viper.SetConfigFile(cfgFile)
+    } else {
+        viper.AddConfigPath(".")
+        viper.SetConfigName("config")
+    }
+    viper.AutomaticEnv()
+    if err := viper.ReadInConfig(); err == nil {
+    }
+}
+```
+
+`viper.AutomaticEnv()` means the same keys can be supplied through environment variables — useful in CI where you don't want to write the token to disk.
+
+A trivial `version` subcommand is also registered. From `cmd/version.go`:
+
+```go
+const version = "0.2.0"
+
+var versionCmd = &cobra.Command{
+    Use:   "version",
+    Short: "Print the version number.",
+    Run: func(cmd *cobra.Command, args []string) {
+        fmt.Println(version)
+    },
+}
+```
+
+So `generator.exe version` prints `0.2.0`.
+
+## The Generate Command
+
+`cmd/generate.go` is the workhorse. It binds CLI flags to the same viper keys used by `config.yaml`:
+
+```go
+func init() {
+    rootCmd.AddCommand(generateCmd)
+    generateCmd.Flags().StringP("repo", "r", "", "repository name to generate the Changelog for, in the form user/repo")
+    generateCmd.Flags().StringP("token", "t", "", "personal access token")
+    generateCmd.Flags().StringP("milestone", "m", "", "milestone title to get issues and pull requests for")
+    generateCmd.Flags().String("since-tag", "", "issues and pull requests since tag")
+    generateCmd.Flags().String("until-tag", "", "issues and pull requests until tag")
+    generateCmd.Flags().StringP("state", "s", "", "state of the issues and pull requests to get (open,closed or all)")
+
+    err := viper.BindPFlags(generateCmd.Flags())
+    if err != nil {
+        er(err)
+    }
+}
+```
+
+`viper.BindPFlags` is what makes the precedence work: a CLI flag overrides an env var which overrides `config.yaml`. The `er` helper (in `cmd/helpers.go`) is the program's standard one-liner exit-with-error:
+
+```go
+func er(msg interface{}) {
+    fmt.Println("Error:", msg)
+    os.Exit(1)
+}
+```
+
+### Generation Flow
+
+`generateCmd.Run` orchestrates four steps:
+
+```go
+c := &internal.Config{}
+err := viper.Unmarshal(c)
+...
+
+repo, err := pkg.NewRepo(c.Repo, c.Token)
+...
+
+issuesByMilestone, err := repo.IssuesByMilestone(c.Milestone, c.State)
+...
+milestone, err := repo.Milestone(c.Milestone)
+...
+sinceTagCommit, err := repo.TagCommit(c.SinceTag)
+...
+untilTagCommit, err := repo.TagCommit(c.UntilTag)
+...
+
+var issuesByTag []*github.Issue
+switch {
+case sinceTagCommit != nil:
+    issuesByTag, err = repo.IssuesSince(sinceTagCommit.Committer.GetDate())
+    ...
+    if c.UntilTag != "" {
+        issuesByTag = pkg.FilterUntil(issuesByTag, untilTagCommit.Committer.GetDate())
+    }
+case untilTagCommit != nil:
+    issuesByTag, err = repo.AllIssues(c.State)
+    ...
+    issuesByTag = pkg.FilterUntil(issuesByTag, untilTagCommit.Committer.GetDate())
+}
+
+groupedIssuesByMilestone := internal.GroupIssues(c.Groups, issuesByMilestone)
+groupedIssuesByTag := internal.GroupIssues(c.Groups, issuesByTag)
+
+err = writeChangelog(os.Stdout, &TemplateData{...})
+```
+
+The milestone path and the tag-range path are independent — both produce a `[]*github.Issue` slice that is then fed through the same `GroupIssues` routine. If you specify only `--milestone`, only the milestone section appears. If you specify only `--since-tag`, only the tag section appears. The default template renders both.
+
+## GitHub API Interaction
+
+`tools/github-changelog-generator/src/GithubChangelogGenerator/pkg/repo.go` wraps the `google/go-github` client. The constructor:
+
+```go
+func NewRepo(repo string, token ...string) (*GitHubRepo, error) {
+    gr := &GitHubRepo{}
+    sx := strings.Split(repo, "/")
+    if len(sx) != 2 {
+        return nil, fmt.Errorf("repo must be in organization/repository format")
+    }
+    gr.repoOwner = sx[0]
+    gr.repoName = sx[1]
+
+    client := github.NewClient(nil)
+    if token != nil && token[0] != "" {
+        gr.token = token[0]
+        ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token[0]})
+        tc := oauth2.NewClient(context.Background(), ts)
+        client = github.NewClient(tc)
+    }
+
+    var err error
+    gr.repo, _, err = client.Repositories.Get(context.Background(), sx[0], sx[1])
+    return gr, err
+}
+```
+
+An unauthenticated client is used when no token is supplied, but you'll quickly run into GitHub's 60-requests-per-hour anonymous quota — there's even a `checkrate()` helper at the bottom of the file that calls `client.RateLimits` and prints the reset time before exiting.
+
+### Pagination
+
+Every fetch is paginated through `github.ListOptions{PerPage: 100}` and a `for { ... if resp.NextPage == 0 { break } opt.Page = resp.NextPage }` loop. For example, `IssuesByMilestone`:
+
+```go
+func (gr *GitHubRepo) IssuesByMilestone(milestone string, state ...string) ([]*github.Issue, error) {
+    ...
+    mil, err := gr.Milestone(milestone)
+    ...
+    opt := &github.IssueListByRepoOptions{
+        Milestone:   strconv.Itoa(mil.GetNumber()),
+        State:       "closed",
+        ListOptions: github.ListOptions{PerPage: 100},
+    }
+    if len(state) == 1 {
+        if state[0] == "open" || state[0] == "closed" || state[0] == "all" {
+            opt.State = state[0]
+        }
+    }
+    for {
+        issues, resp, err := client.Issues.ListByRepo(context.Background(), gr.repoOwner, gr.repoName, opt)
+        ...
+        allIssues = append(allIssues, issues...)
+        if resp.NextPage == 0 {
+            break
+        }
+        opt.Page = resp.NextPage
+    }
+    return allIssues, nil
+}
+```
+
+The GitHub Issues API actually returns *both* issues and pull requests in the same endpoint (pull requests are a special kind of issue), which is why the rendered template differentiates with `{{if .IsPullRequest}}`.
+
+### Milestone Lookup
+
+The `Milestone(title string)` method is what translates a human-typed name like `10.4.0-rc.2` into the integer milestone number that the issues endpoint wants:
+
+```go
+func (gr *GitHubRepo) Milestone(title string) (*github.Milestone, error) {
+    if title == "" {
+        return nil, nil
+    }
+    if gr.milestone.GetTitle() == title {
+        return gr.milestone, nil
+    }
+    milestones, err := gr.Milestones()
+    ...
+    for _, milestone := range milestones {
+        if milestone.GetTitle() == title {
+            gr.milestone = milestone
+            return milestone, nil
+        }
+    }
+    return nil, fmt.Errorf("you didn't pass a valid milestone title")
+}
+```
+
+The cached `gr.milestone` avoids a second round-trip when the milestone is looked up again later in the run. Note the silent treatment of empty titles (`return nil, nil`): this is what lets the same function handle "milestone mode" and "tag mode" without callers checking nilness first.
+
+### Tag-to-Commit Resolution
+
+`TagCommit(name)` is the other identifier-resolution helper, used when the operator passes `--since-tag` and/or `--until-tag`:
+
+```go
+refs, _, err := client.Git.GetRefs(context.Background(), gr.repoOwner, gr.repoName, "tags")
+...
+refName := fmt.Sprintf("refs/tags/%s", name)
+for _, ref := range refs {
+    if ref.GetRef() == refName {
+        sha = ref.Object.GetSHA()
+    }
+    tag := strings.Split(ref.GetRef(), "/")
+    tags = append(tags, tag[len(tag)-1])
+}
+
+if sha == "" {
+    return nil, fmt.Errorf("you didn't pass a valid tag name. the available tags are: %s", tags)
+}
+
+commit, _, err := client.Git.GetCommit(context.Background(), gr.repoOwner, gr.repoName, sha)
+return commit, err
+```
+
+The error message includes the list of valid tag names — a nice operator touch when you mistype a version.
+
+## Grouping by Label
+
+`internal/issues.go` is where labels are matched to groups:
+
+```go
+type GroupedIssues struct {
+    Title  string
+    Issues []*github.Issue
+}
+
+func GroupIssues(groups []*Group, issues []*github.Issue) []*GroupedIssues {
+    if issues == nil {
+        return nil
+    }
+    var result []*GroupedIssues
+    grouped := make(map[string][]*github.Issue)
+
+    for _, issue := range issues {
+        if i, ok := containsAny(issue.Labels, AllLabels(groups)); ok {
+            grouped[groups[i].Title] = append(grouped[groups[i].Title], issue)
+        } else {
+            grouped["no_label"] = append(grouped["no_label"], issue)
+        }
+    }
+
+    for _, group := range groups {
+        if len(group.Labels) == 0 {
+            result = append(result, &GroupedIssues{Title: group.Title, Issues: grouped["no_label"]})
+            continue
+        }
+        result = append(result, &GroupedIssues{Title: group.Title, Issues: grouped[group.Title]})
+    }
+
+    return result
+}
+```
+
+The two-pass design preserves YAML order: every issue is bucketed in the first loop, then the second loop walks the *original* groups slice to produce a result in the order the operator wrote in `config.yaml`. A group with empty `labels` ("Others" in the default config) inherits everything that landed in `grouped["no_label"]`.
+
+Label matching is regex-based (`match` in the same file):
+
+```go
+func match(a, rx string) bool {
+    if a == rx {
+        return true
+    }
+    re, err := regexp.Compile(fmt.Sprintf("^%s$", rx))
+    if err != nil {
+        return false
+    }
+    return re.MatchString(a)
+}
+```
+
+Plain-string labels match exactly; if you need regex semantics (e.g. `type/.*`), the YAML accepts it transparently.
+
+## Template Rendering
+
+`cmd/helpers.go` exposes a one-liner template runner:
+
+```go
+func executeTemplate(tmplStr string, data interface{}) ([]byte, error) {
+    tmpl, err := template.New("").Parse(tmplStr)
+    if err != nil {
+        return nil, err
+    }
+    buf := new(bytes.Buffer)
+    err = tmpl.Execute(buf, data)
+    return buf.Bytes(), err
+}
+```
+
+When the YAML doesn't define a `template:` value, the default is hard-coded inline in `cmd/generate.go`:
+
+```go
+template = `{{if .Milestone}}## {{.Milestone.GetTitle}} ({{.Milestone.GetClosedAt.Format "2006-01-02"}}){{end -}}
+{{if .IssuesByMilestone}}
+{{range .IssuesByMilestone}}
+### {{.Title}}
+{{range .Issues}}
+{{if .IsPullRequest -}}
+- PR [\#{{.GetNumber}}]({{.GetHTMLURL}}): {{.GetTitle}} (by [{{.GetUser.GetLogin}}]({{.GetUser.GetHTMLURL}}))
+{{- else -}}
+- ISSUE [\#{{.GetNumber}}]({{.GetHTMLURL}}): {{.GetTitle}}
+{{- end -}}
+{{end}}
+{{end}}
+{{end -}}
+{{if .SinceTagCommit}}## {{.SinceTag}}{{if .UntilTagCommit}} - {{.UntilTag}}{{end}}{{end -}}
+...
+`
+```
+
+The output shape is:
+
+- A milestone header `## 10.4.0-rc.2 (2025-…)`.
+- A `### Section Title` heading per group.
+- One bullet per issue/PR, prefixed `PR` or `ISSUE`, linking the number and crediting the author.
+- An optional tag-range section if `--since-tag`/`--until-tag` were supplied.
+
+The commented-out template in `config.yaml` is a copy of the same default, exposed so an operator can override it without rebuilding the binary.
+
+## TemplateData
+
+The struct passed into the template is defined right next to `writeChangelog`:
+
+```go
+type TemplateData struct {
+    Repository        *github.Repository
+    IssuesByMilestone []*internal.GroupedIssues
+    IssuesByTag       []*internal.GroupedIssues
+    Milestone         *github.Milestone
+    SinceTag          string
+    SinceTagCommit    *github.Commit
+    UntilTag          string
+    UntilTagCommit    *github.Commit
+}
+```
+
+Every field is dereferenced from the GitHub API responses, so the `.GetTitle`, `.GetNumber`, `.GetHTMLURL`, `.GetUser.GetLogin`, `.GetUser.GetHTMLURL`, and `.GetClosedAt.Format` calls in the template are the generated nil-safe accessors from `go-github`.
+
+## Go Module Pins
+
+`tools/github-changelog-generator/src/GithubChangelogGenerator/go.mod` pins the dependencies:
+
+```text
+module GithubChangelogGenerator
+
+go 1.12
+
+require (
+    github.com/BurntSushi/toml v0.3.1 // indirect
+    github.com/google/go-github v17.0.0+incompatible
+    github.com/google/go-querystring v1.0.0 // indirect
+    github.com/inconshreveable/mousetrap v1.0.0 // indirect
+    github.com/spf13/cobra v0.0.3
+    github.com/spf13/viper v1.3.2
+    golang.org/x/oauth2 v0.0.0-20190402181905-9f3314589c9a
+)
+```
+
+`go 1.12` is the toolchain version this module was authored against, which is fine because no Go-version-specific language features are used. `go-github v17.0.0+incompatible` is the major version of `google/go-github` used at the time — the `+incompatible` suffix is Go's modules-era marker for a v2+ tag that doesn't use the new `/v2` import path convention.
+
+## Release Workflow Fit
+
+The changelog generator is **not** wired into `deploy/_run_all.ps1`. It's run manually by the release engineer, who copies the output into the GitHub Release description after `deploy/7-publish-github-release.ps1` has created the bare release (with an empty `body = ''`, as noted on the deploy-scripts page). A typical command for the next ABP release would be:
+
+```text
+cd tools\github-changelog-generator
+.\generator.exe generate -r abpframework/abp -m "10.4.0" -t %GH_TOKEN% > changelog.md
+```
+
+Then the operator opens `changelog.md`, polishes any unlabelled "Others" entries, and pastes the result into https://github.com/abpframework/abp/releases.
+
+## Related Pages
+
+<CardGroup cols={2}>
+  <Card title="Deploy Scripts" icon="rocket" href="/build/deploy-scripts">
+    Step 7 of the deploy pipeline creates the release shell; the changelog generator fills the body.
+  </Card>
+  <Card title="Localization Sync" icon="language" href="/build/localization-key-synchronizer">
+    The other tool under `tools/`, a .NET console app for keeping module localization JSON files in sync.
+  </Card>
+</CardGroup>

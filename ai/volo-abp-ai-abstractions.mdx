@@ -1,0 +1,269 @@
+---
+title: "Volo.Abp.AI.Abstractions Contracts in ABP Framework"
+sidebarTitle: "AI Abstractions"
+description: "Interfaces and options behind ABP Framework AI integration: IChatClient<TWS>, IChatClientAccessor, IKernelAccessor, AbpAIOptions, WorkspaceNameAttribute."
+---
+
+The ABP Framework `Volo.Abp.AI.Abstractions` package contains the contracts the rest of the AI integration is written against. By depending only on the abstractions package, library code can offer optional AI features without dragging in the `Volo.Abp.AI` registration logic — or [Microsoft Semantic Kernel](https://learn.microsoft.com/semantic-kernel/) — at build time.
+
+All types live under `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/`. There are only seven files; this page covers each of them.
+
+## AbpAIAbstractionsModule
+
+```csharp
+public class AbpAIAbstractionsModule : AbpModule
+{
+}
+```
+
+(`framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/AbpAIAbstractionsModule.cs`)
+
+The module is empty — it exists so other modules can `[DependsOn(typeof(AbpAIAbstractionsModule))]` and pick up the null accessors. `Volo.Abp.AI` depends on it; you should not need to reference it directly unless you ship a contract-only library.
+
+## AbpAIOptions
+
+```csharp
+public class AbpAIOptions
+{
+    public HashSet<string> ConfiguredWorkspaceNames { get; } = new();
+}
+```
+
+(`framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/AbpAIOptions.cs`)
+
+`AbpAIOptions` is the **standard** `IOptions<>` configurable form (unlike the pre-configured `AbpAIWorkspaceOptions` in `Volo.Abp.AI`). `AbpAIModule.ConfigureServices` populates `ConfiguredWorkspaceNames` from the union of workspace keys defined via `PreConfigure<AbpAIWorkspaceOptions>`. Inject `IOptions<AbpAIOptions>` from code that needs to enumerate the available workspaces (for example, an admin endpoint that lists them in the UI):
+
+```csharp
+public class WorkspacesAppService : ApplicationService
+{
+    private readonly IOptions<AbpAIOptions> _options;
+    public WorkspacesAppService(IOptions<AbpAIOptions> options) => _options = options;
+
+    public List<string> ListAsync() => _options.Value.ConfiguredWorkspaceNames.ToList();
+}
+```
+
+## IChatClient&lt;TWorkSpace&gt;
+
+```csharp
+public interface IChatClient<TWorkSpace> : IChatClient
+    where TWorkSpace : class
+{
+}
+```
+
+(`framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/IChatClient.cs`)
+
+It extends `Microsoft.Extensions.AI.IChatClient` with a phantom type parameter. There is no extra method — the type parameter is used as a DI discriminator only. `TypedChatClient<TWorkSpace>` (in `Volo.Abp.AI`) is the concrete implementation; its constructor reads the workspace name from `WorkspaceNameAttribute.GetWorkspaceName<TWorkSpace>()` and resolves the matching keyed `IChatClient` from the container.
+
+The benefit is constructor-time discoverability: code that injects `IChatClient<ComplianceWorkspace>` documents its dependency on the `Compliance` workspace at the type level. Switching workspaces is a compile-time refactor, not a runtime config change.
+
+```csharp
+public class ComplianceCheckService : ITransientDependency
+{
+    private readonly IChatClient<ComplianceWorkspace> _chat;
+
+    public ComplianceCheckService(IChatClient<ComplianceWorkspace> chat) => _chat = chat;
+
+    public async Task<string> CheckAsync(string draftText)
+    {
+        var response = await _chat.GetResponseAsync(
+            new[] { new ChatMessage(ChatRole.User, draftText) });
+        return response.Message?.Text ?? string.Empty;
+    }
+}
+```
+
+## IChatClientAccessor and IChatClientAccessor&lt;TWorkSpace&gt;
+
+```csharp
+public interface IChatClientAccessor
+{
+    IChatClient? ChatClient { get; }
+}
+
+public interface IChatClientAccessor<TWorkSpace> : IChatClientAccessor
+    where TWorkSpace : class
+{
+}
+```
+
+(`framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/IChatClientAccessor.cs`)
+
+`IChatClientAccessor` exposes a **nullable** `IChatClient`. When no chat client is configured for the workspace (or no AI module at all), the accessor's `ChatClient` is `null`. The non-generic flavor targets the default workspace; the generic flavor targets a specific named workspace.
+
+Inject this when AI is optional:
+
+```csharp
+public class SummaryService : ITransientDependency
+{
+    private readonly IChatClientAccessor _accessor;
+    public SummaryService(IChatClientAccessor accessor) => _accessor = accessor;
+
+    public async Task<string?> TrySummarizeAsync(string text)
+    {
+        if (_accessor.ChatClient is null) return null;
+
+        var resp = await _accessor.ChatClient.GetResponseAsync(
+            new[] { new ChatMessage(ChatRole.User, "Summarize: " + text) });
+        return resp.Message?.Text;
+    }
+}
+```
+
+`NullChatClientAccessor` (`framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/NullChatClientAccessor.cs`) is the default registration:
+
+```csharp
+[Dependency(TryRegister = true)]
+[ExposeServices(typeof(IChatClientAccessor))]
+public class NullChatClientAccessor : IChatClientAccessor
+{
+    public IChatClient? ChatClient => null;
+}
+
+[Dependency(TryRegister = true)]
+[ExposeServices(typeof(IChatClientAccessor<>))]
+public class NullChatClientAccessor<TWorkSpace> : IChatClientAccessor<TWorkSpace>
+    where TWorkSpace : class
+{
+    public IChatClient? ChatClient => null;
+}
+```
+
+`TryRegister = true` lets the real `ChatClientAccessor` (in `Volo.Abp.AI`) override it once `AbpAIModule` is referenced.
+
+## IKernelAccessor and IKernelAccessor&lt;TWorkSpace&gt;
+
+```csharp
+public interface IKernelAccessor
+{
+    Kernel? Kernel { get; }
+}
+
+public interface IKernelAccessor<TWorkSpace> : IKernelAccessor
+    where TWorkSpace : class
+{
+}
+```
+
+(`framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/IKernelAccessor.cs`)
+
+The Semantic Kernel counterpart. `Kernel` here is `Microsoft.SemanticKernel.Kernel`. Inject `IKernelAccessor` (or its workspace-typed variant) from code that uses Semantic Kernel plugins, planners or function calling and wants to opt out gracefully when SK is not wired.
+
+`NullKernelAccessor` (`framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/NullKernelAccessor.cs`) mirrors the chat-client null accessor:
+
+```csharp
+[Dependency(TryRegister = true)]
+[ExposeServices(typeof(IKernelAccessor))]
+public class NullKernelAccessor : IKernelAccessor
+{
+    public Kernel? Kernel => null;
+}
+
+[Dependency(TryRegister = true)]
+[ExposeServices(typeof(IKernelAccessor<>))]
+public class NullKernelAccessor<TWorkSpace> : IKernelAccessor<TWorkSpace>
+    where TWorkSpace : class
+{
+    public Kernel? Kernel => null;
+}
+```
+
+The real implementations (`DefaultKernelAccessor`, `KernelAccessor<TWS>`) are in `Volo.Abp.AI`; they read the keyed `Kernel` service that `AbpAIModule` registers for each configured workspace.
+
+## WorkspaceNameAttribute
+
+```csharp
+[AttributeUsage(AttributeTargets.Class)]
+public class WorkspaceNameAttribute : Attribute
+{
+    public string Name { get; }
+
+    public WorkspaceNameAttribute(string name)
+    {
+        Check.NotNull(name, nameof(name));
+        Name = name;
+    }
+
+    private static readonly ConcurrentDictionary<Type, string> _nameCache = new();
+
+    public static string GetWorkspaceName<TWorkspace>()
+        => GetWorkspaceName(typeof(TWorkspace));
+
+    public static string GetWorkspaceName(Type workspaceType)
+        => _nameCache.GetOrAdd(workspaceType, type =>
+            type.GetCustomAttributes(true).OfType<WorkspaceNameAttribute>().FirstOrDefault()?.Name
+            ?? type.FullName!);
+}
+```
+
+(`framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/WorkspaceNameAttribute.cs`)
+
+Marker types act as compile-time tokens. Decorating them with `[WorkspaceName("Compliance")]` makes the typed accessors and `TypedChatClient<TWorkspace>` resolve the correct keyed registration:
+
+```csharp
+[WorkspaceName("Compliance")]
+public class ComplianceWorkspace { }
+
+[WorkspaceName("Marketing")]
+public class MarketingWorkspace { }
+```
+
+If the attribute is absent, the workspace name defaults to `Type.FullName` — usable but not very readable. Always add an explicit attribute when you intend to configure a workspace.
+
+The `_nameCache` ensures the reflection cost is paid once per type per process — important when the typed accessor is resolved inside hot paths.
+
+## AbpAiOptions / AbpAiClientCallContext / IAbpAiToolCallProvider
+
+These names appear in some external ABP documentation but **are not defined in the current `Volo.Abp.AI.Abstractions` source tree**. The framework standardizes instead on the official `Microsoft.Extensions.AI` types:
+
+| Concept asked about | Where it lives in the current codebase |
+| --- | --- |
+| Per-call context (`AbpAiClientCallContext`) | Use `Microsoft.Extensions.AI.ChatOptions` + the workspace's `ChatClientBuilder` middleware |
+| Tool call provider (`IAbpAiToolCallProvider`) | Use `Microsoft.Extensions.AI`'s `AIFunctionFactory.Create(...)` and pass to `ChatOptions.Tools` |
+| Response function (`AbpAiResponseFunction`) | Use `Microsoft.Extensions.AI.AIFunction` |
+| Per-client options (`AbpAiOptions`) | Use `Microsoft.Extensions.AI.ChatOptions` set per-call |
+
+If you previously wrote code against `IAbpAiClient` / `AbpAiOptions` / `AbpAiClientCallContext`, port it to `IChatClient<TWorkSpace>` + `ChatOptions`. The `Microsoft.Extensions.AI` shape is the canonical one — see `IChatClient.GetResponseAsync(IEnumerable<ChatMessage>, ChatOptions?, CancellationToken)`.
+
+## Consuming the abstractions
+
+Library code that wants to be AI-optional should depend on **only** `Volo.Abp.AI.Abstractions`:
+
+```csharp
+[DependsOn(typeof(AbpAIAbstractionsModule))]
+public class MyOptionalAILibraryModule : AbpModule { }
+
+public class MyService : ITransientDependency
+{
+    private readonly IChatClientAccessor _accessor;
+    public MyService(IChatClientAccessor accessor) => _accessor = accessor;
+}
+```
+
+The library compiles without referencing OpenAI, Azure OpenAI or Anthropic; if the host application does not depend on `AbpAIModule`, the resolved `_accessor.ChatClient` is `null` and the code path falls back. If the host wires `AbpAIModule` + a provider, the same library transparently uses the real chat client.
+
+## Service lifetimes
+
+All abstractions are resolved through transient registrations registered by `AbpAIModule`:
+
+- `IChatClient<TWS>` → `TypedChatClient<TWS>` (transient, `TryAddTransient`).
+- `IChatClientAccessor` → `ChatClientAccessor` (transient) or `NullChatClientAccessor` (transient).
+- `IChatClientAccessor<TWS>` → `ChatClientAccessor<TWS>` (transient).
+- `IKernelAccessor` → `DefaultKernelAccessor` (transient) or `NullKernelAccessor` (transient).
+- `IKernelAccessor<TWS>` → `KernelAccessor<TWS>` (transient).
+
+Transient is the safe default because `Microsoft.Extensions.AI`'s `IChatClient` and Semantic Kernel's `Kernel` are not guaranteed to be thread-safe across long-lived scopes; per-call construction avoids the foot-gun.
+
+## Reference
+
+| Type | File |
+| --- | --- |
+| `AbpAIAbstractionsModule` | `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/AbpAIAbstractionsModule.cs` |
+| `AbpAIOptions` | `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/AbpAIOptions.cs` |
+| `IChatClient<TWS>` | `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/IChatClient.cs` |
+| `IChatClientAccessor` / `IChatClientAccessor<TWS>` | `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/IChatClientAccessor.cs` |
+| `IKernelAccessor` / `IKernelAccessor<TWS>` | `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/IKernelAccessor.cs` |
+| `NullChatClientAccessor` | `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/NullChatClientAccessor.cs` |
+| `NullKernelAccessor` | `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/NullKernelAccessor.cs` |
+| `WorkspaceNameAttribute` | `framework/src/Volo.Abp.AI.Abstractions/Volo/Abp/AI/WorkspaceNameAttribute.cs` |

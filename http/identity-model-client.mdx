@@ -1,0 +1,393 @@
+---
+title: "IdentityModel Client: Bearer Tokens For Remote Service Calls"
+sidebarTitle: "IdentityModel Client"
+description: "Reference for the ABP Framework IdentityModel-based access token acquisition, caching, and per-host authenticators for Web, WebAssembly, and MAUI Blazor."
+---
+
+`Volo.Abp.IdentityModel` and the `Volo.Abp.Http.Client.IdentityModel*` packages provide the ABP Framework's default way of attaching OAuth2 access tokens to outgoing remote service calls. The IdentityModel package itself is host-agnostic — it speaks the Duende `IdentityModel` protocol to fetch and cache tokens. Per-host packages then layer on the integration that pulls the right token for the current execution context.
+
+## Volo.Abp.IdentityModel
+
+The base package lives in `framework/src/Volo.Abp.IdentityModel/Volo.Abp.IdentityModel.csproj`. The module declaration in `framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/AbpIdentityModelModule.cs` depends on `AbpThreadingModule`, `AbpMultiTenancyModule`, and `AbpCachingModule`, registers a named `HttpClient` for the token endpoint, and binds `AbpIdentityClientOptions` to configuration:
+
+```csharp
+[DependsOn(typeof(AbpThreadingModule), typeof(AbpMultiTenancyModule), typeof(AbpCachingModule))]
+public class AbpIdentityModelModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        context.Services.AddHttpClient(IdentityModelAuthenticationService.HttpClientName);
+        Configure<AbpIdentityClientOptions>(configuration);
+    }
+}
+```
+
+The named `HttpClient` is the one the authentication service uses to call the discovery endpoint and the token endpoint. Its name is the constant `"IdentityModelAuthenticationServiceHttpClientName"` declared on `IdentityModelAuthenticationService.HttpClientName` (`framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IdentityModelAuthenticationService.cs`).
+
+### IIdentityModelAuthenticationService
+
+`framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IIdentityModelAuthenticationService.cs` is intentionally minimal:
+
+```csharp
+public interface IIdentityModelAuthenticationService
+{
+    Task<bool>   TryAuthenticateAsync(HttpClient client, string? identityClientName = null);
+    Task<string> GetAccessTokenAsync(IdentityClientConfiguration configuration);
+}
+```
+
+`TryAuthenticateAsync` is what the per-host authenticators call. It looks up the configuration for the given client name (defaulting to `"Default"`), acquires a token using `GetAccessTokenOrNullAsync`, and on success calls `SetAccessToken(client, accessToken)` to mutate the supplied `HttpClient`. The default implementation `IdentityModelAuthenticationService` (`framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IdentityModelAuthenticationService.cs`) sets the Authorization header through a virtual `SetAccessToken` method so subclasses can switch between `Bearer` and DPoP.
+
+`GetAccessTokenAsync` does the heavy lifting: it computes a cache key from the configuration with `IdentityModelTokenCacheItem.CalculateCacheKey(configuration)`, checks the `IDistributedCache<IdentityModelTokenCacheItem>` cache, fetches a fresh discovery document if missed (cached as `IdentityModelDiscoveryDocumentCacheItem`), and finally requests a token through Duende's `PasswordTokenRequest` or `ClientCredentialsTokenRequest` depending on the configured `GrantType`.
+
+### IdentityClientConfiguration
+
+`framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IdentityClientConfiguration.cs` is a `Dictionary<string, string?>` with strongly-typed accessors for every OIDC field:
+
+| Property | Description |
+|----------|-------------|
+| `GrantType` | `"client_credentials"` (default) or `"password"`. |
+| `ClientId` / `ClientSecret` | OAuth client credentials. |
+| `UserName` / `UserPassword` | Resource owner credentials when `GrantType == "password"`. |
+| `Authority` | OIDC discovery base URL. |
+| `Scope` | Whitespace-separated scope list. |
+| `RequireHttps` | Default `true`; set `false` only in development. |
+| `CacheAbsoluteExpiration` | Token cache lifetime in seconds, default `1800`. |
+| `ValidateIssuerName` / `ValidateEndpoints` | Discovery validation; default `true`. |
+
+Storing the configuration as a `Dictionary<string, string?>` is what allows `IdentityModelTokenCacheItem.CalculateCacheKey` to produce a stable SHA-256 hash from the configuration values: any change to a property automatically invalidates cached tokens because the hash changes.
+
+### AbpIdentityClientOptions and tenant-scoped resolution
+
+`framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/AbpIdentityClientOptions.cs` wraps an `IdentityClientConfigurationDictionary` (`framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IdentityClientConfigurationDictionary.cs`) and exposes a `GetClientConfiguration(ICurrentTenant, string?)` resolver that supports both per-tenant overrides and the `"Default"` fallback:
+
+```csharp
+public IdentityClientConfiguration? GetClientConfiguration(ICurrentTenant currentTenant, string? identityClientName = null)
+{
+    if (identityClientName.IsNullOrWhiteSpace())
+        identityClientName = IdentityClientConfigurationDictionary.DefaultName;
+
+    if (currentTenant.Id.HasValue)
+    {
+        var tenantConfiguration = IdentityClients.FirstOrDefault(x => x.Key == $"{identityClientName}.{currentTenant.Id}");
+        if (tenantConfiguration.Key == null && !currentTenant.Name.IsNullOrWhiteSpace())
+            tenantConfiguration = IdentityClients.FirstOrDefault(x => x.Key == $"{identityClientName}.{currentTenant.Name}");
+
+        if (tenantConfiguration.Key != null)
+            return tenantConfiguration.Value;
+    }
+
+    return IdentityClients.GetOrDefault(identityClientName!) ?? IdentityClients.Default;
+}
+```
+
+A configuration key like `"Default.acme"` overrides the default for tenant `"acme"`. The same shape applies for the GUID form `"Default.<tenant-guid>"`. The fallback chain is **named-tenant → default-tenant-of-named → default-of-default**, which is the same precedence the rest of ABP uses for tenant-aware options.
+
+### IdentityModelHttpRequestMessageOptions
+
+`framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IdentityModelHttpRequestMessageOptions.cs` exposes a single optional callback:
+
+```csharp
+public class IdentityModelHttpRequestMessageOptions
+{
+    public Action<HttpRequestMessage>? ConfigureHttpRequestMessage { get; set; }
+}
+```
+
+`IdentityModelAuthenticationService.AddHeaders` and the token request builders apply this callback to every protocol request the service makes. It is the right hook for adding mTLS headers, custom proxies, or trace metadata to the token endpoint call without subclassing.
+
+### Caching items
+
+Two `[Serializable]` records back the distributed cache:
+
+- `framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IdentityModelTokenCacheItem.cs` — holds the `AccessToken` and a static `CalculateCacheKey(IdentityClientConfiguration)` that hashes every property into a single SHA-256 string.
+- `framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IdentityModelDiscoveryDocumentCacheItem.cs` — holds `TokenEndpoint` and `DeviceAuthorizationEndpoint`. Marked `[IgnoreMultiTenancy]` because discovery documents are authority-level, not tenant-level. Its cache key is `configuration.Authority.ToLower().ToSha256()`.
+
+Both items leverage `IDistributedCache<T>`, so when ABP is configured with Redis the tokens and discovery URLs are shared across replicas of the same application. The cache absolute expiration is driven by `IdentityClientConfiguration.CacheAbsoluteExpiration`.
+
+## Volo.Abp.Http.Client.IdentityModel
+
+The bridge package `framework/src/Volo.Abp.Http.Client.IdentityModel/Volo.Abp.Http.Client.IdentityModel.csproj` is even smaller. The module declaration in `framework/src/Volo.Abp.Http.Client.IdentityModel/Volo/Abp/Http/Client/IdentityModel/AbpHttpClientIdentityModelModule.cs` simply chains `AbpHttpClientModule` and `AbpIdentityModelModule`:
+
+```csharp
+[DependsOn(typeof(AbpHttpClientModule), typeof(AbpIdentityModelModule))]
+public class AbpHttpClientIdentityModelModule : AbpModule
+{
+}
+```
+
+### IdentityModelRemoteServiceHttpClientAuthenticator
+
+`framework/src/Volo.Abp.Http.Client.IdentityModel/Volo/Abp/Http/Client/IdentityModel/IdentityModelRemoteServiceHttpClientAuthenticator.cs` replaces the null authenticator from the base HTTP client:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class IdentityModelRemoteServiceHttpClientAuthenticator
+    : IRemoteServiceHttpClientAuthenticator, ITransientDependency
+{
+    protected IIdentityModelAuthenticationService IdentityModelAuthenticationService { get; }
+
+    public virtual async Task Authenticate(RemoteServiceHttpClientAuthenticateContext context)
+    {
+        await IdentityModelAuthenticationService.TryAuthenticateAsync(
+            context.Client,
+            context.RemoteService.GetIdentityClient() ?? context.RemoteServiceName);
+    }
+}
+```
+
+The lookup `context.RemoteService.GetIdentityClient() ?? context.RemoteServiceName` is what binds remote services to their token sources: by default the identity client name equals the remote service name, but it can be overridden per remote service via `RemoteServiceConfigurationExtensions.SetIdentityClient` (`framework/src/Volo.Abp.Http.Client.IdentityModel/Volo/Abp/Http/Client/RemoteServiceConfigurationExtensions.cs`).
+
+### RemoteServiceConfiguration extensions
+
+The same file adds two extension helpers that surface optional values inside the `RemoteServiceConfiguration` dictionary:
+
+```csharp
+public const string IdentityClientName         = "IdentityClient";
+public const string UseCurrentAccessTokenName  = "UseCurrentAccessToken";
+
+public static string? GetIdentityClient(this RemoteServiceConfiguration configuration);
+public static RemoteServiceConfiguration SetIdentityClient(this RemoteServiceConfiguration configuration, string? value);
+
+public static bool?   GetUseCurrentAccessToken(this RemoteServiceConfiguration configuration);
+public static RemoteServiceConfiguration SetUseCurrentAccessToken(this RemoteServiceConfiguration configuration, bool? value);
+```
+
+`UseCurrentAccessToken = true` switches the authenticator to read the access token from the current `HttpContext` instead of acquiring a new one — that is the path used when the host already has a user-bound token (Web) and wants to forward it downstream.
+
+## Per-host packages
+
+There are four physical packages — Web, WebAssembly, MAUI Blazor, and the shared base — each implementing `IAbpAccessTokenProvider` (`framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/Authentication/IAbpAccessTokenProvider.cs`) in the way that makes sense for the host.
+
+### Web (ASP.NET Core)
+
+`framework/src/Volo.Abp.Http.Client.IdentityModel.Web/Volo/Abp/Http/Client/IdentityModel/Web/AbpHttpClientIdentityModelWebModule.cs` adds `IHttpContextAccessor` and depends on `AbpHttpClientIdentityModelModule`. The host-specific provider is `HttpContextAbpAccessTokenProvider` (`framework/src/Volo.Abp.Http.Client.IdentityModel.Web/Volo/Abp/Http/Client/IdentityModel/Web/HttpContextAbpAccessTokenProvider.cs`):
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class HttpContextAbpAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    protected IHttpContextAccessor HttpContextAccessor { get; }
+
+    public virtual async Task<string?> GetTokenAsync()
+    {
+        var httpContext = HttpContextAccessor?.HttpContext;
+        if (httpContext == null) return null;
+        if (!httpContext.RequestServices.GetRequiredService<ICurrentUser>().IsAuthenticated) return null;
+        return await httpContext.GetTokenAsync("access_token");
+    }
+}
+```
+
+`httpContext.GetTokenAsync("access_token")` is the standard ASP.NET Core Authentication extension that returns whatever token was stored when the cookie was issued — typically the result of an OpenID Connect login. The companion `HttpContextIdentityModelRemoteServiceHttpClientAuthenticator` (same folder) wires this provider into the authenticator pipeline by deciding between forwarding the current token and requesting a new one based on `UseCurrentAccessToken`.
+
+### WebAssembly (Blazor)
+
+`framework/src/Volo.Abp.Http.Client.IdentityModel.WebAssembly/Volo/Abp/Http/Client/IdentityModel/WebAssembly/AbpHttpClientIdentityModelWebAssemblyModule.cs` depends on `AbpAspNetCoreComponentsWebAssemblyModule` and remaps `AbpClaimTypes.UserName`, `Name`, `SurName`, `UserId`, `Role`, and `Email` to the Duende `JwtClaimTypes` shape so that ABP's `ICurrentUser` picks up the right values from a JWT.
+
+The provider `WebAssemblyAbpAccessTokenProvider` (`framework/src/Volo.Abp.Http.Client.IdentityModel.WebAssembly/Volo/Abp/Http/Client/IdentityModel/WebAssembly/WebAssemblyAbpAccessTokenProvider.cs`) delegates to Blazor's built-in `IAccessTokenProvider`:
+
+```csharp
+public virtual async Task<string?> GetTokenAsync()
+{
+    if (AccessTokenProvider == null) return null;
+    var result = await AccessTokenProvider.RequestAccessToken();
+    if (result.Status != AccessTokenResultStatus.Success) return null;
+    result.TryGetToken(out var token);
+    return token?.Value;
+}
+```
+
+This is the Blazor WebAssembly authentication pipeline. The companion authenticator `AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator` in the same folder attaches the token to the outgoing `HttpClient.DefaultRequestHeaders`.
+
+### MAUI Blazor
+
+`framework/src/Volo.Abp.Http.Client.IdentityModel.MauiBlazor/Volo/Abp/Http/Client/IdentityModel/MauiBlazor/AbpHttpClientIdentityModelMauiBlazorModule.cs` mirrors the WebAssembly module's claim-type mapping. The provider `MauiBlazorAbpAccessTokenProvider` is intentionally a no-op stub:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class MauiBlazorAbpAccessTokenProvider : IAbpAccessTokenProvider, ITransientDependency
+{
+    public virtual Task<string?> GetTokenAsync() => Task.FromResult(null as string);
+}
+```
+
+MAUI Blazor apps typically use the OS keychain, so the real implementation is provided by the application template; this stub is the safe default that returns `null` when no token store has been configured. The matching authenticator `MauiIBlazorIdentityModelRemoteServiceHttpClientAuthenticator` (note the typo preserved from the source file name) is what hooks into the `IRemoteServiceHttpClientAuthenticator` pipeline.
+
+## The bearer token handler pipeline
+
+The full authentication sequence for a remote call looks like this:
+
+```mermaid
+sequenceDiagram
+    participant Proxy as DynamicHttpProxyInterceptor
+    participant Auth as IdentityModelRemoteServiceHttpClientAuthenticator
+    participant Svc as IIdentityModelAuthenticationService
+    participant Cache as IDistributedCache&lt;IdentityModelTokenCacheItem&gt;
+    participant IdP as OIDC Authority
+
+    Proxy->>Auth: Authenticate(context)
+    Auth->>Svc: TryAuthenticateAsync(client, name)
+    Svc->>Svc: AbpIdentityClientOptions.GetClientConfiguration&#40;tenant, name&#41;
+    Svc->>Cache: Get&#40;IdentityModelTokenCacheItem.CalculateCacheKey&#40;cfg&#41;&#41;
+    alt Cache hit
+        Cache-->>Svc: AccessToken
+    else Cache miss
+        Svc->>IdP: Discovery + Token request
+        IdP-->>Svc: TokenResponse
+        Svc->>Cache: Set&#40;cacheItem, AbsoluteExpiration&#41;
+    end
+    Svc->>Proxy: client.DefaultRequestHeaders.Authorization = Bearer ...
+```
+
+For the Web host where `UseCurrentAccessToken = true`, the cache-miss/IdP path is skipped entirely — the authenticator reads `httpContext.GetTokenAsync("access_token")` directly. For WebAssembly hosts, the BFF or built-in OIDC remote authentication flow keeps the token fresh, and `WebAssemblyAbpAccessTokenProvider.GetTokenAsync` reads it from the result of `IAccessTokenProvider.RequestAccessToken`.
+
+## Configuration
+
+A minimal `appsettings.json` snippet that the options pipeline binds to looks like:
+
+```json
+{
+  "IdentityClients": {
+    "Default": {
+      "GrantType": "client_credentials",
+      "ClientId": "MyApp_App",
+      "ClientSecret": "1q2w3e*",
+      "Authority": "https://auth.example.com",
+      "Scope": "MyApp"
+    }
+  },
+  "RemoteServices": {
+    "Default": {
+      "BaseUrl": "https://api.example.com/",
+      "IdentityClient": "Default"
+    }
+  }
+}
+```
+
+`Configure<AbpIdentityClientOptions>(configuration)` and `Configure<AbpRemoteServiceOptions>(configuration)` are called from the two modules; the section names match the property names by convention. Tenant-scoped overrides slot in under the same `IdentityClients` object with the `Default.<tenant>` shape.
+
+<Note>
+The IdentityModel client never assumes that authentication exists. Even with the package installed, the authenticator only activates when the host configures `IdentityClients` and points the relevant remote service at one. That is what makes it safe to add to backend-for-frontend templates where some calls are anonymous and others are authenticated.
+</Note>
+
+## IAbpAccessTokenProvider
+
+The host-agnostic interface that ties everything together is `IAbpAccessTokenProvider` (`framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/Authentication/IAbpAccessTokenProvider.cs`):
+
+```csharp
+public interface IAbpAccessTokenProvider
+{
+    Task<string?> GetTokenAsync();
+}
+```
+
+This is the smallest possible contract — return a token or null. Per-host packages each ship a `[Dependency(ReplaceServices = true)]` implementation that knows where the host stores tokens (cookie auth state for Web, Blazor's `IAccessTokenProvider` for WebAssembly, etc.). The default `NullAbpAccessTokenProvider` (`framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/Authentication/NullAbpAccessTokenProvider.cs`) returns null, which is the right behaviour for hosts where no user context exists.
+
+The bridge from `IAbpAccessTokenProvider` to `IIdentityModelAuthenticationService` is in the host-specific authenticators (e.g. `HttpContextIdentityModelRemoteServiceHttpClientAuthenticator` in the Web package, which calls `GetTokenAsync` to forward the current token vs. acquiring a new one).
+
+## RemoteServiceHttpClientAuthenticateContext
+
+`framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/Authentication/RemoteServiceHttpClientAuthenticateContext.cs` carries the data an authenticator needs:
+
+```csharp
+public class RemoteServiceHttpClientAuthenticateContext
+{
+    public HttpClient Client                    { get; }
+    public RemoteServiceConfiguration RemoteService { get; }
+    public string  RemoteServiceName           { get; }
+    public Type?   ServiceType                  { get; }
+}
+```
+
+The context is constructed by the dynamic proxy just before `Authenticate(context)` runs. The authenticator can read `context.RemoteService.GetIdentityClient()` or `GetUseCurrentAccessToken()` to decide its behaviour without taking a dependency on the global configuration object.
+
+## Token caching invalidation
+
+`IdentityModelAuthenticationService.GetAccessTokenOrNullAsync` caches successful token responses through `IDistributedCache<IdentityModelTokenCacheItem>`. The cache key is the SHA-256 of every property in the `IdentityClientConfiguration` dictionary, so any change to authority, scope, client id, or grant type automatically invalidates the cached token. The `CacheAbsoluteExpiration` setting (default 1800 seconds) caps the cache lifetime independent of token expiration — this is a defence against the cache outliving the actual token's validity, which can happen if the IdP issues a shorter-lived token than expected.
+
+When the cached token is rejected by the resource server (401 response with `WWW-Authenticate: error="invalid_token"`), the standard mitigation is to invalidate the cache and retry — but the IdentityModel client does **not** do this automatically. The pattern that ABP applications follow is to subscribe to `ClientProxyExceptionEventData` (raised by the dynamic proxy on 401 responses) and call `IDistributedCache<IdentityModelTokenCacheItem>.RemoveAsync(cacheKey)` manually, then let the next request acquire a fresh token.
+
+## Discovery document caching
+
+`GetDiscoveryResponse` caches the `IdentityModelDiscoveryDocumentCacheItem` per authority (key = `Authority.ToLower().ToSha256()`). The default cache duration follows the standard distributed cache defaults — typically the same `CacheAbsoluteExpiration` value the application configures, or no expiration when the cache is keyed by authority only. The `[IgnoreMultiTenancy]` attribute on `IdentityModelDiscoveryDocumentCacheItem` is important: discovery documents describe the authority, not the tenant, and sharing them across tenants reduces load on the IdP.
+
+The cached fields are `TokenEndpoint` and `DeviceAuthorizationEndpoint`. The userinfo endpoint, end-session endpoint, and JWKS URI are **not** cached here because they are used by other components (the OpenID Connect handler, for instance) and would risk version skew if cached separately.
+
+## Token request shapes
+
+`IdentityModelAuthenticationService.GetTokenResponse` builds one of two request shapes:
+
+- `PasswordTokenRequest` — resource-owner-password flow, used when `GrantType == "password"`. Carries `UserName`, `Password`, `Scope`, plus the client credentials.
+- `ClientCredentialsTokenRequest` — machine-to-machine flow, used when `GrantType == "client_credentials"`. Carries only client credentials and scope.
+
+Both go through `CreatePasswordTokenRequestAsync` / `CreateClientCredentialsTokenRequestAsync` so subclasses can inject extra parameters. `AddParametersToRequestAsync` is the override hook that lets a subclass add `acr_values`, `resource`, or any other OIDC parameter without modifying the framework code.
+
+`AddHeaders(HttpClient)` applies any headers configured in `IdentityModelHttpRequestMessageOptions.ConfigureHttpRequestMessage`. The configurable callback gives developers a hook to inject mTLS headers, trace IDs, or custom proxies that should accompany the token request itself — distinct from the headers attached to the downstream remote service call.
+
+## Multi-tenant identity clients in practice
+
+A typical multi-tenant deployment that uses different OIDC authorities per tenant configures the dictionary like this:
+
+```json
+{
+  "IdentityClients": {
+    "Default": {
+      "GrantType": "client_credentials",
+      "Authority": "https://central-auth.example.com",
+      "ClientId": "MyApp_App",
+      "ClientSecret": "...",
+      "Scope": "MyApp"
+    },
+    "Default.acme": {
+      "Authority": "https://acme-auth.example.com",
+      "ClientId": "MyApp_App_Acme",
+      "ClientSecret": "...",
+      "Scope": "MyApp"
+    },
+    "Default.contoso": {
+      "Authority": "https://contoso-auth.example.com",
+      "ClientId": "MyApp_App_Contoso",
+      "ClientSecret": "...",
+      "Scope": "MyApp"
+    }
+  }
+}
+```
+
+`AbpIdentityClientOptions.GetClientConfiguration` looks for `Default.<tenant>` first, falls back to `Default.<tenant-name>`, then `Default`. The configuration values themselves are cached per call in the `IdentityModelTokenCacheItem` cache key, so each tenant gets its own cached token.
+
+## Replacing the authenticator
+
+When a deployment needs custom token logic (mTLS-bound tokens, hardware-backed credentials, FedAuth integration), the standard extension point is to ship a replacement `IRemoteServiceHttpClientAuthenticator` with `[Dependency(ReplaceServices = true)]`. The replacement can reuse `IIdentityModelAuthenticationService` for the token acquisition step while customising the application step:
+
+```csharp
+[Dependency(ReplaceServices = true)]
+public class CustomAuthenticator : IRemoteServiceHttpClientAuthenticator, ITransientDependency
+{
+    protected IIdentityModelAuthenticationService IdentityModelService { get; }
+    public async Task Authenticate(RemoteServiceHttpClientAuthenticateContext context)
+    {
+        var accessToken = await IdentityModelService.GetAccessTokenAsync(
+            ResolveConfigurationForCurrentTenant(context));
+        context.Client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("DPoP", accessToken);
+        context.Client.DefaultRequestHeaders.Add("DPoP", BuildDpopProof(accessToken));
+    }
+}
+```
+
+Because the registration uses `ReplaceServices = true`, the new authenticator is the only one DI resolves — there is no chain to compose with the original.
+
+## Per-host concerns summarised
+
+| Host | Provider | Authenticator | Where token comes from |
+|------|----------|---------------|-----------------------|
+| ASP.NET Core Web (BFF) | `HttpContextAbpAccessTokenProvider` | `HttpContextIdentityModelRemoteServiceHttpClientAuthenticator` | Cookie-stored OIDC tokens via `HttpContext.GetTokenAsync("access_token")` |
+| Blazor WebAssembly | `WebAssemblyAbpAccessTokenProvider` | `AccessTokenProviderIdentityModelRemoteServiceHttpClientAuthenticator` | Blazor's `IAccessTokenProvider.RequestAccessToken` |
+| MAUI Blazor | `MauiBlazorAbpAccessTokenProvider` (stub) | `MauiIBlazorIdentityModelRemoteServiceHttpClientAuthenticator` | Application-supplied via the keychain |
+| Server-to-server | `NullAbpAccessTokenProvider` | `IdentityModelRemoteServiceHttpClientAuthenticator` | `IdentityModelAuthenticationService` fetches client_credentials tokens |
+
+The server-to-server row is the canonical "machine talking to machine" path — no current user, no cookie, just a long-lived client credential that produces short-lived bearer tokens cached across the process.

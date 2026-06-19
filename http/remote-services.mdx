@@ -1,0 +1,300 @@
+---
+title: "Volo.Abp.RemoteServices: Named Endpoints & Multi-Tenant URLs"
+sidebarTitle: "Remote Services"
+description: "ABP Framework remote service configuration reference: named base URLs, multi-tenant URL substitution, and the options-driven configuration provider."
+---
+
+`Volo.Abp.RemoteServices` is the smallest package in the HTTP stack and arguably the most foundational. It owns the answer to one question: "Given a logical name like `Identity` or `Tenant`, what base URL should an outgoing HTTP request actually use?" The ABP Framework keeps this in its own assembly so that both the dynamic HTTP client proxy (`Volo.Abp.Http.Client`) and any custom integration can depend on the same configuration shape without dragging in Castle, IdentityModel, or ASP.NET Core.
+
+## The package
+
+`framework/src/Volo.Abp.RemoteServices/Volo.Abp.RemoteServices.csproj` ships seven C# files. The module class in `framework/src/Volo.Abp.RemoteServices/Volo/Abp/RemoteServices/AbpRemoteServicesModule.cs` declares its dependency on `AbpMultiTenancyAbstractionsModule` and binds the configuration to options:
+
+```csharp
+[DependsOn(typeof(AbpMultiTenancyAbstractionsModule))]
+public class AbpRemoteServicesModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpRemoteServiceOptions>(configuration);
+    }
+}
+```
+
+`Configure<AbpRemoteServiceOptions>(configuration)` reads the whole `IConfiguration` root, which means the options binder picks up properties keyed by name in the JSON. The `RemoteServices` section in `appsettings.json` is what populates `AbpRemoteServiceOptions.RemoteServices`.
+
+## AbpRemoteServiceOptions
+
+`framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/AbpRemoteServiceOptions.cs` is intentionally minimal:
+
+```csharp
+public class AbpRemoteServiceOptions
+{
+    public RemoteServiceConfigurationDictionary RemoteServices { get; set; }
+
+    public AbpRemoteServiceOptions()
+    {
+        RemoteServices = new RemoteServiceConfigurationDictionary();
+    }
+}
+```
+
+The single `RemoteServices` dictionary is the root of every named endpoint in the application. Adding `services.Configure<AbpRemoteServiceOptions>(opts => opts.RemoteServices["Identity"] = new RemoteServiceConfiguration("https://identity.example.com"))` is how code-first registrations work; the JSON path is the same shape.
+
+## RemoteServiceConfiguration
+
+`framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/RemoteServiceConfiguration.cs` is a `Dictionary<string, string?>` with two strongly typed accessors:
+
+```csharp
+public class RemoteServiceConfiguration : Dictionary<string, string?>
+{
+    public string  BaseUrl { get => this.GetOrDefault(nameof(BaseUrl))!; set => this[nameof(BaseUrl)] = value; }
+    public string? Version { get => this.GetOrDefault(nameof(Version));  set => this[nameof(Version)] = value; }
+
+    public RemoteServiceConfiguration() { }
+    public RemoteServiceConfiguration(string baseUrl, string? version = null)
+    {
+        this[nameof(BaseUrl)] = baseUrl;
+        this[nameof(Version)] = version;
+    }
+    public RemoteServiceConfiguration(RemoteServiceConfiguration configuration)
+    {
+        foreach (var keyValuePair in configuration) this.Add(keyValuePair.Key, keyValuePair.Value);
+    }
+}
+```
+
+The dictionary shape is deliberate: it lets other packages tack on properties through extension methods without modifying the type. The IdentityModel client uses this in `RemoteServiceConfigurationExtensions` (`framework/src/Volo.Abp.Http.Client.IdentityModel/Volo/Abp/Http/Client/RemoteServiceConfigurationExtensions.cs`) to attach `IdentityClient` and `UseCurrentAccessToken` values, and downstream modules can add their own keys without coordinating with this package.
+
+The copy constructor `RemoteServiceConfiguration(RemoteServiceConfiguration)` exists because the provider clones the configuration when the multi-tenant URL provider rewrites the `BaseUrl` — see below.
+
+## RemoteServiceConfigurationDictionary
+
+`framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/RemoteServiceConfigurationDictionary.cs` keys configurations by service name and exposes a `Default` slot:
+
+```csharp
+public class RemoteServiceConfigurationDictionary : Dictionary<string, RemoteServiceConfiguration?>
+{
+    public const string DefaultName = "Default";
+
+    public RemoteServiceConfiguration? Default {
+        get => this.GetOrDefault(DefaultName);
+        set => this[DefaultName] = value;
+    }
+
+    [NotNull]
+    public RemoteServiceConfiguration GetConfigurationOrDefault(string name)
+    {
+        return this.GetOrDefault(name)
+            ?? Default
+            ?? throw new AbpException($"Remote service '{name}' was not found and there is no default configuration.");
+    }
+
+    public RemoteServiceConfiguration? GetConfigurationOrDefaultOrNull(string name)
+    {
+        return this.GetOrDefault(name) ?? Default;
+    }
+}
+```
+
+`DefaultName` equals `"Default"` — the same string used by `AbpHttpClientOptions.HttpClientProxies` entries when the developer calls `AddHttpClientProxies(assembly)` without specifying a service name. That single constant is what makes the entire client stack work without explicit naming in single-service applications.
+
+`GetConfigurationOrDefault` throws when both the named lookup and the default lookup fail, because a remote call cannot proceed without a base URL. `GetConfigurationOrDefaultOrNull` returns `null` instead, used by callers that can degrade gracefully (for example, the IdentityModel `RemoteServiceHttpClientAuthenticateContext.RemoteService` accessor).
+
+## IRemoteServiceConfigurationProvider
+
+The provider interface in `framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/IRemoteServiceConfigurationProvider.cs` is the boundary between options and runtime resolution:
+
+```csharp
+public interface IRemoteServiceConfigurationProvider
+{
+    [ItemNotNull]
+    Task<RemoteServiceConfiguration> GetConfigurationOrDefaultAsync(string name);
+    Task<RemoteServiceConfiguration?> GetConfigurationOrDefaultOrNullAsync(string name);
+}
+```
+
+The asynchronous shape exists because tenant-aware URL resolution may need to query a tenant store. The default implementation `RemoteServiceConfigurationProvider` (`framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/RemoteServiceConfigurationProvider.cs`) marks itself `IScopedDependency` so that `IMultiTenantUrlProvider` and `ICurrentTenant` resolve to the right scope-local instances. Its constructor pulls in `IOptionsMonitor<AbpRemoteServiceOptions>` (so config changes are picked up without app restart), `IMultiTenantUrlProvider`, and `ICurrentTenant`.
+
+The interesting method is `GetMultiTenantConfigurationAsync`:
+
+```csharp
+protected virtual async Task<RemoteServiceConfiguration?> GetMultiTenantConfigurationAsync(RemoteServiceConfiguration? configuration)
+{
+    if (configuration == null) return configuration;
+
+    var baseUrl = await MultiTenantUrlProvider.GetUrlAsync(configuration.BaseUrl);
+    if (baseUrl == configuration.BaseUrl) return configuration;
+
+    var multiTenantConfiguration = new RemoteServiceConfiguration(configuration)
+    {
+        BaseUrl = baseUrl
+    };
+
+    return multiTenantConfiguration;
+}
+```
+
+`MultiTenantUrlProvider.GetUrlAsync(configuration.BaseUrl)` looks at a URL pattern like `https://{0}.api.example.com/` and substitutes the current tenant's name or id, producing a tenant-specific URL. When the URL is rewritten, the provider **clones** the configuration using the copy constructor — this is critical because the original instance lives inside the singleton `IOptions` registry and mutating it would leak tenant data across requests.
+
+## RemoteServiceConfigurationProviderExtensions
+
+`framework/src/Volo.Abp.RemoteServices/Volo/Abp/Http/Client/RemoteServiceConfigurationProviderExtensions.cs` adds two parameter-less overloads:
+
+```csharp
+public static Task<RemoteServiceConfiguration>  GetConfigurationOrDefaultAsync(this IRemoteServiceConfigurationProvider provider)
+    => provider.GetConfigurationOrDefaultAsync(RemoteServiceConfigurationDictionary.DefaultName);
+
+public static Task<RemoteServiceConfiguration?> GetConfigurationOrDefaultOrNullAsync(this IRemoteServiceConfigurationProvider provider)
+    => provider.GetConfigurationOrDefaultOrNullAsync(RemoteServiceConfigurationDictionary.DefaultName);
+```
+
+These shortcuts read the `"Default"` configuration without forcing every caller to know about the constant. Most ABP startup code uses them.
+
+## Resolution sequence
+
+When `DynamicHttpProxyInterceptor<TService>` (see [HTTP Client](/http/http-client)) asks for a base URL, the call passes through the provider's pipeline:
+
+```mermaid
+sequenceDiagram
+    participant Interceptor
+    participant Provider as RemoteServiceConfigurationProvider
+    participant Options as IOptionsMonitor&lt;AbpRemoteServiceOptions&gt;
+    participant Dict as RemoteServiceConfigurationDictionary
+    participant MultiTenant as IMultiTenantUrlProvider
+
+    Interceptor->>Provider: GetConfigurationOrDefaultAsync("Identity")
+    Provider->>Options: CurrentValue
+    Options-->>Provider: AbpRemoteServiceOptions
+    Provider->>Dict: GetConfigurationOrDefault("Identity")
+    Dict-->>Provider: RemoteServiceConfiguration {BaseUrl="https://{0}.api...&#125;
+    Provider->>MultiTenant: GetUrlAsync(BaseUrl)
+    MultiTenant-->>Provider: "https://acme.api..."
+    Provider->>Provider: clone configuration with new BaseUrl
+    Provider-->>Interceptor: tenant-scoped RemoteServiceConfiguration
+```
+
+The clone-on-substitute pattern is the same one the IdentityModel `AbpIdentityClientOptions.GetClientConfiguration` uses; both packages keep the cached options instance immutable.
+
+## Configuring through appsettings.json
+
+A typical `appsettings.json` fragment looks like:
+
+```json
+{
+  "RemoteServices": {
+    "Default": {
+      "BaseUrl": "https://api.example.com/",
+      "Version": "v1"
+    },
+    "Identity": {
+      "BaseUrl": "https://{0}.identity.example.com/",
+      "IdentityClient": "Identity",
+      "UseCurrentAccessToken": "false"
+    },
+    "Notifications": {
+      "BaseUrl": "https://notifications.example.com/"
+    }
+  }
+}
+```
+
+The `IdentityClient` and `UseCurrentAccessToken` keys are picked up by the IdentityModel extensions (`framework/src/Volo.Abp.Http.Client.IdentityModel/Volo/Abp/Http/Client/RemoteServiceConfigurationExtensions.cs`); they are not part of `RemoteServiceConfiguration` itself. The placeholder `{0}` is handled by the multi-tenant URL provider — whatever module supplies `IMultiTenantUrlProvider` (typically `Volo.Abp.MultiTenancy`) decides what to substitute.
+
+## Working with the configuration in code
+
+The dictionary shape makes both code-first and config-first registrations friendly:
+
+```csharp
+// Add a remote service in code
+Configure<AbpRemoteServiceOptions>(options =>
+{
+    options.RemoteServices["Reports"] = new RemoteServiceConfiguration("https://reports.example.com/")
+    {
+        Version = "2024-01"
+    }
+    .SetIdentityClient("Reports")
+    .SetUseCurrentAccessToken(true);
+});
+```
+
+The fluent style is enabled by the extension methods returning the `RemoteServiceConfiguration` instance after setting the dictionary key. Because the type derives from `Dictionary<string, string?>`, the configuration round-trips losslessly through JSON binding.
+
+## What this package deliberately does not own
+
+`Volo.Abp.RemoteServices` has no opinion on the wire format, the authenticator, the proxy mechanism, or even the HTTP library. It does not know about `HttpClient`. Its only job is to be the canonical, scope-aware registry for `string name → RemoteServiceConfiguration`. That is what allows it to be reused by SignalR, gRPC, Dapr, and any future transport without changes — when `Volo.Abp.Http.Client.Dapr` ships its own `IProxyHttpClientFactory`, the factory still calls `IRemoteServiceConfigurationProvider.GetConfigurationOrDefaultAsync` to fetch the per-tenant base URL.
+
+## Interaction with multi-tenancy
+
+`AbpMultiTenancyAbstractionsModule` is the only declared dependency precisely because URL templating per tenant is the most common reason to depart from a single base URL. When ABP is configured **without** the full multi-tenancy module (only the abstractions), the abstractions ship a no-op `IMultiTenantUrlProvider` whose `GetUrlAsync` returns its input unchanged. That keeps single-tenant applications free of the cost of pattern substitution while preserving the same code path for everyone.
+
+When ABP is configured **with** `Volo.Abp.MultiTenancy`, the implementation walks `ICurrentTenant.Id` and `ICurrentTenant.Name` against an `AbpMultiTenancyOptions` substitution rule. The configuration provider's clone step then ensures the cached options remain pristine across tenant switches inside the same scope.
+
+<Tip>
+The cheapest way to debug a wrong base URL in a remote call is to inject `IRemoteServiceConfigurationProvider` in a controller and call `GetConfigurationOrDefaultAsync(name)` directly. The returned object is exactly what the dynamic proxy will use, including any tenant-specific substitution. If the value looks wrong here, the bug is in configuration; if it looks right, the bug is downstream in `Volo.Abp.Http.Client`.
+</Tip>
+
+## The dictionary-as-bag pattern in depth
+
+The decision to model `RemoteServiceConfiguration` as `Dictionary<string, string?>` rather than a class with strong properties is unusual enough to deserve commentary. It mirrors the same decision in `IdentityClientConfiguration` (`framework/src/Volo.Abp.IdentityModel/Volo/Abp/IdentityModel/IdentityClientConfiguration.cs`) and is repeated by `RemoteServiceConfigurationExtensions` (`framework/src/Volo.Abp.Http.Client.IdentityModel/Volo/Abp/Http/Client/RemoteServiceConfigurationExtensions.cs`).
+
+The benefits are concrete:
+
+- **Forward compatibility** — new keys can be added in downstream packages without modifying the type definition or breaking serialisation. The `IdentityClient` and `UseCurrentAccessToken` keys are precisely such additions.
+- **Configuration binding** — `IConfigurationBuilder` round-trips a `Dictionary<string, string?>` losslessly. There is no need to maintain `JsonSerializerOptions` per property, and `appsettings.json` entries map one-to-one onto dictionary keys.
+- **Loss-free copying** — the copy constructor `RemoteServiceConfiguration(RemoteServiceConfiguration)` simply iterates the source dictionary. Any extension keys added by downstream packages survive the clone without coordination.
+
+The cost is that strongly-typed access lives in extension methods rather than properties. The convention `GetXxx`/`SetXxx` (returning `this` for fluent chaining) is what `RemoteServiceConfigurationExtensions` uses; downstream packages follow the same shape to keep the API discoverable in IDE auto-completion.
+
+## Lifetime considerations
+
+`RemoteServiceConfigurationProvider` is registered as `IScopedDependency`. That choice matters because:
+
+- `IOptionsMonitor<AbpRemoteServiceOptions>` is a singleton itself; the provider closes over `Options.CurrentValue` at construction time but reads it each call so that hot-reloaded configurations take effect on the next request.
+- `IMultiTenantUrlProvider` is scoped, so the tenant substitution happens against the current request's tenant — important for multi-tenant single-host deployments.
+- `ICurrentTenant` is scoped, so it reflects whichever tenant the multi-tenancy middleware resolved for the current request.
+
+Resolving the provider as a singleton would break tenant isolation; resolving it as transient would create unnecessary allocations and lose the per-request `ICurrentTenant` value. The scoped registration is the right balance.
+
+## Interaction with named HttpClient
+
+`AbpRemoteServiceOptions.RemoteServices` keys correspond directly to `IHttpClientFactory` named clients via `ServiceCollectionHttpClientProxyExtensions.AddHttpClientFactory` (`framework/src/Volo.Abp.Http.Client/Microsoft/Extensions/DependencyInjection/ServiceCollectionHttpClientProxyExtensions.cs`). When `AddHttpClientProxies(assembly, "Identity")` runs at startup, it calls `services.AddHttpClient("Identity", ...)` — the name `"Identity"` is reused as the key in both registries. At call time, `DynamicHttpProxyInterceptor` resolves a `RemoteServiceConfiguration` for `"Identity"` and an `HttpClient` for `"Identity"`, and the two are always in sync.
+
+This invariant is what makes per-service configuration possible. If you want to attach a delegating handler (e.g. `BearerTokenHandler`) only to the `Identity` client, you configure it through `IServiceCollection.AddHttpClient("Identity", ...).AddHttpMessageHandler<BearerTokenHandler>()` — the name match guarantees the handler runs for every request that uses the `Identity` remote service.
+
+## Adding configuration at runtime
+
+`IOptionsMonitor<AbpRemoteServiceOptions>.CurrentValue` is what the provider reads, which means options-system changes are picked up automatically. The typical pattern for a control-plane change (an admin module updating a base URL) is:
+
+```csharp
+var monitor = serviceProvider.GetRequiredService<IOptionsMonitor<AbpRemoteServiceOptions>>();
+var snapshot = monitor.CurrentValue;
+snapshot.RemoteServices["MyService"] = new RemoteServiceConfiguration("https://new.url/");
+```
+
+Because the dictionary is mutable and the `IOptionsMonitor` re-reads on every access, the next call to `GetConfigurationOrDefaultAsync("MyService")` sees the new URL — without restart, without locking, and without a separate broadcast. The trade-off is that the change is process-local; multi-process deployments need to coordinate the update through a distributed event, typically the `CurrentApplicationConfigurationCacheResetEventData` event in `Volo.Abp.AspNetCore.Mvc.Contracts`.
+
+## Comparison with ASP.NET Core's named HttpClient
+
+ASP.NET Core's `IHttpClientFactory` also supports per-name configuration via `AddHttpClient("name", client => client.BaseAddress = ...)`. The difference is that ASP.NET Core's configuration is baked at startup, while ABP's configuration is read on every call. This is necessary because:
+
+- **Multi-tenancy** — the same name can resolve to different base URLs for different tenants.
+- **Hot config reload** — admins should be able to change a backend URL without a restart.
+- **Code-first overrides** — a module might compute the URL from a service registry rather than a static config.
+
+`DefaultProxyHttpClientFactory.Create(name)` (`framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/Proxying/DefaultProxyHttpClientFactory.cs`) still calls `IHttpClientFactory.CreateClient(name)`, so the per-name handler chain (timeouts, retries, delegating handlers) is unchanged. The `BaseAddress` is supplied at request time by the dynamic proxy from `IRemoteServiceConfigurationProvider`, not by the factory itself.
+
+## What this looks like in code-generated proxies
+
+Static (build-time) proxies emitted by ABP's source generator inherit from `ClientProxyBase<TService>` (`framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/ClientProxyBase.cs`) and read the configuration the same way:
+
+```csharp
+var clientConfig = ClientOptions.Value.HttpClientProxies.GetOrDefault(requestContext.ServiceType)
+    ?? throw new AbpException($"Could not get HttpClientProxyConfig for {requestContext.ServiceType.FullName}.");
+var remoteServiceConfig = await RemoteServiceConfigurationProvider.GetConfigurationOrDefaultAsync(clientConfig.RemoteServiceName);
+var client = HttpClientFactory.Create(clientConfig.RemoteServiceName);
+var url = remoteServiceConfig.BaseUrl.EnsureEndsWith('/') + await GetUrlWithParametersAsync(...);
+```
+
+Both dynamic and static proxies use the same provider, so a change to `AbpRemoteServiceOptions` affects both — there is no separate static-proxy configuration to maintain.

@@ -1,0 +1,301 @@
+---
+title: "MVC Conventions: Auto-Controllers From Application Services"
+sidebarTitle: "Conventions"
+description: "How the ABP Framework turns IApplicationService interfaces into ASP.NET Core controllers via AbpServiceConvention, ConventionalRouteBuilder, and settings."
+---
+
+`framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/` is the folder that makes ABP feel different from a stock ASP.NET Core project. It contains the machinery that walks an assembly, identifies application service interfaces, treats their implementations as controllers, derives URL templates from method names, and wires everything into the MVC application model without a developer ever writing a controller class. This page is the file-by-file reference for that machinery.
+
+## The mental model
+
+ASP.NET Core MVC asks `IApplicationFeatureProvider<ControllerFeature>` instances "is this type a controller?", builds an `ApplicationModel`, then runs every registered `IApplicationModelConvention` over it to shape routes, filters, parameter binding, and selectors. ABP plugs into both: a custom feature provider declares application services as controllers, and a custom convention rewrites their routes and metadata to match the framework's URL pattern. The two together are what produce, for example, `POST /api/identity/users` from `IIdentityUserAppService.CreateAsync(IdentityUserCreateDto input)`.
+
+## ConventionalControllerSetting
+
+`framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/ConventionalControllerSetting.cs` is the per-assembly registration:
+
+```csharp
+public class ConventionalControllerSetting
+{
+    public Assembly Assembly { get; }
+    internal HashSet<Type> ControllerTypes { get; }
+    public bool? UseV3UrlStyle { get; set; }
+    public string RootPath { get; set; }
+    public string RemoteServiceName { get; set; }
+    public Func<Type, bool>? TypePredicate { get; set; }
+    public ApplicationServiceTypes ApplicationServiceTypes { get; set; } = ApplicationServiceTypes.All;
+    public Action<ControllerModel>? ControllerModelConfigurer { get; set; }
+    public Func<UrlControllerNameNormalizerContext, string>? UrlControllerNameNormalizer { get; set; }
+    public Func<UrlActionNameNormalizerContext, string>? UrlActionNameNormalizer { get; set; }
+    public List<ApiVersion> ApiVersions { get; }
+    // ...
+}
+```
+
+Each setting owns the **`Assembly`** to scan, the **`RootPath`** to prefix URLs with (`"identity"`, `"tenant"`, etc.), and the **`RemoteServiceName`** that identifies which `RemoteServiceConfiguration` to use on the client side. `TypePredicate` lets a module narrow the scan to specific types; `ApplicationServiceTypes` filters by integration vs. application service. `UrlControllerNameNormalizer` and `UrlActionNameNormalizer` are the most powerful hooks — they accept the proposed name and let the developer rewrite it before it is baked into the route.
+
+`UseV3UrlStyle` controls the case style: when `true`, segments are camelCase (legacy v3 style); when `false`, they are kebab-case (current default). `ControllerModelConfigurer` is the bottom-of-the-funnel callback that runs after ABP has applied its own conventions — handy for adding global filters or `[Authorize]` policies to a whole bucket of services.
+
+## ConventionalControllerSettingList
+
+`ConventionalControllerSettingList.cs` is the `List<ConventionalControllerSetting>` aggregate exposed as `AbpConventionalControllerOptions.ConventionalControllerSettings`. Its `GetSettingOrNull(Type)` is the lookup used by `AbpConventionalControllerFeatureProvider` to decide whether a candidate type is enrolled.
+
+## AbpConventionalControllerOptions
+
+`AbpConventionalControllerOptions.cs` is the root options class:
+
+```csharp
+public class AbpConventionalControllerOptions
+{
+    public ConventionalControllerSettingList ConventionalControllerSettings { get; }
+    public List<Type> FormBodyBindingIgnoredTypes { get; }
+    public bool UseV3UrlStyle { get; set; }
+    public string[] IgnoredUrlSuffixesInControllerNames { get; set; } = new[] { "Integration" };
+
+    public AbpConventionalControllerOptions Create(
+        Assembly assembly, Action<ConventionalControllerSetting>? optionsAction = null)
+    {
+        var setting = new ConventionalControllerSetting(
+            assembly,
+            ModuleApiDescriptionModel.DefaultRootPath,
+            ModuleApiDescriptionModel.DefaultRemoteServiceName
+        );
+        optionsAction?.Invoke(setting);
+        setting.Initialize();
+        ConventionalControllerSettings.Add(setting);
+        return this;
+    }
+}
+```
+
+`Create(Assembly, Action<>)` is the public entry point every module uses:
+
+```csharp
+Configure<AbpAspNetCoreMvcOptions>(options =>
+{
+    options.ConventionalControllers
+        .Create(typeof(IdentityApplicationModule).Assembly, opts =>
+        {
+            opts.RootPath = "identity";
+        });
+});
+```
+
+The defaults pull from `ModuleApiDescriptionModel.DefaultRootPath` (`"app"`) and `ModuleApiDescriptionModel.DefaultRemoteServiceName` (`"Default"`) — both declared in `framework/src/Volo.Abp.Http/Volo/Abp/Http/Modeling/ModuleApiDescriptionModel.cs`. The `IgnoredUrlSuffixesInControllerNames` array of `["Integration"]` is why an `IntegrationService` named `OrderIntegrationService` becomes the URL segment `order` instead of `order-integration`. `FormBodyBindingIgnoredTypes` defaults to `IFormFile` and `IRemoteStreamContent` so multipart upload parameters keep their form binding.
+
+## AbpConventionalControllerFeatureProvider
+
+`AbpConventionalControllerFeatureProvider.cs` is how candidate types get into the MVC application model in the first place:
+
+```csharp
+public class AbpConventionalControllerFeatureProvider : ControllerFeatureProvider
+{
+    private readonly IAbpApplication _application;
+
+    protected override bool IsController(TypeInfo typeInfo)
+    {
+        if (_application.ServiceProvider == null) return false;
+        var configuration = _application.ServiceProvider
+            .GetRequiredService<IOptions<AbpAspNetCoreMvcOptions>>().Value
+            .ConventionalControllers
+            .ConventionalControllerSettings
+            .GetSettingOrNull(typeInfo.AsType());
+        return configuration != null;
+    }
+}
+```
+
+It checks the registered settings, and if the type is enrolled, declares it a controller. MVC then runs the standard controller pipeline over it — pulling action methods from the `IApplicationService` interface, building an `ApplicationModel`, and handing it to every registered convention.
+
+## AbpConventionalApiControllerSpecification
+
+`AbpConventionalApiControllerSpecification.cs` is the `Asp.Versioning.ApplicationModels.IApiControllerSpecification` used by the API versioning library to recognise ABP conventional controllers — without it, conventional controllers would not be treated as API controllers and `?api-version=` would not be honoured.
+
+## AbpServiceConvention
+
+`AbpServiceConvention.cs` is the centrepiece — the `IApplicationModelConvention` that mutates the in-progress `ApplicationModel`. It is registered as `ITransientDependency` and consumed through `IAbpServiceConvention` (a single-method interface in `IAbpServiceConvention.cs`). `AbpServiceConventionWrapper.cs` is the adapter that bridges it into MVC's `IApplicationModelConvention` shape.
+
+`Apply(ApplicationModel application)` does the following:
+
+1. **`RemoveDuplicateControllers`** — drops any type appearing in `AbpAspNetCoreMvcOptions.ControllersToRemove`. This is how modules unregister default controllers when they are replaced.
+2. **`RemoveIntegrationControllersIfNotExposed`** — skips integration services when `Options.ExposeIntegrationServices` is false (the default for public APIs). Same for `IsClientProxyService`: types that derive from `Volo.Abp.Http.Client.ClientProxying.ClientProxyBase` are hidden by default because they are client-side stubs, not server endpoints.
+3. **Per controller** — if the type implements `IRemoteService`, strip common postfixes (`AppService`, `IntegrationService`) from the controller name, invoke `configuration.ControllerModelConfigurer`, and call `ConfigureRemoteService`. Otherwise, look for an explicit `[RemoteService]` attribute and call `ConfigureRemoteService` if it is enabled.
+
+`ConfigureRemoteService` is where the heavy lifting happens: it adds `[ApiController]`-equivalent metadata, sets the area to the configured area, applies the HTTP method per action (using `HttpMethodHelper.GetConventionalVerbForMethodName`), strips method postfixes (`Async`), and finally calls `IConventionalRouteBuilder.Build` to produce the URL template.
+
+The convention also wires up parameter binding sources, defaulting to `[FromBody]` for complex types — unless the type appears in `AbpConventionalControllerOptions.FormBodyBindingIgnoredTypes` (so `IFormFile` stays a form parameter), or the type is a primitive (which becomes a `[FromRoute]` or `[FromQuery]` based on whether it appears in the URL template).
+
+## IConventionalRouteBuilder
+
+`IConventionalRouteBuilder.cs` declares the contract:
+
+```csharp
+public interface IConventionalRouteBuilder
+{
+    string Build(string rootPath, string controllerName, ActionModel action, string httpMethod, ConventionalControllerSetting? configuration);
+}
+```
+
+`ConventionalRouteBuilder.cs` is the default implementation. The URL template assembled in `Build` follows the pattern:
+
+```
+{ApiPrefix}/{RootPath}/{ControllerName}[/{id}][/{ActionName}][/{secondaryId}]
+```
+
+The implementation goes through these stages:
+
+1. **`GetApiRoutePrefix`** chooses `AbpAspNetCoreConsts.DefaultApiPrefix` (`"api"`) or `DefaultIntegrationServiceApiPrefix` (`"integration-api"`) depending on whether the controller carries `IntegrationServiceAttribute`.
+2. **`NormalizeUrlControllerName`** strips `IgnoredUrlSuffixesInControllerNames` (`"Integration"`) and runs the optional `UrlControllerNameNormalizer` callback.
+3. **`NormalizeControllerNameCase`** switches between camelCase (`UseV3UrlStyle`) and kebab-case.
+4. **Id binding** — looks for an `id` parameter. If it is primitive (or has a `TypeConverter` from `string`), append `/{id}`. Otherwise, walk the public properties of the complex id type and append `/{propertyName}` for each — supporting composite keys.
+5. **`NormalizeUrlActionName`** removes the HTTP verb prefix using `HttpMethodHelper.RemoveHttpMethodPrefix` (`GetListAsync` → `List`) and the `Async` suffix, then runs the optional `UrlActionNameNormalizer` callback.
+6. **Action name segment** — when the normalized action name is non-empty, append `/{actionName}`. So `GetListAsync` produces `/identity/users` (action name empty after stripping `Get`+`List`+`Async`... actually `List` remains), while `LockAsync` produces `/identity/users/{id}/lock`.
+7. **Secondary id** — if the action has exactly one parameter ending in `Id` (and not marked `[Optional]`), append `/{secondaryId}` as the last segment.
+
+The result is a route like `api/identity/users/{id}/two-factor-enabled` for `IIdentityUserAppService.SetTwoFactorEnabledAsync(Guid id, bool isEnabled)`.
+
+## UrlControllerNameNormalizerContext and UrlActionNameNormalizerContext
+
+These two record-like types in `UrlControllerNameNormalizerContext.cs` and `UrlActionNameNormalizerContext.cs` carry everything the normalizer hook needs:
+
+```csharp
+public class UrlActionNameNormalizerContext
+{
+    public string RootPath { get; }
+    public string ControllerName { get; }
+    public ActionModel Action { get; }
+    public string ActionNameInUrl { get; }
+    public string HttpMethod { get; }
+}
+```
+
+A typical normaliser uses these to rewrite a name based on naming conventions specific to the module — for example, switching from kebab-case to camelCase only for a particular controller.
+
+## ServiceConventionExtensions
+
+There is no separately-named `ServiceConventionExtensions` file in this folder, but the same effect is achieved by the `AbpConventionalControllerOptions.Create` extension on the options class itself. Module authors call `options.ConventionalControllers.Create(assembly, ...)` from inside their `Configure<AbpAspNetCoreMvcOptions>` block, and the call chains into the registration pipeline described above.
+
+## The auto-controller pipeline
+
+```mermaid
+flowchart TB
+    A[Module configures AbpAspNetCoreMvcOptions.ConventionalControllers.Create&#40;assembly&#41;] --> B[ConventionalControllerSetting added to ConventionalControllerSettingList]
+    B --> C[Setting.Initialize&#40;&#41; scans assembly for IApplicationService types]
+    C --> D[Setting.ControllerTypes populated]
+    D --> E[ASP.NET Core boot: AbpConventionalControllerFeatureProvider.IsController]
+    E --> F[Type added to MVC ControllerFeature]
+    F --> G[MVC builds ApplicationModel]
+    G --> H[AbpServiceConvention.Apply iterates Controllers]
+    H --> I[ConfigureRemoteService: strip postfixes, set area, choose HTTP verb]
+    I --> J[ConventionalRouteBuilder.Build: assemble URL template]
+    J --> K[AttributeRouteModel updated on the ControllerModel]
+    K --> L[MVC route table populated]
+    L --> M[Incoming request: /api/identity/users/{id} matches IIdentityUserAppService.GetAsync]
+    M --> N[Controller activator resolves the implementation]
+    N --> O[Action invoked; AbpUowActionFilter wraps in UoW; AbpValidationActionFilter validates input]
+    O --> P[Result serialised by JSON formatter; AbpNoContentActionFilter rewrites empty results to 204]
+```
+
+Every box maps to a file in this folder or an adjacent one. The end-to-end story is **interface → setting → feature provider → application model → convention → route → execution**.
+
+## Interacting with the system
+
+A typical module that wants to expose its application services as auto-controllers looks like:
+
+```csharp
+public override void ConfigureServices(ServiceConfigurationContext context)
+{
+    Configure<AbpAspNetCoreMvcOptions>(options =>
+    {
+        options.ConventionalControllers.Create(typeof(MyModuleApplicationModule).Assembly, opts =>
+        {
+            opts.RootPath        = "my-module";
+            opts.RemoteServiceName = "MyModule";
+            opts.UrlControllerNameNormalizer = ctx => ctx.ControllerName.ToLowerInvariant();
+            opts.ControllerModelConfigurer = controller =>
+            {
+                controller.Filters.Add(new ProducesAttribute("application/json"));
+            };
+        });
+    });
+}
+```
+
+That single call is enough to expose every `IApplicationService` in the assembly under `/api/my-module/...` URLs. The companion `IRemoteService` interface marker comes from `Volo.Abp.Ddd.Application.Contracts`, so it travels with the interface and is therefore available to any client that consumes the contracts module.
+
+## The relationship with the client side
+
+The client-side `Volo.Abp.Http.Client` package never needs to know about any of this. The client only ever calls `/api/abp/api-definition`, deserialises the returned `ApplicationApiDescriptionModel`, and reads `ActionApiDescriptionModel.Url` directly. Because that URL was produced by `ConventionalRouteBuilder.Build` on the server, any change the server makes to URL conventions is immediately visible to the client without code regeneration. The `RootPath` and `RemoteServiceName` survive the round-trip in the `ModuleApiDescriptionModel` so the client can group endpoints the same way the server does.
+
+<Tip>
+When a route is missing from an ABP application, the quickest debugging step is to set a breakpoint at the end of `AbpServiceConvention.Apply` and inspect `application.Controllers` to confirm your type made it in. If it is missing, the feature provider rejected it — check the `ConventionalControllerSettings` for an entry covering your type. If it is present but the route is wrong, step into `ConventionalRouteBuilder.Build` with the controller and action models to watch each normalisation step.
+</Tip>
+
+## ApplicationServiceTypes filter
+
+`ConventionalControllerSetting.ApplicationServiceTypes` defaults to `ApplicationServiceTypes.All` but supports finer-grained selection: `ApplicationService` only, `IntegrationService` only, or a custom combination. This is what allows a host to expose a module's regular application services on its public API surface while keeping integration services on the private surface (or vice versa). `AbpServiceConvention` honours the flag in `RemoveIntegrationControllersIfNotExposed`, and `AbpAspNetCoreMvcOptions` carries the parallel host-level toggles `ExposeIntegrationServices` and `ExposeClientProxyServices`.
+
+## API versioning integration
+
+`ConventionalControllerSetting.ApiVersions` carries `List<ApiVersion>` from `Asp.Versioning`. The presence of versions changes the URL template construction: the convention adds a `{version:apiVersion}` parameter or a `?api-version=` query token depending on the versioning configuration. `AbpConventionalApiControllerSpecification` (`framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Conventions/AbpConventionalApiControllerSpecification.cs`) integrates with `Asp.Versioning`'s controller specification so versioned controllers are recognised as API controllers.
+
+The corresponding action descriptor provider `AbpMvcActionDescriptorProvider` (`framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/AbpMvcActionDescriptorProvider.cs`) augments the descriptor metadata with the version information so the client's `CurrentApiVersionInfo` (`framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/CurrentApiVersionInfo.cs`) can request a specific version on outgoing calls. The pair is symmetric: server-side versioning produces a model the client reads to forge correctly-versioned requests.
+
+## Controller name post-fix stripping
+
+`AbpServiceConvention.ConfigureRemoteService` strips the postfixes `ApplicationService.CommonPostfixes` from controller names. The list is defined in `Volo.Abp.Ddd.Application` and includes `AppService`, `ApplicationService`, `IntegrationService`. The result is that `IdentityUserAppService` produces the URL segment `users`, and `OrderIntegrationService` produces `order`. The behaviour is deliberately opinionated; developers who want full control of the URL pass a `UrlControllerNameNormalizer` callback to keep their own naming.
+
+`AbpConventionalControllerOptions.IgnoredUrlSuffixesInControllerNames` adds a second-pass strip — `"Integration"` by default — so types named `OrderIntegration` (without the `Service` suffix) still produce `order`. Modules can extend the list:
+
+```csharp
+options.ConventionalControllers.IgnoredUrlSuffixesInControllerNames =
+    new[] { "Integration", "Internal", "Admin" };
+```
+
+## ControllerModelConfigurer in practice
+
+The `ControllerModelConfigurer` callback runs at the end of `ConfigureRemoteService`. Common uses include:
+
+```csharp
+opts.ControllerModelConfigurer = controller =>
+{
+    controller.Filters.Add(new AuthorizeFilter(IdentityPermissions.GroupName));
+    controller.RouteValues["area"] = "identity";
+    foreach (var action in controller.Actions)
+    {
+        action.Filters.Add(new ProducesAttribute("application/json"));
+    }
+};
+```
+
+The callback is the standard way to apply module-wide cross-cutting concerns without writing per-action attributes. Because it runs after ABP's own conventions, it sees the controller with the normalised name and the generated routes already attached.
+
+## URL pattern for compound ids
+
+The conventional route builder's id-handling code is the most subtle part of the convention. When the `id` parameter is a primitive (`Guid`, `int`, `string`), the URL gets `/{id}`. When it is a complex type, the builder walks `GetProperties(BindingFlags.Instance | BindingFlags.Public)` and appends one segment per property. So a method `GetAsync(EditionLookupKey id)` where `EditionLookupKey` has `OrganizationId` and `EditionName` properties produces `/{OrganizationId}/{EditionName}`.
+
+The matching client-side de-construction is handled in `ClientProxyUrlBuilder` (`framework/src/Volo.Abp.Http.Client/Volo/Abp/Http/Client/ClientProxying/ClientProxyUrlBuilder.cs`), which deserialises the compound key from the same `id` value when sending. Because the server's URL pattern is part of `ActionApiDescriptionModel.Url`, the client reads the segment names from the model and binds the right properties without needing to know about the C# type.
+
+## The "secondary id" segment
+
+When an action has a parameter ending in `Id` other than the `id` parameter itself — for example `LockUserAsync(Guid id, Guid roleId)` — and that parameter is not optional, the builder appends `/{roleId}` after the action name segment. So the URL becomes `/api/identity/users/{id}/lock/{roleId}`. This matches REST conventions for relationship endpoints without per-method attribute configuration.
+
+The `[OptionalAttribute]` check is reflective: `secondaryIds[0].Attributes.Any(x => x is OptionalAttribute)` — meaning a parameter declared with `[Optional]` will be relegated to a query parameter instead of a path segment. This is what lets `[Optional] Guid? roleId` produce `/lock?roleId=...` while non-optional `Guid roleId` produces `/lock/{roleId}`.
+
+## kebab-case vs camelCase
+
+`ConventionalRouteBuilder.NormalizeControllerNameCase` switches based on the `UseV3UrlStyle` flag. The default `false` produces kebab-case URLs (`/api/identity/two-factor-tokens`); legacy `true` produces camelCase (`/api/identity/twoFactorTokens`). The flag exists at both the setting level (`ConventionalControllerSetting.UseV3UrlStyle`) and the options level (`AbpConventionalControllerOptions.UseV3UrlStyle`), with the setting taking precedence — so a single module can opt into the legacy style during a migration without affecting the rest of the app.
+
+## Implications for static proxy generation
+
+ABP's static proxy generator reads the server's `ApplicationApiDescriptionModel` and emits one C# class per controller, with one method per action. The URL template comes straight from `ActionApiDescriptionModel.Url`, which `ConventionalRouteBuilder.Build` produced. So even though the generator does not understand the convention, the emitted code is correct because the model captures the final route. This is what allows the generator to live in a separate tool (`abp generate-proxy`) while still keeping pace with whatever changes a module makes to its conventions.
+
+## Reflection cost and caching
+
+Conventions run **once** at startup. The cost of walking every type and applying every rule is paid during boot, not per request. `AbpServiceConvention` is registered as `ITransientDependency` but is effectively called once by MVC's `ApplicationModelProviderContext` pipeline. The cached output lives inside the MVC `ApplicationModel` which is converted into the `ActionDescriptor[]` collection that the routing engine uses at request time — so per-request lookups remain O(1) hash-table accesses against the route table.
+
+When debugging boot-time slowness, the conventions are usually not the culprit; the heavy work is in `AbpConventionalControllerFeatureProvider.IsController` because it runs for every type in every loaded assembly. If a module ships many types and few of them are application services, narrowing the assembly registration with `TypePredicate` reduces the work significantly.
+
+## Test isolation
+
+When unit-testing a module's convention, the recommended pattern is to construct an `ApplicationModel` from a known controller type, call `AbpServiceConvention.Apply`, and assert on `application.Controllers.Single().Actions.Single().Selectors.Single().AttributeRouteModel.Template`. The convention is deterministic given the same inputs, so tests can pin down expected URLs without spinning up a host. The same approach works for the `AbpConventionalControllerFeatureProvider`: pass a `TypeInfo` and assert the boolean result.

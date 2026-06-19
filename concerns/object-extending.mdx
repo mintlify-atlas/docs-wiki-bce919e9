@@ -1,0 +1,351 @@
+---
+title: "ABP Object Extension Manager: Properties at Runtime"
+sidebarTitle: "Object Extending"
+description: "Declare, validate, and map dynamic extra properties on ABP aggregates with ObjectExtensionManager, ObjectExtensionPropertyInfo, and IHasExtraProperties."
+---
+
+## Overview
+
+The ABP Framework lets module consumers attach additional properties to
+aggregates they do not own — without subclassing, code-generating, or
+modifying the source. The mechanism lives in
+`framework/src/Volo.Abp.ObjectExtending/` and is wired by
+`Volo/Abp/ObjectExtending/AbpObjectExtendingModule.cs`. The module exposes a
+static singleton `ObjectExtensionManager.Instance` that holds the metadata,
+a `IHasExtraProperties` contract carried by every extensible entity / DTO,
+and an `ExtraPropertyDictionary` bag stored on each object.
+
+The design separates *definition* (the manager keeps an immutable description
+of every extra property) from *storage* (each object instance carries its own
+`ExtraProperties` dictionary). Together with the
+`ExtensibleObjectMapper` helper, this lets every layer — entity, DTO, EF Core
+shadow column, REST payload — share the same property without each layer
+declaring it explicitly.
+
+## The `IHasExtraProperties` contract
+
+The simplest building block is the marker interface in
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/Data/IHasExtraProperties.cs`:
+
+```csharp framework/src/Volo.Abp.ObjectExtending/Volo/Abp/Data/IHasExtraProperties.cs
+public interface IHasExtraProperties
+{
+    ExtraPropertyDictionary ExtraProperties { get; }
+}
+```
+
+`ExtraPropertyDictionary`, defined in
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/Data/ExtraPropertyDictionary.cs`,
+is just a `Dictionary<string, object?>` subclass. Aggregates, DTOs, and
+identity-style entities throughout ABP implement `IHasExtraProperties` so that
+the same bag survives database round-trips and HTTP serialisation.
+
+## `ExtensibleObject` base class
+
+The `ExtensibleObject` class in
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ExtensibleObject.cs`
+is a convenient base for DTOs and value objects that are not already entities:
+
+```csharp framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ExtensibleObject.cs
+[Serializable]
+public class ExtensibleObject : IHasExtraProperties, IValidatableObject
+{
+    public ExtraPropertyDictionary ExtraProperties { get; protected set; }
+
+    public ExtensibleObject() : this(true) { }
+
+    public ExtensibleObject(bool setDefaultsForExtraProperties)
+    {
+        ExtraProperties = new ExtraPropertyDictionary();
+        if (setDefaultsForExtraProperties)
+        {
+            this.SetDefaultsForExtraProperties(ProxyHelper.UnProxy(this).GetType());
+        }
+    }
+
+    public virtual IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
+    {
+        return ExtensibleObjectValidator.GetValidationErrors(this, validationContext);
+    }
+}
+```
+
+Two responsibilities are bundled here:
+
+1. The constructor seeds `ExtraProperties` with each property's configured
+   default value. The unwrapping via `ProxyHelper.UnProxy(this).GetType()`
+   ensures that DI proxies do not confuse the lookup against
+   `ObjectExtensionManager`.
+2. `Validate` delegates to `ExtensibleObjectValidator.GetValidationErrors`,
+   defined in `Volo/Abp/ObjectExtending/ExtensibleObjectValidator.cs`, so that
+   extra properties participate in standard `IValidatableObject` validation.
+
+## `ObjectExtensionManager`
+
+The class
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ObjectExtensionManager.cs`
+is the central registry. Its public surface is intentionally small:
+
+```csharp framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ObjectExtensionManager.cs
+public class ObjectExtensionManager
+{
+    public static ObjectExtensionManager Instance { get; protected set; }
+        = new ObjectExtensionManager();
+
+    public ConcurrentDictionary<object, object> Configuration { get; }
+
+    public virtual ObjectExtensionManager AddOrUpdate<TObject>(
+        Action<ObjectExtensionInfo>? configureAction = null);
+
+    public virtual ObjectExtensionManager AddOrUpdate(
+        Type[] types,
+        Action<ObjectExtensionInfo>? configureAction = null);
+
+    public virtual ObjectExtensionManager AddOrUpdate(
+        Type type,
+        Action<ObjectExtensionInfo>? configureAction = null);
+
+    public virtual ObjectExtensionInfo? GetOrNull<TObject>();
+    public virtual ObjectExtensionInfo? GetOrNull(Type type);
+
+    public virtual ImmutableList<ObjectExtensionInfo> GetExtendedObjects();
+}
+```
+
+Internally it stores `ConcurrentDictionary<Type, ObjectExtensionInfo>`, so
+`AddOrUpdate` is idempotent: calling it twice for the same type simply
+re-applies the configuration delegate against the same `ObjectExtensionInfo`
+instance. Module authors call `ObjectExtensionManager.Instance.AddOrUpdate(...)`
+from their module's `PreConfigureServices`, which is exactly the contract used
+by other ABP modules (Identity, Tenant Management, BLOB Storing) to extend
+their own aggregates.
+
+## `ObjectExtensionInfo`
+
+Each registered type maps to one
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ObjectExtensionInfo.cs`
+instance. The class holds the per-type property dictionary, free-form
+`Configuration`, and a list of object-level validators:
+
+```csharp framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ObjectExtensionInfo.cs
+public class ObjectExtensionInfo
+{
+    public Type Type { get; }
+    public ConcurrentDictionary<object, object> Configuration { get; }
+    public List<Action<ObjectExtensionValidationContext>> Validators { get; }
+
+    public virtual bool HasProperty(string propertyName);
+
+    public virtual ObjectExtensionInfo AddOrUpdateProperty<TProperty>(
+        string propertyName,
+        Action<ObjectExtensionPropertyInfo>? configureAction = null);
+
+    public virtual ImmutableList<ObjectExtensionPropertyInfo> GetProperties();
+
+    public virtual ObjectExtensionPropertyInfo? GetPropertyOrNull(string propertyName);
+}
+```
+
+`GetProperties()` returns the properties sorted by their `UI.Order`, so UI
+generators automatically respect the configured ordering. `HasProperty` and
+`GetPropertyOrNull` are the lookup primitives the rest of the framework uses
+when mapping or validating individual property values.
+
+## `ObjectExtensionPropertyInfo`
+
+Each property carries the metadata defined in
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ObjectExtensionPropertyInfo.cs`:
+
+```csharp framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ObjectExtensionPropertyInfo.cs
+public class ObjectExtensionPropertyInfo
+    : IHasNameWithLocalizableDisplayName, IBasicObjectExtensionPropertyInfo
+{
+    public ObjectExtensionInfo ObjectExtension { get; }
+    public string Name { get; }
+    public Type Type { get; }
+    public List<Attribute> Attributes { get; }
+    public List<Action<ObjectExtensionPropertyValidationContext>> Validators { get; }
+    public ILocalizableString? DisplayName { get; set; }
+    public bool? CheckPairDefinitionOnMapping { get; set; }
+    public object? DefaultValue { get; set; }
+    public Func<object>? DefaultValueFactory { get; set; }
+    public ExtensionPropertyLookupConfiguration Lookup { get; set; }
+    public ExtensionPropertyUI UI { get; set; }
+    public ExtensionPropertyPolicyConfiguration Policy { get; set; }
+}
+```
+
+The constructor pulls a set of default validation attributes from
+`ExtensionPropertyHelper.GetDefaultAttributes(Type)` and seeds `DefaultValue`
+from `TypeHelper.GetDefaultValue(Type)`. The nested `ExtensionPropertyUI`,
+`ExtensionPropertyUICreateModal`, and `ExtensionPropertyUIEditModal` classes
+control how the property appears in auto-generated create / edit modals;
+`IsVisible` defaults to `true` and `IsReadOnly` defaults to `false`.
+
+The `CheckPairDefinitionOnMapping` flag interacts with
+`ExtensibleObjectMapper` (below): when `null`, the mapper requires that *both*
+sides declare the property; setting it to `false` allows propagation even when
+only one side declares it.
+
+## Defining properties
+
+Module authors typically use the `ObjectExtensionManagerExtensions` helpers in
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ObjectExtensionManagerExtensions.cs`,
+which provide ergonomic overloads:
+
+```csharp framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ObjectExtensionManagerExtensions.cs
+public static ObjectExtensionManager AddOrUpdateProperty<TObject, TProperty>(
+    this ObjectExtensionManager objectExtensionManager,
+    string propertyName,
+    Action<ObjectExtensionPropertyInfo>? configureAction = null)
+    where TObject : IHasExtraProperties;
+
+public static ObjectExtensionManager AddOrUpdateProperty<TProperty>(
+    this ObjectExtensionManager objectExtensionManager,
+    Type[] objectTypes,
+    string propertyName,
+    Action<ObjectExtensionPropertyInfo>? configureAction = null);
+
+public static ObjectExtensionPropertyInfo? GetPropertyOrNull<TObject>(
+    this ObjectExtensionManager objectExtensionManager,
+    string propertyName);
+
+public static ImmutableList<ObjectExtensionPropertyInfo> GetProperties<TObject>(
+    this ObjectExtensionManager objectExtensionManager);
+
+public static Task<ImmutableList<ObjectExtensionPropertyInfo>>
+    GetPropertiesAndCheckPolicyAsync<TObject>(
+        this ObjectExtensionManager objectExtensionManager,
+        IServiceProvider serviceProvider);
+```
+
+The generic constraint `where TObject : IHasExtraProperties` in
+`AddOrUpdateProperty<TObject, TProperty>` ensures only sensible types are
+extended. The array overload propagates a single configure delegate across
+many types, which is how multi-layer wiring (entity + create DTO + update DTO
++ get DTO) is usually expressed in one call.
+
+`GetPropertiesAndCheckPolicyAsync` resolves `ExtensionPropertyPolicyChecker`
+from the supplied `IServiceProvider` and filters out properties whose
+`Policy` (permission / feature / global feature gates declared in
+`Volo/Abp/ObjectExtending/ExtensionPropertyPolicyConfiguration.cs`) is not
+satisfied for the current user — that's the API UI generators call when
+building runtime form definitions.
+
+## Copying extra properties between objects
+
+`ExtensibleObjectMapper` in
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ExtensibleObjectMapper.cs`
+is the bridge between extra-property *definitions* and object-to-object
+mapping. The core method is:
+
+```csharp framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/ExtensibleObjectMapper.cs
+public static void MapExtraPropertiesTo<TSource, TDestination>(
+    TSource source,
+    TDestination destination,
+    MappingPropertyDefinitionChecks? definitionChecks = null,
+    string[]? ignoredProperties = null)
+    where TSource : IHasExtraProperties
+    where TDestination : IHasExtraProperties;
+```
+
+The body iterates `source.ExtraProperties` and calls
+`destination.SetProperty(keyValue.Key, keyValue.Value)` only when
+`CanMapProperty` returns `true`. `CanMapProperty` consults the
+`ObjectExtensionManager.Instance.GetOrNull(...)` metadata for both sides plus
+the `MappingPropertyDefinitionChecks` enum from
+`framework/src/Volo.Abp.ObjectExtending/Volo/Abp/ObjectExtending/MappingPropertyDefinitionChecks.cs`:
+
+| Flag value      | Meaning                                                                 |
+| --------------- | ----------------------------------------------------------------------- |
+| `Null` / `None` | No check; copy all source extra properties                              |
+| `Source`        | Copy only properties defined on the source `ObjectExtensionInfo`        |
+| `Destination`   | Copy only properties defined on the destination `ObjectExtensionInfo`   |
+| `Both` (S \| D) | Property must be declared on both `ObjectExtensionInfo` instances       |
+
+When `definitionChecks` is `null`, the helper falls back to the more nuanced
+rule based on each property's `CheckPairDefinitionOnMapping` flag from
+`ObjectExtensionPropertyInfo`.
+
+The Mapperly and AutoMapper integrations invoke this helper indirectly. The
+Mapperly provider, in
+`framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapperlyAutoObjectMappingProvider.cs`,
+reads the `[MapExtraProperties]` attribute and calls
+`ExtensibleObjectMapper.MapExtraPropertiesTo(typeof(TSource), typeof(TDestination), ...)`.
+
+## Validation
+
+Each `ObjectExtensionInfo` carries `Validators` (object-level) and each
+`ObjectExtensionPropertyInfo` carries its own `Validators` (property-level).
+`ExtensibleObjectValidator.GetValidationErrors`, invoked from
+`ExtensibleObject.Validate` in `ExtensibleObject.cs`, walks all configured
+properties and produces standard `ValidationResult` instances. The
+`Attributes` list on each property (seeded from
+`ExtensionPropertyHelper.GetDefaultAttributes`) is also honoured, so
+`[Required]`, `[StringLength]`, and the rest of `DataAnnotations` work without
+declaring them on a CLR property.
+
+The validation context types
+`ObjectExtensionValidationContext` and `ObjectExtensionPropertyValidationContext`
+(in the same folder) give validators access to the `IServiceProvider`,
+the object being validated, and the property metadata.
+
+## Modular extension configuration
+
+For module authors who need to expose entity extensions to consumers, the
+`Modularity` sub-namespace provides higher-level helpers:
+
+- `Volo/Abp/ObjectExtending/Modularity/ModuleExtensionConfigurationHelper.cs`
+- `Volo/Abp/ObjectExtending/Modularity/EntityExtensionConfiguration.cs`
+- `Volo/Abp/ObjectExtending/Modularity/ExtensionPropertyConfiguration.cs`
+
+The convention is for each module (Identity, Tenant Management, ...) to expose
+a static helper like `IdentityUser.AddOrUpdateProperty<TProperty>(...)` that
+forwards to `ModuleExtensionConfigurationHelper`, which in turn updates the
+`ObjectExtensionManager.Instance` for the full chain of related types
+(entity, create input, update input, get output) in one call.
+
+## Putting it together
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    ObjectExtensionManager.Instance
+        .AddOrUpdate<MyBook>(book =>
+        {
+            book.AddOrUpdateProperty<string>("Author", property =>
+            {
+                property.DefaultValue = "Unknown";
+                property.Attributes.Add(new RequiredAttribute());
+                property.UI.Order = 1;
+            });
+        });
+}
+```
+
+That single block defines an `Author` property on `MyBook` so that:
+
+* `book.GetProperty("Author")` and `book.SetProperty("Author", ...)` work
+  through the extensions in
+  `framework/src/Volo.Abp.ObjectExtending/Volo/Abp/Data/HasExtraPropertiesExtensions.cs`.
+* New instances created through `ExtensibleObject` constructor receive
+  `"Unknown"` as the default.
+* The property is mapped between layers when the destination mapper carries
+  `[MapExtraProperties]` (see
+  `framework/src/Volo.Abp.Mapperly/Volo/Abp/Mapperly/MapExtraPropertiesAttribute.cs`).
+* `[Required]` validation runs whenever the object is validated by
+  `ExtensibleObjectValidator` (see
+  `Volo/Abp/ObjectExtending/ExtensibleObjectValidator.cs`).
+
+## Related concerns
+
+<CardGroup cols={2}>
+  <Card title="Mapperly" href="/concerns/mapperly">
+    `MapperlyAutoObjectMappingProvider` calls into `ExtensibleObjectMapper`
+    when a mapper class is annotated with `[MapExtraProperties]`.
+  </Card>
+  <Card title="EF Core extensions" icon="database">
+    The EF Core integration translates extra properties into JSON columns or
+    shadow columns using the same `ObjectExtensionManager` metadata.
+  </Card>
+</CardGroup>

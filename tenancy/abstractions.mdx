@@ -1,0 +1,393 @@
+---
+title: "Multi-Tenancy Abstractions: Contracts, Options, and DTOs"
+sidebarTitle: "Abstractions"
+description: "Walk through Volo.Abp.MultiTenancy.Abstractions in ABP Framework: ICurrentTenant, ITenantStore, TenantConfiguration, IMultiTenant, options, and ETOs."
+---
+
+The contracts that every other multi-tenancy assembly depends on live in the
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/` project. Loading this single
+project from a class library (or a CLI tool) is enough to author a tenant-aware
+domain model, because the package defines the marker interface
+`IMultiTenant`, the ambient `ICurrentTenant` service, the `ITenantStore` lookup
+contract, and the value objects (`TenantConfiguration`, `BasicTenantInfo`,
+`TenantResolveResult`) that the runtime exchanges. The ABP Framework module that
+wires the assembly into the host is
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/AbpMultiTenancyAbstractionsModule.cs`,
+which depends on `AbpVirtualFileSystemModule` and `AbpLocalizationModule` to
+publish the embedded `AbpMultiTenancyResource` localization JSON.
+
+## `ICurrentTenant` — the ambient identity
+
+The core contract is `ICurrentTenant` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ICurrentTenant.cs`:
+
+```csharp
+public interface ICurrentTenant
+{
+    bool IsAvailable { get; }
+    Guid? Id { get; }
+    string? Name { get; }
+    IDisposable Change(Guid? id, string? name = null);
+}
+```
+
+`IsAvailable` is `true` only when `Id` has a value, which distinguishes a *tenant*
+call from a *host* call. `Change(...)` returns an `IDisposable` so that callers
+can scope a different tenant for a block of work (background jobs, data
+migrations, cross-tenant maintenance). The extension methods in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/CurrentTenantExtensions.cs`
+add `GetId()` (throws an `AbpException` when `Id` is null) and
+`GetMultiTenancySide()` which classifies the caller into the `MultiTenancySides`
+enum. The accessor `ICurrentTenantAccessor` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ICurrentTenantAccessor.cs`
+is the *storage* contract — its `Current` property holds a `BasicTenantInfo?`,
+and a `null` `Current` means "nothing was set", while a non-null `Current` with
+`TenantId == null` means "the host was explicitly selected".
+
+The DTO record `BasicTenantInfo` lives in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/BasicTenantInfo.cs`:
+
+```csharp
+public class BasicTenantInfo
+{
+    public Guid? TenantId { get; }
+    public string? Name { get; }
+
+    public BasicTenantInfo(Guid? tenantId, string? name = null)
+    { TenantId = tenantId; Name = name; }
+}
+```
+
+It carries only the identity plus the friendly name, which keeps the ambient
+state small enough to flow through `AsyncLocal` storage without surprises.
+
+## `ITenantStore` and `TenantConfiguration`
+
+`ITenantStore` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ITenantStore.cs`
+is the lookup contract used by the resolver pipeline:
+
+```csharp
+public interface ITenantStore
+{
+    Task<TenantConfiguration?> FindAsync(string normalizedName);
+    Task<TenantConfiguration?> FindAsync(Guid id);
+    Task<IReadOnlyList<TenantConfiguration>> GetListAsync(bool includeDetails = false);
+
+    [Obsolete("Use FindAsync method.")] TenantConfiguration? Find(string normalizedName);
+    [Obsolete("Use FindAsync method.")] TenantConfiguration? Find(Guid id);
+}
+```
+
+The two synchronous methods are kept only for compatibility — every new
+integration must implement the async overloads. `GetListAsync(includeDetails)`
+exists so admin UIs can include connection strings only when needed.
+
+`TenantConfiguration` itself lives at
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantConfiguration.cs`:
+
+```csharp
+[Serializable]
+public class TenantConfiguration
+{
+    public Guid Id { get; set; }
+    public string Name { get; set; } = default!;
+    public string NormalizedName { get; set; } = default!;
+    public ConnectionStrings? ConnectionStrings { get; set; }
+    public bool IsActive { get; set; }
+    public Guid? EditionId { get; set; }
+    // ...
+}
+```
+
+It is the *runtime-friendly* representation of a tenant, distinct from the
+persisted aggregate root in the tenant-management module. The `ConnectionStrings`
+type is `Volo.Abp.Data.ConnectionStrings`, which is a name → connection-string
+dictionary. `IsActive` is set to `true` in the parameterless constructor and is
+the flag that `TenantConfigurationProvider` reads to throw the
+`Volo.AbpIo.MultiTenancy:010002` business exception when a tenant has been
+disabled. `EditionId` ties the tenant to a feature edition consumed by the
+`Volo.Abp.FeatureManagement` stack.
+
+`TenantConfigurationCacheItem` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantConfigurationCacheItem.cs`
+is the boxed cache entry used by distributed caches that wrap `ITenantStore`
+implementations.
+
+## `IMultiTenant` and `IgnoreMultiTenancyAttribute`
+
+Domain entities opt into per-tenant isolation by implementing `IMultiTenant`
+from `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/IMultiTenant.cs`:
+
+```csharp
+public interface IMultiTenant
+{
+    /// <summary>
+    /// Id of the related tenant.
+    /// </summary>
+    Guid? TenantId { get; }
+}
+```
+
+A `null` `TenantId` means the entity belongs to the host. ABP Framework's data
+filters (the EF Core query filter inside
+`Volo.Abp.EntityFrameworkCore.AbpDbContext`, and the MongoDB filter inside
+`Volo.Abp.MongoDB`) detect `IMultiTenant` and inject a `WHERE TenantId =
+@currentTenantId` clause whenever the `IMultiTenant` filter is enabled. The
+filter respects `ICurrentTenant.Id`, so host calls see only `TenantId IS NULL`
+rows and tenant calls see only their own.
+
+The companion attribute `IgnoreMultiTenancyAttribute` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/IgnoreMultiTenancyAttribute.cs`
+is a flagging mechanism for entities and DTOs that should bypass the filter. It
+has `AttributeUsage(AttributeTargets.All)` so it can be placed on classes,
+properties, or parameters where the consumer needs to inspect it.
+
+## `MultiTenancySides` and `MultiTenancyDatabaseStyle`
+
+Two flag enums describe the runtime topology. `MultiTenancySides` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/MultiTenancySides.cs`:
+
+```csharp
+[Flags]
+public enum MultiTenancySides : byte
+{
+    Tenant = 1,
+    Host = 2,
+    Both = Tenant | Host
+}
+```
+
+is consumed by features, permissions, settings, and modules that need to
+restrict their definitions to one side. For example, `IFeatureDefinitionContext`
+implementations and `IPermissionDefinitionContext` implementations both take a
+`MultiTenancySides` argument when adding a definition.
+
+`MultiTenancyDatabaseStyle` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/MultiTenancyDatabaseStyle.cs`
+describes how persistence is laid out:
+
+```csharp
+[Flags]
+public enum MultiTenancyDatabaseStyle
+{
+    Shared = 1,
+    PerTenant = 2,
+    Hybrid = Shared | PerTenant
+}
+```
+
+- `Shared` — one database for everyone, tenant rows filtered by `TenantId`.
+- `PerTenant` — each tenant has its own connection string and database.
+- `Hybrid` — the host runs in a shared database and tenants may *override* it
+  with a per-tenant connection string via `TenantConfiguration.ConnectionStrings`.
+
+`AbpMultiTenancyOptions.DatabaseStyle` defaults to `Hybrid`, which matches the
+behavior of `MultiTenantConnectionStringResolver` in the core assembly.
+
+## `AbpMultiTenancyOptions`
+
+The central on/off switch lives in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/AbpMultiTenancyOptions.cs`:
+
+```csharp
+public class AbpMultiTenancyOptions
+{
+    public bool IsEnabled { get; set; }
+    public MultiTenancyDatabaseStyle DatabaseStyle { get; set; } = MultiTenancyDatabaseStyle.Hybrid;
+    public TenantUserSharingStrategy UserSharingStrategy { get; set; } = TenantUserSharingStrategy.Isolated;
+}
+```
+
+`IsEnabled` is the canonical flag every module reads before applying tenant
+filters. `UserSharingStrategy` (from
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantUserSharingStrategy.cs`)
+declares whether users are tenant-scoped (`Isolated`, default) or `Shared`
+across the deployment — Identity reads it when validating uniqueness of email and
+username.
+
+Configure the options from the host module like any other ABP option object:
+
+```csharp
+Configure<AbpMultiTenancyOptions>(options =>
+{
+    options.IsEnabled = true;
+    options.DatabaseStyle = MultiTenancyDatabaseStyle.Hybrid;
+});
+```
+
+## `AbpTenantResolveOptions`
+
+The resolver pipeline is declared by
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/AbpTenantResolveOptions.cs`:
+
+```csharp
+public class AbpTenantResolveOptions
+{
+    [NotNull]
+    public List<ITenantResolveContributor> TenantResolvers { get; }
+    public string? FallbackTenant { get; set; }
+
+    public AbpTenantResolveOptions()
+    { TenantResolvers = new List<ITenantResolveContributor>(); }
+}
+```
+
+`TenantResolvers` is an ordered list. `Volo.Abp.MultiTenancy` and
+`Volo.Abp.AspNetCore.MultiTenancy` each contribute defaults during their
+`ConfigureServices`, and applications can `Insert`, `Add`, or `InsertAfter` to
+customize. `FallbackTenant` is the string applied by `TenantResolver` when every
+contributor returns null — useful for development scenarios where a tenant id is
+hard-coded.
+
+## `ITenantResolveContext`, `TenantResolveContext`, and `TenantResolveResult`
+
+The contributor protocol is small. `ITenantResolveContext` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ITenantResolveContext.cs`
+extends `IServiceProviderAccessor` and exposes:
+
+```csharp
+public interface ITenantResolveContext : IServiceProviderAccessor
+{
+    string? TenantIdOrName { get; set; }
+    bool Handled { get; set; }
+}
+```
+
+`TenantResolveContext` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantResolveContext.cs`
+implements it and adds `HasResolvedTenantOrHost()`, which returns `true` when
+either `Handled` is set or `TenantIdOrName` is non-null. The resolver short-
+circuits on the first contributor that satisfies that predicate. Setting
+`Handled = true` with a `null` `TenantIdOrName` is the documented way to mean
+"this is explicitly the host, stop the chain" — used by
+`CurrentUserTenantResolveContributor` when an authenticated user's
+`TenantId` claim is missing.
+
+`TenantResolveResult` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantResolveResult.cs`
+is what `ITenantResolver.ResolveTenantIdOrNameAsync()` returns:
+
+```csharp
+public class TenantResolveResult
+{
+    public string? TenantIdOrName { get; set; }
+    public List<string> AppliedResolvers { get; }
+}
+```
+
+`AppliedResolvers` is the audit trail of contributor `Name`s that ran before
+resolution finished — exactly what `MultiTenancyMiddleware` consults when it
+needs to decide whether to refresh the tenant cookie. The accessor
+`ITenantResolveResultAccessor` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ITenantResolveResultAccessor.cs`
+makes that result available downstream of the middleware.
+
+## `ITenantNormalizer` and `UpperInvariantTenantNormalizer`
+
+Tenant names can be supplied as raw user input, so the abstractions package ships
+a normalization contract in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ITenantNormalizer.cs`:
+
+```csharp
+public interface ITenantNormalizer
+{
+    string? NormalizeName(string? name);
+}
+```
+
+The default implementation
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/UpperInvariantTenantNormalizer.cs`
+applies `name?.Normalize().ToUpperInvariant()`, which matches the way
+`TenantConfiguration.NormalizedName` is stored. The class is registered as
+`ITransientDependency`, so any module can replace it by declaring its own
+implementation with `[Dependency(ReplaceServices = true)]`.
+
+## `IMultiTenantUrlProvider` and `ITenantConfigurationProvider`
+
+Two "policy" contracts in the abstractions assembly are implemented in the core
+project but consumed everywhere:
+
+- `IMultiTenantUrlProvider` from
+  `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/IMultiTenantUrlProvider.cs`
+  computes a per-tenant URL from a template such as `{0}.myapp.com`. The
+  Account module uses it to build OpenIddict callback URLs, and email templates
+  pass through it before rendering links.
+- `ITenantConfigurationProvider` from
+  `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ITenantConfigurationProvider.cs`
+  runs the resolver chain and turns its output into a `TenantConfiguration?`.
+  The `saveResolveResult` flag tells the provider whether to push the
+  `TenantResolveResult` into `ITenantResolveResultAccessor` — `true` from the
+  ASP.NET Core middleware, `false` from background jobs that do not want to
+  pollute the HTTP-context store.
+
+## Event-bus payloads
+
+Multi-tenancy is also a distributed-events story. The package defines three
+serializable payloads that the tenant-management module publishes:
+
+- `TenantCreatedEto` in
+  `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantCreatedEto.cs`
+  fires when the management module persists a new tenant.
+- `CreateTenantEto` in
+  `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/CreateTenantEto.cs`
+  is the *request* payload that a SaaS host might send to ask another service to
+  provision a tenant.
+- `TenantConnectionStringUpdatedEto` in
+  `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantConnectionStringUpdatedEto.cs`
+  notifies subscribers (caches, migrators) when an operator changes a tenant's
+  database mapping.
+
+There is also `TenantChangedEvent` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantChangedEvent.cs`,
+which is *local* (in-process) and is published when the current tenant scope
+changes — useful for caches that need to invalidate on tenant switch.
+
+## Claims-identity helpers
+
+When `CurrentUserTenantResolveContributor` reads
+`ICurrentUser.TenantId`, the value is hydrated from the `tenantid` claim on the
+authenticated identity. The helper
+`AbpMultiTenancyClaimsIdentityExtensions` in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/System/Security/Principal/AbpMultiTenancyClaimsIdentityExtensions.cs`
+exposes `FindTenantId()` and `SetTenantId(...)` over a `ClaimsPrincipal` /
+`ClaimsIdentity`, so login pipelines, OpenIddict issuers, and bearer-token
+validators read and write the same claim consistently.
+
+## `TenantResolverConsts` and `TenantResolverNames`
+
+Two constants files round out the package:
+
+- `TenantResolverConsts` in
+  `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantResolverConsts.cs`
+  declares `DefaultTenantKey = "__tenant"`, which is the default cookie /
+  header / query-string / route-value name used by every HTTP-aware
+  contributor.
+- `TenantResolverNames` in
+  `framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/TenantResolverNames.cs`
+  defines well-known contributor names such as
+  `FallbackTenant = "FallbackTenant"`. These names appear in
+  `TenantResolveResult.AppliedResolvers`, which is how you tell from logs which
+  step actually picked the tenant.
+
+<Note>
+The abstractions package has no `AbpMultiTenancyConsts` class today; constant
+strings live in the more specific `TenantResolverConsts` and
+`TenantResolverNames` types. If you read older documentation that references
+`AbpMultiTenancyConsts`, the values are now spread across these two files.
+</Note>
+
+## Default tenant store options
+
+The `AbpDefaultTenantStoreOptions` type in
+`framework/src/Volo.Abp.MultiTenancy.Abstractions/Volo/Abp/MultiTenancy/ConfigurationStore/AbpDefaultTenantStoreOptions.cs`
+is what the configuration-driven `DefaultTenantStore` reads. Hosts that want
+hard-coded tenants for tests can `Configure<AbpDefaultTenantStoreOptions>` with a
+list of `TenantConfiguration` rows, but production deployments almost always
+replace `ITenantStore` with the tenant-management module's database-backed
+implementation.
+
+<Card title="Next: core implementations" icon="arrow-right" href="/tenancy/multi-tenancy-core">
+  See how `Volo.Abp.MultiTenancy` implements `ICurrentTenant`, the resolver
+  pipeline, and the default tenant store.
+</Card>

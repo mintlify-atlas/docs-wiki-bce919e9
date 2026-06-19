@@ -1,0 +1,179 @@
+---
+title: "Background Jobs Module: Durable Persistence Overview"
+sidebarTitle: "Overview"
+description: "How the ABP Framework Background Jobs module replaces the default in-memory job store with a durable, repository-backed BackgroundJobRecord aggregate."
+---
+
+## What This Module Is
+
+The ABP Framework ships a built-in background job abstraction in `Volo.Abp.BackgroundJobs` (the core framework package). That base package defines `IBackgroundJobManager`, `BackgroundJobInfo`, the worker loop, and an in-memory `InMemoryBackgroundJobStore`. The module under `modules/background-jobs/src/` does not redefine those concepts — it provides a **persistence layer** that swaps out the in-memory store for a database-backed `BackgroundJobStore` plus EF Core and MongoDB implementations of the underlying repository.
+
+The module lives in `modules/background-jobs/src/` and is split into five packages: `Volo.Abp.BackgroundJobs.Domain.Shared`, `Volo.Abp.BackgroundJobs.Domain`, `Volo.Abp.BackgroundJobs.EntityFrameworkCore`, `Volo.Abp.BackgroundJobs.MongoDB`, and `Volo.Abp.BackgroundJobs.Installer`. The Domain package is the contract layer; the EntityFrameworkCore and MongoDB packages are interchangeable adapters; the Domain.Shared package holds constants like `BackgroundJobRecordConsts`; and the Installer is a thin embedded-resource package used by ABP's setup tooling.
+
+<Info>
+This module is the persistence companion to the core background-job runtime. It does not contain the worker, the queue, or the retry policy — those live in `Volo.Abp.BackgroundJobs` proper. The module simply provides a `BackgroundJobStore` implementation on top of a repository that targets a real database.
+</Info>
+
+## Why a Persistence Module Exists
+
+The default `InMemoryBackgroundJobStore` in `Volo.Abp.BackgroundJobs` is fine for development and tests, but it loses every queued job when the process restarts. For any non-trivial application — sending email, generating reports, scheduling outbound webhooks — jobs must survive process restarts, deployment swaps, and pod evictions. That requirement is what the module in `modules/background-jobs/src/` exists to satisfy.
+
+The module replaces the in-memory store with `BackgroundJobStore`, defined in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobStore.cs`. That class still implements `IBackgroundJobStore` (the framework interface), but it delegates every call to an `IBackgroundJobRepository`, which is fulfilled by either EF Core or MongoDB. The framework's polling worker continues to call `GetWaitingJobsAsync`, `InsertAsync`, `UpdateAsync`, and `DeleteAsync` exactly as before; the only thing that changes is where the rows live.
+
+## Module Composition
+
+`AbpBackgroundJobsDomainModule`, defined in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/AbpBackgroundJobsDomainModule.cs`, is the entry point. It declares dependencies on `AbpBackgroundJobsDomainSharedModule`, `AbpBackgroundJobsModule` (the core framework package that owns `IBackgroundJobStore`), and `AbpMapperlyModule`. The `ConfigureServices` override registers a Mapperly-based object mapper for the module:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/AbpBackgroundJobsDomainModule.cs
+[DependsOn(
+    typeof(AbpBackgroundJobsDomainSharedModule),
+    typeof(AbpBackgroundJobsModule),
+    typeof(AbpMapperlyModule)
+)]
+public class AbpBackgroundJobsDomainModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMapperlyObjectMapper<AbpBackgroundJobsDomainModule>();
+    }
+}
+```
+
+By depending on `AbpBackgroundJobsModule`, the Domain module participates in the framework's existing DI registrations. Because `BackgroundJobStore` is declared as `ITransientDependency` and implements `IBackgroundJobStore`, ABP's conventional service registration replaces the default `InMemoryBackgroundJobStore` binding with the database-backed one — no manual `Replace` call is needed in user code.
+
+`AbpBackgroundJobsDomainSharedModule`, defined in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain.Shared/Volo/Abp/BackgroundJobs/AbpBackgroundJobsDomainSharedModule.cs`, is empty by design — it exists only so consumers can reference the shared constants package without pulling in the Domain assembly's runtime dependencies. The constants themselves live in `BackgroundJobRecordConsts` in the same folder.
+
+## Storage Adapters
+
+Once `AbpBackgroundJobsDomainModule` is in your dependency graph, you still need an adapter that wires up `IBackgroundJobRepository`. The module ships two:
+
+<CardGroup cols={2}>
+  <Card title="Entity Framework Core" icon="database">
+    `AbpBackgroundJobsEntityFrameworkCoreModule` registers `BackgroundJobsDbContext` and binds `IBackgroundJobRepository` to `EfCoreBackgroundJobRepository`. Source: `modules/background-jobs/src/Volo.Abp.BackgroundJobs.EntityFrameworkCore/`.
+  </Card>
+  <Card title="MongoDB" icon="leaf">
+    `AbpBackgroundJobsMongoDbModule` registers `BackgroundJobsMongoDbContext` and binds `IBackgroundJobRepository` to `MongoBackgroundJobRepository`. Source: `modules/background-jobs/src/Volo.Abp.BackgroundJobs.MongoDB/`.
+  </Card>
+</CardGroup>
+
+You depend on exactly one adapter from your host module. The two adapters never coexist in a single process because they each provide the same `IBackgroundJobRepository` binding, which would create an ambiguous registration. Both adapter modules are documented in detail on the [Persistence](./persistence) page.
+
+## The Domain Aggregate
+
+The single persisted entity is `BackgroundJobRecord`, defined in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobRecord.cs`. It is an `AggregateRoot<Guid>` that implements `IHasCreationTime`. The aggregate carries everything the framework's worker loop needs to schedule, retry, prioritise, and abandon a job:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobRecord.cs
+public class BackgroundJobRecord : AggregateRoot<Guid>, IHasCreationTime
+{
+    public virtual string ApplicationName { get; set; }
+    public virtual string JobName { get; set; }     // AssemblyQualifiedName of job type
+    public virtual string JobArgs { get; set; }     // serialized arguments
+    public virtual short TryCount { get; set; }
+    public virtual DateTime CreationTime { get; set; }
+    public virtual DateTime NextTryTime { get; set; }
+    public virtual DateTime? LastTryTime { get; set; }
+    public virtual bool IsAbandoned { get; set; }
+    public virtual BackgroundJobPriority Priority { get; set; }
+}
+```
+
+Note that `ApplicationName` is on the record itself, not on a separate index table. This is how a single shared database can serve many independent ABP applications: every host writes its own `ApplicationName` and only polls for rows matching its name. The field defaults to whatever ABP's `BackgroundWorkerOptions.ApplicationName` is set to at host startup.
+
+`JobName` is stored as the assembly-qualified type name of the job class — that is how the worker re-binds rows back to executable types after a process restart. `JobArgs` is the JSON-serialized argument object. The two together let the framework reconstruct an `IBackgroundJob<TArgs>` and invoke it without any prior in-memory state.
+
+## Relationship to `BackgroundJobInfo`
+
+The framework's worker loop is written against `BackgroundJobInfo` (a DTO from `Volo.Abp.BackgroundJobs`), not against `BackgroundJobRecord`. The module converts between the two using Mapperly mappers in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobsDomainMapperlyMappers.cs`. Two mappers are declared: `BackgroundJobInfoToBackgroundJobRecordMapper` and `BackgroundJobRecordToBackgroundJobInfoMapper`.
+
+The info-to-record mapper is interesting because it has to deal with `BackgroundJobRecord` inheriting `ConcurrencyStamp` and `ExtraProperties` from `AggregateRoot<Guid>`. Both are deliberately ignored so they keep their server-managed values rather than being clobbered by the inbound DTO:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobsDomainMapperlyMappers.cs
+[Mapper(RequiredMappingStrategy = RequiredMappingStrategy.Target)]
+public partial class BackgroundJobInfoToBackgroundJobRecordMapper
+    : MapperBase<BackgroundJobInfo, BackgroundJobRecord>
+{
+    [MapperIgnoreTarget(nameof(BackgroundJobRecord.ConcurrencyStamp))]
+    [MapperIgnoreTarget(nameof(BackgroundJobRecord.ExtraProperties))]
+    public override partial BackgroundJobRecord Map(BackgroundJobInfo source);
+
+    [ObjectFactory]
+    protected BackgroundJobRecord CreateBackgroundJobRecord(BackgroundJobInfo source)
+    {
+        return new BackgroundJobRecord(source.Id);
+    }
+}
+```
+
+The `[ObjectFactory]` method guarantees that when Mapperly needs a new `BackgroundJobRecord`, it goes through the `id`-taking constructor — preserving the deterministic primary key that the framework chose for the job. This also means optimistic-concurrency stamps continue to roll forward correctly across `UpdateAsync` calls inside `BackgroundJobStore.UpdateAsync`, which looks up the record by id first, then maps the inbound info onto it.
+
+## What You Get End-to-End
+
+When you add `AbpBackgroundJobsDomainModule` plus one of the storage adapters to your host:
+
+1. The framework's `BackgroundJobManager.EnqueueAsync` calls `IBackgroundJobStore.InsertAsync`, which is now `BackgroundJobStore.InsertAsync`, which maps to a `BackgroundJobRecord` and calls `IBackgroundJobRepository.InsertAsync`.
+2. The worker periodically calls `IBackgroundJobStore.GetWaitingJobsAsync(applicationName, maxResultCount)`, which delegates to `IBackgroundJobRepository.GetWaitingListAsync` — implemented identically on both adapters as a priority-ordered, non-abandoned, due-now query.
+3. On success the worker calls `DeleteAsync`; on failure it calls `UpdateAsync`, which bumps `TryCount`, sets `LastTryTime`, recomputes `NextTryTime`, and possibly sets `IsAbandoned`.
+
+All three operations are persisted, so a process restart loses nothing.
+
+## When to Use This Module
+
+<Tip>
+Reach for the module the moment you want background work that survives a deployment. The only time to keep the default in-memory store is for unit tests or for short-lived demo apps where you do not care about losing queued work.
+</Tip>
+
+The module is also the right choice when you want a single shared database to coordinate jobs across multiple application hosts (typical in a microservice solution where each service has its own `ApplicationName`). Because every host filters `GetWaitingListAsync` by its own `ApplicationName`, there is no cross-host poisoning even though the rows share one table.
+
+If you instead need a high-throughput, push-based job queue with cron-style scheduling, the ABP commercial stack ships separate Hangfire and Quartz integrations under `Volo.Abp.BackgroundJobs.Hangfire` and `Volo.Abp.BackgroundJobs.Quartz` (outside this module's source tree). Those use their own persistence and bypass `BackgroundJobStore` entirely. This module is the polling, store-backed implementation that ABP uses by default.
+
+## Database Naming and Multi-Tenancy
+
+The schema and table-prefix defaults live in `AbpBackgroundJobsDbProperties` in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/AbpBackgroundJobsDbProperties.cs`. The connection-string name is the constant `"AbpBackgroundJobs"`, and the table prefix and schema default to ABP's common values:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/AbpBackgroundJobsDbProperties.cs
+public static class AbpBackgroundJobsDbProperties
+{
+    public static string DbTablePrefix { get; set; } = AbpCommonDbProperties.DbTablePrefix;
+    public static string DbSchema { get; set; } = AbpCommonDbProperties.DbSchema;
+    public const string ConnectionStringName = "AbpBackgroundJobs";
+}
+```
+
+Setting `AbpBackgroundJobsDbProperties.DbTablePrefix = ""` before host startup gives you an unprefixed `BackgroundJobs` table; setting it to `"MyApp"` gives you `MyAppBackgroundJobs`. The same approach applies to the MongoDB collection name, which uses the same prefix.
+
+Both the EF Core `BackgroundJobsDbContext` and the Mongo `BackgroundJobsMongoDbContext` are decorated with `[IgnoreMultiTenancy]` and `[ConnectionStringName("AbpBackgroundJobs")]`. The `[IgnoreMultiTenancy]` attribute keeps tenant filters from being applied to job records, which is correct: a background job belongs to the application instance, not to a tenant. If the queued job needs to run in a tenant scope, it is the job's responsibility to enter `ICurrentTenant.Change(tenantId)` from its arguments, not the store's.
+
+## Where to Go Next
+
+<CardGroup cols={2}>
+  <Card title="Persistence Reference" icon="hard-drive" href="./persistence">
+    Full walk-through of `BackgroundJobRecord`, `IBackgroundJobRepository`, `BackgroundJobStore`, the EF Core schema, the MongoDB collection layout, and the waiting-list query.
+  </Card>
+  <Card title="Blob Storing Database" icon="folder-tree" href="../module-blob-database/overview">
+    A parallel persistence module that backs `IBlobProvider` with the same repository pattern.
+  </Card>
+</CardGroup>
+
+## Installer Package
+
+The fifth assembly, `Volo.Abp.BackgroundJobs.Installer`, is not on the runtime path. Its only module class is `AbpBackgroundJobsInstallerModule` in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Installer/Volo/Abp/BackgroundJobs/AbpBackgroundJobsInstallerModule.cs`, which depends on `AbpVirtualFileSystemModule` and registers the assembly's embedded resources:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Installer/Volo/Abp/BackgroundJobs/AbpBackgroundJobsInstallerModule.cs
+[DependsOn(typeof(AbpVirtualFileSystemModule))]
+public class AbpBackgroundJobsInstallerModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpBackgroundJobsInstallerModule>();
+        });
+    }
+}
+```
+
+It exists so the ABP CLI's `abp add-module` command can stream module bootstrap files into a target solution. You will never depend on it from application code; it is tooling-only.
+
+## Summary
+
+The module under `modules/background-jobs/src/` turns ABP's framework-level background-job abstraction into a durable system. It introduces a single aggregate (`BackgroundJobRecord`), one repository contract (`IBackgroundJobRepository`), a store adapter (`BackgroundJobStore`), and two interchangeable storage backends (EF Core and MongoDB). The next page dissects each of those classes in depth.

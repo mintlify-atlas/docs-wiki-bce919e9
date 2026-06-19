@@ -1,0 +1,467 @@
+---
+title: "Background Jobs Persistence: Record, Store, EF Core, Mongo"
+sidebarTitle: "Persistence"
+description: "Deep dive into BackgroundJobRecord, IBackgroundJobRepository, BackgroundJobStore, and the EF Core and MongoDB adapters that back the ABP Framework job store."
+---
+
+## Scope
+
+This page documents every class in the ABP Framework Background Jobs persistence module that touches the database — from the aggregate to the two concrete repositories. Everything here lives under `modules/background-jobs/src/`. The companion [Overview](./overview) explains why the module exists and how it slots into the framework's job runtime; this page is the implementation reference.
+
+## The `BackgroundJobRecord` Aggregate
+
+The single persisted entity is `BackgroundJobRecord`, defined in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobRecord.cs`. It inherits `AggregateRoot<Guid>` and implements `IHasCreationTime`. The full property surface is:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobRecord.cs
+public class BackgroundJobRecord : AggregateRoot<Guid>, IHasCreationTime
+{
+    public virtual string ApplicationName { get; set; }
+    public virtual string JobName { get; set; }
+    public virtual string JobArgs { get; set; }
+    public virtual short TryCount { get; set; }
+    public virtual DateTime CreationTime { get; set; }
+    public virtual DateTime NextTryTime { get; set; }
+    public virtual DateTime? LastTryTime { get; set; }
+    public virtual bool IsAbandoned { get; set; }
+    public virtual BackgroundJobPriority Priority { get; set; }
+
+    protected BackgroundJobRecord() { }
+
+    public BackgroundJobRecord(Guid id) : base(id) { }
+}
+```
+
+Every property is `virtual` so EF Core can build proxies and the Mapperly mapper can assign them. The protected parameterless constructor is required for materialization; the public `Guid`-taking constructor is what the Mapperly `[ObjectFactory]` calls when promoting a `BackgroundJobInfo` into a record. The aggregate intentionally does not enforce invariants in its setters — the framework's `BackgroundJobManager` and `BackgroundJobStore` are the only allowed writers, and they shape the state machine externally.
+
+### Field Semantics
+
+The fields divide into three groups. `ApplicationName`, `JobName`, and `JobArgs` describe **what to run**; the worker reconstructs an `IBackgroundJob<TArgs>` from `JobName` (which holds the assembly-qualified type name) and deserialises `JobArgs` into the matching argument type. `TryCount`, `CreationTime`, `NextTryTime`, `LastTryTime`, and `IsAbandoned` describe **scheduling state**; `Priority` describes **dispatch order**. The values come from the framework constants and the `BackgroundJobPriority` enum defined in the core `Volo.Abp.BackgroundJobs` package.
+
+### Length Limits
+
+The maximum lengths are not hard-coded in the entity. They live in `BackgroundJobRecordConsts` in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain.Shared/Volo/Abp/BackgroundJobs/BackgroundJobRecordConsts.cs`, and the EF Core model-creating extension reads them at startup:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain.Shared/Volo/Abp/BackgroundJobs/BackgroundJobRecordConsts.cs
+public static class BackgroundJobRecordConsts
+{
+    public static int MaxApplicationNameLength { get; set; } = 96;
+    public static int MaxJobNameLength { get; set; } = 128;
+    public static int MaxJobArgsLength { get; set; } = 1024 * 1024;
+}
+```
+
+Because these are mutable static properties (not constants), you can raise them before host startup if your `JobArgs` JSON payloads exceed 1 MiB or if your `JobName` assembly-qualified names get unusually long. Changes apply only at the time the EF Core model is built; after `OnModelCreating` runs, raising the limits has no further effect for that DbContext.
+
+## Repository Contract
+
+The repository is `IBackgroundJobRepository`, defined in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/IBackgroundJobRepository.cs`. It is intentionally narrow — it extends `IBasicRepository<BackgroundJobRecord, Guid>` (which gives Insert/Update/Delete/Find/GetList) and adds a single method:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/IBackgroundJobRepository.cs
+public interface IBackgroundJobRepository : IBasicRepository<BackgroundJobRecord, Guid>
+{
+    Task<List<BackgroundJobRecord>> GetWaitingListAsync(
+        [CanBeNull] string applicationName,
+        int maxResultCount,
+        CancellationToken cancellationToken = default);
+}
+```
+
+`GetWaitingListAsync` is the hot path. The framework's worker calls it on every poll interval, so its implementation determines the cost of the entire job runtime. The `[CanBeNull]` annotation on `applicationName` reflects that the parameter can be `null`; the persisted records still hold whatever `ApplicationName` the originating host set.
+
+The contract intentionally does not include bulk methods, pagination, or update-with-locking. The framework's `BackgroundJobWorker` handles concurrency by claiming jobs through a combination of `TryCount` increments and database optimistic concurrency on the aggregate's `ConcurrencyStamp` (inherited from `AggregateRoot<Guid>`). Implementations therefore do not need explicit row-level locking.
+
+## The `BackgroundJobStore` Adapter
+
+`BackgroundJobStore`, defined in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobStore.cs`, is the bridge between the framework-level `IBackgroundJobStore` interface and `IBackgroundJobRepository`:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobStore.cs
+public class BackgroundJobStore : IBackgroundJobStore, ITransientDependency
+{
+    protected IBackgroundJobRepository BackgroundJobRepository { get; }
+    protected IObjectMapper<AbpBackgroundJobsDomainModule> ObjectMapper { get; }
+
+    public BackgroundJobStore(
+        IBackgroundJobRepository backgroundJobRepository,
+        IObjectMapper<AbpBackgroundJobsDomainModule> objectMapper)
+    {
+        BackgroundJobRepository = backgroundJobRepository;
+        ObjectMapper = objectMapper;
+    }
+    // ...
+}
+```
+
+Because it implements `IBackgroundJobStore` and is registered as `ITransientDependency`, ABP's conventional registration replaces the default in-memory store at DI build time. No `services.Replace(...)` call is needed; the user only adds `AbpBackgroundJobsDomainModule` (and a storage adapter) to the module graph.
+
+### `InsertAsync`
+
+`InsertAsync` is a straightforward map-then-persist:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobStore.cs
+public virtual async Task InsertAsync(BackgroundJobInfo jobInfo)
+{
+    await BackgroundJobRepository.InsertAsync(
+        ObjectMapper.Map<BackgroundJobInfo, BackgroundJobRecord>(jobInfo)
+    );
+}
+```
+
+The `ObjectMapper` here resolves to the Mapperly mapper registered by `AbpBackgroundJobsDomainModule.ConfigureServices`. Because Mapperly's `[ObjectFactory]` rebuilds the record through its `Guid`-taking constructor, the inbound `jobInfo.Id` becomes the aggregate's `Id`, preserving deterministic identity from the framework's `BackgroundJobManager`.
+
+### `FindAsync` and `GetWaitingJobsAsync`
+
+`FindAsync` performs a single primary-key lookup and maps the result back to a `BackgroundJobInfo`. `GetWaitingJobsAsync` is the most consequential method on the store — it is what the polling worker calls every tick:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobStore.cs
+public virtual async Task<List<BackgroundJobInfo>> GetWaitingJobsAsync(
+    string applicationName, int maxResultCount)
+{
+    return ObjectMapper.Map<List<BackgroundJobRecord>, List<BackgroundJobInfo>>(
+        await BackgroundJobRepository.GetWaitingListAsync(applicationName, maxResultCount)
+    );
+}
+```
+
+The store does not paginate, sort, or filter — the entire shape of the result is determined by `IBackgroundJobRepository.GetWaitingListAsync`. Both shipped repositories implement that method identically: filter by `ApplicationName`, exclude abandoned rows, require `NextTryTime <= now`, then order by priority desc, try-count asc, next-try-time asc.
+
+### `UpdateAsync`
+
+`UpdateAsync` has a small but important subtlety:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobStore.cs
+public virtual async Task UpdateAsync(BackgroundJobInfo jobInfo)
+{
+    var backgroundJobRecord = await BackgroundJobRepository.FindAsync(jobInfo.Id);
+    if (backgroundJobRecord == null)
+    {
+        return;
+    }
+
+    ObjectMapper.Map(jobInfo, backgroundJobRecord);
+    await BackgroundJobRepository.UpdateAsync(backgroundJobRecord);
+}
+```
+
+The store loads the existing record, then runs the **in-place** mapping overload (`Map(source, destination)`), and finally calls `UpdateAsync`. This preserves the aggregate's `ConcurrencyStamp` and `ExtraProperties`, both of which are explicitly ignored by the Mapperly mapper. If the record has been deleted out from under the store (for example by a previous successful run on another worker), the method silently no-ops — which is correct, because there is nothing to update.
+
+### `DeleteAsync`
+
+`DeleteAsync` is a pass-through:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.Domain/Volo/Abp/BackgroundJobs/BackgroundJobStore.cs
+public virtual async Task DeleteAsync(Guid jobId)
+{
+    await BackgroundJobRepository.DeleteAsync(jobId);
+}
+```
+
+The worker calls this when a job completes successfully or when it is permanently abandoned (in some shipped policies). The repository's basic `DeleteAsync(Guid)` handles both EF Core's `Remove`/`SaveChanges` and Mongo's `DeleteOne` semantics.
+
+## EF Core Adapter
+
+The EF Core adapter lives in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.EntityFrameworkCore/`. It contains four pieces: the module class, the DbContext interface, the DbContext, the model-creating extension, and the repository implementation.
+
+### Module Wiring
+
+`AbpBackgroundJobsEntityFrameworkCoreModule` registers the DbContext and the repository in one call:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.EntityFrameworkCore/Volo/Abp/BackgroundJobs/EntityFrameworkCore/AbpBackgroundJobsEntityFrameworkCoreModule.cs
+[DependsOn(
+    typeof(AbpBackgroundJobsDomainModule),
+    typeof(AbpEntityFrameworkCoreModule)
+)]
+public class AbpBackgroundJobsEntityFrameworkCoreModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddAbpDbContext<BackgroundJobsDbContext>(options =>
+        {
+            options.AddRepository<BackgroundJobRecord, EfCoreBackgroundJobRepository>();
+        });
+    }
+}
+```
+
+`AddAbpDbContext` registers `BackgroundJobsDbContext` with ABP's DbContext factory; `AddRepository` binds `IBackgroundJobRepository` (auto-discovered from `EfCoreBackgroundJobRepository`'s interface list) to the EF Core implementation.
+
+### DbContext Surface
+
+`BackgroundJobsDbContext` is a single-table context decorated with `[IgnoreMultiTenancy]` and `[ConnectionStringName("AbpBackgroundJobs")]`:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.EntityFrameworkCore/Volo/Abp/BackgroundJobs/EntityFrameworkCore/BackgroundJobsDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpBackgroundJobsDbProperties.ConnectionStringName)]
+public class BackgroundJobsDbContext : AbpDbContext<BackgroundJobsDbContext>, IBackgroundJobsDbContext
+{
+    public DbSet<BackgroundJobRecord> BackgroundJobs { get; set; }
+
+    public BackgroundJobsDbContext(DbContextOptions<BackgroundJobsDbContext> options)
+        : base(options) { }
+
+    protected override void OnModelCreating(ModelBuilder builder)
+    {
+        base.OnModelCreating(builder);
+        builder.ConfigureBackgroundJobs();
+    }
+}
+```
+
+The interface `IBackgroundJobsDbContext` in the same folder mirrors the read-side shape. Defining the interface separately lets users configure `EfCoreRepository<IBackgroundJobsDbContext, ...>` so the repository remains untied to the concrete context — that is how you would substitute the jobs tables into a custom application DbContext using `ReplaceDbContext`.
+
+### Model Creating
+
+The model-creating extension is where the column shape, defaults, and the single composite index are declared:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.EntityFrameworkCore/Volo/Abp/BackgroundJobs/EntityFrameworkCore/BackgroundJobsDbContextModelCreatingExtensions.cs
+public static void ConfigureBackgroundJobs(this ModelBuilder builder)
+{
+    if (builder.IsTenantOnlyDatabase())
+    {
+        return;
+    }
+
+    builder.Entity<BackgroundJobRecord>(b =>
+    {
+        b.ToTable(AbpBackgroundJobsDbProperties.DbTablePrefix + "BackgroundJobs",
+                  AbpBackgroundJobsDbProperties.DbSchema);
+        b.ConfigureByConvention();
+
+        b.Property(x => x.ApplicationName).IsRequired(false)
+            .HasMaxLength(BackgroundJobRecordConsts.MaxApplicationNameLength);
+        b.Property(x => x.JobName).IsRequired()
+            .HasMaxLength(BackgroundJobRecordConsts.MaxJobNameLength);
+        b.Property(x => x.JobArgs).IsRequired()
+            .HasMaxLength(BackgroundJobRecordConsts.MaxJobArgsLength);
+        b.Property(x => x.TryCount).HasDefaultValue(0);
+        b.Property(x => x.NextTryTime);
+        b.Property(x => x.LastTryTime);
+        b.Property(x => x.IsAbandoned).HasDefaultValue(false);
+        b.Property(x => x.Priority)
+            .HasDefaultValue(BackgroundJobPriority.Normal)
+            .HasSentinel(BackgroundJobPriority.Normal);
+
+        b.HasIndex(x => new { x.IsAbandoned, x.NextTryTime });
+
+        b.ApplyObjectExtensionMappings();
+    });
+
+    builder.TryConfigureObjectExtensions<BackgroundJobsDbContext>();
+}
+```
+
+Several details deserve attention:
+
+<AccordionGroup>
+  <Accordion title="The IsTenantOnlyDatabase short-circuit">
+    `builder.IsTenantOnlyDatabase()` is an ABP convention. In multi-tenant solutions with separate tenant databases, the jobs table belongs to the host database, not the tenant database. The early return prevents the table from being created in tenant databases when the same `OnModelCreating` runs there.
+  </Accordion>
+  <Accordion title="HasSentinel on Priority">
+    `HasSentinel(BackgroundJobPriority.Normal)` tells EF Core that if a property is set to `Normal` (the default), it should be treated as "not set" — letting the database-side default actually win. Without it, EF Core would always emit an explicit `Normal` in INSERT statements.
+  </Accordion>
+  <Accordion title="ApplyObjectExtensionMappings">
+    `ApplyObjectExtensionMappings` and `TryConfigureObjectExtensions` integrate `BackgroundJobRecord` with ABP's object-extension system, so consumers can append custom columns through `ObjectExtensionManager.Instance.AddOrUpdateProperty<...>(...)` without subclassing the entity.
+  </Accordion>
+</AccordionGroup>
+
+### The Composite Index
+
+The only index declared is `(IsAbandoned, NextTryTime)`. That choice matches the predicate used by every poll:
+
+```sql
+WHERE ApplicationName = @app AND IsAbandoned = 0 AND NextTryTime <= @now
+```
+
+The `(IsAbandoned, NextTryTime)` ordering puts the high-selectivity `IsAbandoned = false` filter first and then a range scan on `NextTryTime`. `ApplicationName` is not included in the index because most workloads have a single dominant `ApplicationName` per database; if you run many applications against one schema with very different cardinalities, you can append a custom index from your application module.
+
+### EF Core Repository
+
+`EfCoreBackgroundJobRepository` extends ABP's generic `EfCoreRepository` with the waiting-list query and an injected `IClock`:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.EntityFrameworkCore/Volo/Abp/BackgroundJobs/EntityFrameworkCore/EfCoreBackgroundJobRepository.cs
+public class EfCoreBackgroundJobRepository
+    : EfCoreRepository<IBackgroundJobsDbContext, BackgroundJobRecord, Guid>,
+      IBackgroundJobRepository
+{
+    protected IClock Clock { get; }
+
+    public EfCoreBackgroundJobRepository(
+        IDbContextProvider<IBackgroundJobsDbContext> dbContextProvider,
+        IClock clock) : base(dbContextProvider)
+    {
+        Clock = clock;
+    }
+
+    public virtual async Task<List<BackgroundJobRecord>> GetWaitingListAsync(
+        string applicationName, int maxResultCount,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetWaitingListQueryAsync(applicationName, maxResultCount))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    protected virtual async Task<IQueryable<BackgroundJobRecord>> GetWaitingListQueryAsync(
+        string applicationName, int maxResultCount)
+    {
+        var now = Clock.Now;
+        return (await GetDbSetAsync())
+            .Where(t => t.ApplicationName == applicationName)
+            .Where(t => !t.IsAbandoned && t.NextTryTime <= now)
+            .OrderByDescending(t => t.Priority)
+            .ThenBy(t => t.TryCount)
+            .ThenBy(t => t.NextTryTime)
+            .Take(maxResultCount);
+    }
+}
+```
+
+The `IClock` is ABP's abstraction over `DateTime.Now`/`DateTime.UtcNow` — using `Clock.Now` ensures the comparison uses the same kind (UTC vs. local) as whatever was stored when the job was inserted. The `Take(maxResultCount)` runs server-side, which keeps the worker poll from pulling more rows than it intends to dispatch.
+
+<Warning>
+`GetWaitingListQueryAsync` is marked `protected virtual` precisely so you can override the ordering or apply additional filters in a subclass. If you do, register your subclass as the `IBackgroundJobRepository` binding instead of `EfCoreBackgroundJobRepository`. Keep the priority-first ordering or you will starve high-priority jobs behind a backlog of normal ones.
+</Warning>
+
+## MongoDB Adapter
+
+The MongoDB adapter is symmetric to the EF Core one. It lives in `modules/background-jobs/src/Volo.Abp.BackgroundJobs.MongoDB/`.
+
+### Module Wiring
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.MongoDB/Volo/Abp/BackgroundJobs/MongoDB/AbpBackgroundJobsMongoDbModule.cs
+[DependsOn(
+    typeof(AbpBackgroundJobsDomainModule),
+    typeof(AbpMongoDbModule)
+)]
+public class AbpBackgroundJobsMongoDbModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.AddMongoDbContext<BackgroundJobsMongoDbContext>(options =>
+        {
+            options.AddRepository<BackgroundJobRecord, MongoBackgroundJobRepository>();
+        });
+    }
+}
+```
+
+The shape mirrors the EF Core module exactly — same dependency layout, same `AddRepository` call.
+
+### Mongo DbContext and Collection
+
+`BackgroundJobsMongoDbContext` exposes a single collection and is similarly decorated:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.MongoDB/Volo/Abp/BackgroundJobs/MongoDB/BackgroundJobsMongoDbContext.cs
+[IgnoreMultiTenancy]
+[ConnectionStringName(AbpBackgroundJobsDbProperties.ConnectionStringName)]
+public class BackgroundJobsMongoDbContext : AbpMongoDbContext, IBackgroundJobsMongoDbContext
+{
+    public IMongoCollection<BackgroundJobRecord> BackgroundJobs { get; set; }
+
+    protected override void CreateModel(IMongoModelBuilder modelBuilder)
+    {
+        base.CreateModel(modelBuilder);
+        modelBuilder.ConfigureBackgroundJobs();
+    }
+}
+```
+
+The model-builder extension only sets the collection name:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.MongoDB/Volo/Abp/BackgroundJobs/MongoDB/BackgroundJobsMongoDbContextExtensions.cs
+public static void ConfigureBackgroundJobs(this IMongoModelBuilder builder)
+{
+    builder.Entity<BackgroundJobRecord>(b =>
+    {
+        b.CollectionName = AbpBackgroundJobsDbProperties.DbTablePrefix + "BackgroundJobs";
+    });
+}
+```
+
+There is no explicit index declaration. MongoDB indexes for this collection are not provisioned by the module; for production workloads you should create a compound index manually that matches the query, for example `{ ApplicationName: 1, IsAbandoned: 1, NextTryTime: 1 }`, possibly with a `Priority` suffix if your dispatch is dominated by priority-mixed traffic.
+
+### Mongo Repository
+
+`MongoBackgroundJobRepository` is functionally identical to its EF Core sibling — same filter, same ordering, same `IClock` dependency:
+
+```csharp module-background-jobs/src/Volo.Abp.BackgroundJobs.MongoDB/Volo/Abp/BackgroundJobs/MongoDB/MongoBackgroundJobRepository.cs
+public class MongoBackgroundJobRepository
+    : MongoDbRepository<IBackgroundJobsMongoDbContext, BackgroundJobRecord, Guid>,
+      IBackgroundJobRepository
+{
+    protected IClock Clock { get; }
+
+    public MongoBackgroundJobRepository(
+        IMongoDbContextProvider<IBackgroundJobsMongoDbContext> dbContextProvider,
+        IClock clock) : base(dbContextProvider)
+    {
+        Clock = clock;
+    }
+
+    public virtual async Task<List<BackgroundJobRecord>> GetWaitingListAsync(
+        string applicationName, int maxResultCount,
+        CancellationToken cancellationToken = default)
+    {
+        return await (await GetWaitingListQuery(applicationName, maxResultCount, cancellationToken))
+            .ToListAsync(GetCancellationToken(cancellationToken));
+    }
+
+    protected virtual async Task<IQueryable<BackgroundJobRecord>> GetWaitingListQuery(
+        string applicationName, int maxResultCount,
+        CancellationToken cancellationToken = default)
+    {
+        var now = Clock.Now;
+        return (await GetQueryableAsync(cancellationToken))
+            .Where(t => t.ApplicationName == applicationName)
+            .Where(t => !t.IsAbandoned && t.NextTryTime <= now)
+            .OrderByDescending(t => t.Priority)
+            .ThenBy(t => t.TryCount)
+            .ThenBy(t => t.NextTryTime)
+            .Take(maxResultCount);
+    }
+}
+```
+
+Because both adapters share the same predicate and sort, the behaviour of `BackgroundJobStore.GetWaitingJobsAsync` is independent of the chosen backend. The only observable difference is index behaviour, which you control through schema choices.
+
+## Data Seed Contributors
+
+There are no data seed contributors in this module. Background jobs are runtime state — they are inserted by `IBackgroundJobManager.EnqueueAsync` calls, not bootstrapped from seed data. A search through the module source confirms there is no `IDataSeedContributor` implementation anywhere in `modules/background-jobs/src/`. If you need to ensure jobs exist on first start, register an `IHostedService` or a startup module method that calls `EnqueueAsync` conditionally.
+
+## End-to-End Sequence
+
+Putting the pieces together, here is what happens on a single enqueue / poll / failure cycle:
+
+<Steps>
+  <Step title="Enqueue">
+    A caller invokes `IBackgroundJobManager.EnqueueAsync(args)`. The framework constructs a `BackgroundJobInfo`, then calls `IBackgroundJobStore.InsertAsync(info)`. The DI container resolves that to `BackgroundJobStore`, which maps to `BackgroundJobRecord` and calls `IBackgroundJobRepository.InsertAsync` — which is either `EfCoreBackgroundJobRepository` or `MongoBackgroundJobRepository`.
+  </Step>
+  <Step title="Poll">
+    On each tick, `BackgroundJobWorker` calls `IBackgroundJobStore.GetWaitingJobsAsync(applicationName, batchSize)`. `BackgroundJobStore` delegates to `IBackgroundJobRepository.GetWaitingListAsync`. The repository runs the priority-ordered, due-now query against the `AbpBackgroundJobs` table or collection.
+  </Step>
+  <Step title="Execute">
+    The worker resolves each `JobName` to a concrete `IBackgroundJob<TArgs>`, deserialises `JobArgs`, and runs the job. On success it calls `IBackgroundJobStore.DeleteAsync(id)`.
+  </Step>
+  <Step title="Retry or abandon">
+    On failure, the worker mutates the `BackgroundJobInfo` (increment `TryCount`, set `LastTryTime`, compute `NextTryTime`, optionally set `IsAbandoned`) and calls `IBackgroundJobStore.UpdateAsync(info)`. `BackgroundJobStore` reloads, in-place maps, and updates — preserving the concurrency stamp.
+  </Step>
+</Steps>
+
+## Customisation Cookbook
+
+<CardGroup cols={2}>
+  <Card title="Custom table name">
+    Set `AbpBackgroundJobsDbProperties.DbTablePrefix` and `DbSchema` before `Application.Initialize()` to control where the table is created. The same prefix drives the Mongo collection name.
+  </Card>
+  <Card title="Larger payloads">
+    Raise `BackgroundJobRecordConsts.MaxJobArgsLength` before the host's EF Core model is built. Existing schemas need a corresponding migration to widen the column.
+  </Card>
+  <Card title="Different ordering">
+    Subclass `EfCoreBackgroundJobRepository` (or its Mongo sibling), override `GetWaitingListQueryAsync`, and bind the subclass to `IBackgroundJobRepository`. Keep `OrderByDescending(Priority)` to avoid priority starvation.
+  </Card>
+  <Card title="Shared application database">
+    Use ABP's `ReplaceDbContext<IBackgroundJobsDbContext, MyAppDbContext>` so the `BackgroundJobs` table lives in your application's main DbContext instead of its own.
+  </Card>
+</CardGroup>
+
+## Summary
+
+The persistence module is implemented in roughly 200 lines spread across two adapters around a single aggregate. Everything funnels through `IBackgroundJobRepository`; `BackgroundJobStore` wraps it to implement the framework's `IBackgroundJobStore`; and the two adapters keep their query shape identical so the worker behaves the same regardless of backend. The next module — [Blob Storing Database](../module-blob-database/overview) — applies the same pattern to file blobs.

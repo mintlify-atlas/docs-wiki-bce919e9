@@ -1,0 +1,333 @@
+---
+title: "Unit of Work and Transaction Flow: Begin to Commit"
+sidebarTitle: "UoW & Transaction"
+description: "Trace ABP Framework's Unit of Work pipeline — UnitOfWorkAttribute, interceptor, manager, ambient AsyncLocal, EF SaveChanges, transaction commit, dispose ordering."
+---
+
+ABP Framework's Unit of Work (UoW) abstraction is the substrate that makes "every database write either fully happens or fully doesn't" feel automatic. It wraps EF Core's `SaveChangesAsync` and `BeginTransaction` (and the equivalents for MongoDB, Dapper, etc.) into a uniform `IUnitOfWork` contract managed by `IUnitOfWorkManager`. All code paths described here live under [`framework/src/Volo.Abp.Uow/`](https://github.com/abpframework/abp/tree/dev/framework/src/Volo.Abp.Uow).
+
+<Note>
+The UoW machinery is **ambient**: there is a single `AsyncLocal<IUnitOfWork?>` per execution context. Every `IRepository<T>` and every `IDbContext`-resolution participates in whatever UoW is currently in scope. That is what makes nested calls Just Work.
+</Note>
+
+## Entry Points
+
+There are four ways a UoW is created on the request path:
+
+<CardGroup cols={2}>
+  <Card title="UnitOfWorkAttribute" icon="at">
+    `[UnitOfWork]` on an `ApplicationService` method — interpreted by `UnitOfWorkInterceptor` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkInterceptor.cs`).
+  </Card>
+  <Card title="AbpUowActionFilter" icon="filter">
+    MVC pipeline — wraps controller actions whose method/class is not `[UnitOfWork(IsDisabled = true)]`. See `framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Uow/AbpUowActionFilter.cs`.
+  </Card>
+  <Card title="AbpUnitOfWorkMiddleware" icon="layer-group">
+    Reserves the named UoW `_AbpActionUnitOfWork` so the action filter can bind to it. See `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Uow/AbpUnitOfWorkMiddleware.cs`.
+  </Card>
+  <Card title="IUnitOfWorkManager.Begin" icon="code">
+    Manual: `using (var uow = _uowManager.Begin(requiresNew: true)) { ... await uow.CompleteAsync(); }` for custom orchestration.
+  </Card>
+</CardGroup>
+
+## The Reservation Handshake
+
+The middleware reserves a UoW; the filter then *binds* to that reservation. The full handshake is in `AbpUnitOfWorkMiddleware.InvokeAsync` (in `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Uow/AbpUnitOfWorkMiddleware.cs`):
+
+```csharp
+using (var uow = _unitOfWorkManager.Reserve(UnitOfWork.UnitOfWorkReservationName))
+{
+    await next(context);
+    await uow.CompleteAsync(_cancellationTokenProvider.Token);
+}
+```
+
+`Reserve(reservationName)` (in `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkManager.cs`) creates a new `UnitOfWork`, calls `unitOfWork.Reserve(reservationName)`, and **does not yet** initialize options or push it on the ambient stack — the work item is parked under the constant `UnitOfWork.UnitOfWorkReservationName = "_AbpActionUnitOfWork"` (declared in `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWork.cs`).
+
+Later, `AbpUowActionFilter.OnActionExecutionAsync` (see `framework/src/Volo.Abp.AspNetCore.Mvc/Volo/Abp/AspNetCore/Mvc/Uow/AbpUowActionFilter.cs`) calls `unitOfWorkManager.TryBeginReserved(UnitOfWork.UnitOfWorkReservationName, options)`. Inside `UnitOfWorkManager.TryBeginReserved` (in `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkManager.cs`), the loop walks the ambient UoW chain `while (uow != null && !uow.IsReservedFor(reservationName))` until it finds the reserved one, then calls `uow.Initialize(options)`. Now it is a live UoW participating in repository writes.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant MW as AbpUnitOfWorkMiddleware
+    participant Mgr as IUnitOfWorkManager
+    participant Amb as IAmbientUnitOfWork
+    participant Uow as UnitOfWork
+    participant F as AbpUowActionFilter
+    participant Act as Action
+    participant Repo as IRepository<Book>
+    MW->>Mgr: Reserve("_AbpActionUnitOfWork")
+    Mgr->>Uow: new UnitOfWork(); uow.Reserve(name)
+    Mgr->>Amb: SetUnitOfWork(uow)
+    Mgr-->>MW: uow (reserved, not initialized)
+    MW->>F: await next() (downstream pipeline)
+    F->>Mgr: TryBeginReserved(name, options)
+    Mgr->>Amb: walk Outer chain to find reserved
+    Mgr->>Uow: Initialize(options)
+    Uow-->>F: live UoW
+    F->>Act: action delegate runs
+    Act->>Repo: await _bookRepo.InsertAsync(book)
+    Repo->>Uow: enlist DbContext; track changes
+    Act-->>F: result
+    F->>Mgr: Current.SaveChangesAsync()  (via reserved branch)
+    F-->>MW: ok
+    MW->>Uow: uow.CompleteAsync(ct)  (events, save, commit)
+    Uow-->>MW: completed
+    MW->>Uow: Dispose (transactions disposed, OnDisposed fired)
+```
+
+## The Attribute → Interceptor Path
+
+`UnitOfWorkInterceptor.InterceptAsync` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkInterceptor.cs`) is registered for any class whose methods or class type satisfy `UnitOfWorkHelper.IsUnitOfWorkMethod`. The interceptor is installed via `UnitOfWorkInterceptorRegistrar` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkInterceptorRegistrar.cs`), which hooks into the dynamic-proxy registration in DI.
+
+The body is:
+
+```csharp
+public override async Task InterceptAsync(IAbpMethodInvocation invocation)
+{
+    if (!UnitOfWorkHelper.IsUnitOfWorkMethod(invocation.Method, out var unitOfWorkAttribute))
+    {
+        await invocation.ProceedAsync();
+        return;
+    }
+
+    using (var scope = _serviceScopeFactory.CreateScope())
+    {
+        var options = CreateOptions(scope.ServiceProvider, invocation, unitOfWorkAttribute);
+        var unitOfWorkManager = scope.ServiceProvider.GetRequiredService<IUnitOfWorkManager>();
+
+        if (unitOfWorkManager.TryBeginReserved(UnitOfWork.UnitOfWorkReservationName, options))
+        {
+            await invocation.ProceedAsync();
+            if (unitOfWorkManager.Current != null)
+            {
+                await unitOfWorkManager.Current.SaveChangesAsync();
+            }
+            return;
+        }
+
+        using (var uow = unitOfWorkManager.Begin(options))
+        {
+            await invocation.ProceedAsync();
+            await uow.CompleteAsync();
+        }
+    }
+}
+```
+
+`CreateOptions` (same file) reads the attribute and consults `IUnitOfWorkTransactionBehaviourProvider` (default `AspNetCoreUnitOfWorkTransactionBehaviourProvider` in `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Uow/`) plus the fallback rule "`!Method.Name.StartsWith("Get")`" to decide `IsTransactional` when the attribute does not say.
+
+`UnitOfWorkHelper.GetUnitOfWorkAttributeOrNull` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkHelper.cs`) walks the method and declaring type looking for `[UnitOfWork]`. Application service methods get UoW *by convention*; you only need the attribute to override timeout, isolation level, or `IsDisabled`.
+
+## Ambient AsyncLocal
+
+`AmbientUnitOfWork` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/AmbientUnitOfWork.cs`) holds the current UoW in `AsyncLocal<IUnitOfWork?>`:
+
+```csharp
+[ExposeServices(typeof(IAmbientUnitOfWork), typeof(IUnitOfWorkAccessor))]
+public class AmbientUnitOfWork : IAmbientUnitOfWork, ISingletonDependency
+{
+    public IUnitOfWork? UnitOfWork => _currentUow.Value;
+    private readonly AsyncLocal<IUnitOfWork?> _currentUow = new();
+    public void SetUnitOfWork(IUnitOfWork? unitOfWork) => _currentUow.Value = unitOfWork;
+    public IUnitOfWork? GetCurrentByChecking()
+    {
+        var uow = UnitOfWork;
+        while (uow != null && (uow.IsReserved || uow.IsDisposed || uow.IsCompleted))
+            uow = uow.Outer;
+        return uow;
+    }
+}
+```
+
+`GetCurrentByChecking` is what `IUnitOfWorkManager.Current` resolves to (see the property at the top of `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWorkManager.cs`). The "skip reserved/disposed/completed" loop ensures `Current` never returns a UoW that cannot accept new work.
+
+`UnitOfWorkManager.Begin` (same file) returns a `ChildUnitOfWork` when one already exists and `requiresNew == false`, so nested `Begin()` calls don't open new transactions — they piggyback on the outer. See `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/ChildUnitOfWork.cs` for the wrapper that forwards everything to the outer.
+
+## Inside `CompleteAsync`
+
+`UnitOfWork.CompleteAsync(CancellationToken)` in `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWork.cs` is the heart of the flow:
+
+<Steps>
+  <Step title="Short-circuit if rolled back">
+    `if (_isRolledback) return;` — nothing to do.
+  </Step>
+  <Step title="PreventMultipleComplete">
+    Throws `AbpException("Completion has already been requested for this unit of work.")` if `IsCompleted || _isCompleting`.
+  </Step>
+  <Step title="First SaveChanges">
+    `_isCompleting = true; await SaveChangesAsync(cancellationToken);` — iterates every active `IDatabaseApi` and, for each that implements `ISupportsSavingChanges`, calls `SaveChangesAsync`. For EF that calls `DbContext.SaveChangesAsync`.
+  </Step>
+  <Step title="Drain event boxes (loop)">
+    Collects `LocalEvents` + `LocalEventWithPredicates` and publishes them via `IUnitOfWorkEventPublisher.PublishLocalEventsAsync`. Same for `DistributedEvents` via `PublishDistributedEventsAsync`. Then calls `SaveChangesAsync` again (because handlers may have written to entities). Loop until both queues are empty.
+  </Step>
+  <Step title="Commit transactions">
+    `await CommitTransactionsAsync(cancellationToken)` iterates `GetAllActiveTransactionApis()` and calls `transaction.CommitAsync(cancellationToken)` on each.
+  </Step>
+  <Step title="Mark completed; fire OnCompleted">
+    `IsCompleted = true; await OnCompletedAsync();` invokes every callback registered via `OnCompleted(Func<Task>)`.
+  </Step>
+  <Step title="On exception">
+    `_exception = ex; throw;` — the exception is captured for `OnFailed` and re-thrown. The outer `using` then calls `Dispose`, which disposes transactions and fires `Failed`.
+  </Step>
+</Steps>
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Caller as caller (filter/middleware)
+    participant Uow as UnitOfWork
+    participant DbApi as IDatabaseApi (EF wrapper)
+    participant Ctx as DbContext
+    participant Tx as ITransactionApi
+    participant Pub as IUnitOfWorkEventPublisher
+    participant LBus as ILocalEventBus
+    participant DBus as IDistributedEventBus
+    Caller->>Uow: CompleteAsync(ct)
+    Uow->>Uow: PreventMultipleComplete()
+    Uow->>DbApi: SaveChangesAsync(ct) for each active
+    DbApi->>Ctx: DbContext.SaveChangesAsync(ct)
+    Ctx-->>DbApi: int affected
+    loop while events queued
+        Uow->>Pub: PublishLocalEventsAsync(records)
+        Pub->>LBus: TriggerHandlersAsync(...)
+        Uow->>Pub: PublishDistributedEventsAsync(records)
+        Pub->>DBus: PublishAsync(...) (or outbox)
+        Uow->>DbApi: SaveChangesAsync(ct) (handlers may dirty entities)
+        DbApi->>Ctx: DbContext.SaveChangesAsync(ct)
+    end
+    Uow->>Tx: CommitAsync(ct) for each transaction
+    Tx-->>Uow: ok
+    Uow->>Uow: IsCompleted = true; OnCompletedAsync()
+    Uow-->>Caller: void
+```
+
+## DatabaseApi & TransactionApi
+
+`IDatabaseApi` (in `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/IDatabaseApi.cs`) is a marker. Concrete implementations like `EfCoreDatabaseApi` (in `framework/src/Volo.Abp.EntityFrameworkCore/Volo/Abp/EntityFrameworkCore/EfCoreDatabaseApi.cs`) hold a `DbContext` reference. `ITransactionApi` (in `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/ITransactionApi.cs`) declares `CommitAsync`, `RollbackAsync`, and `Dispose` — EF implements it as `EfCoreTransactionApi` wrapping `IDbContextTransaction`.
+
+When a repository accesses the database for the first time inside a UoW, it calls `UnitOfWork.GetOrAddDatabaseApi(key, factory)` (top of `UnitOfWork.cs`) where `key` typically is `"EfCore_" + dbContext type FullName`. The factory opens the DbContext and, if `Options.IsTransactional`, begins a DB transaction and adds an `EfCoreTransactionApi` via `AddTransactionApi`. From then on, every read/write through that key sees the same DbContext and transaction.
+
+`UnitOfWork.AddDatabaseApi` throws `AbpException("This unit of work already contains a database API for the given key.")` if you double-register — the registration is meant to be idempotent through `GetOrAddDatabaseApi`.
+
+## SaveChanges Within CompleteAsync
+
+The crucial subtlety: `SaveChangesAsync` is called *before* event publishing, then again *after* every event-publishing round, then `CommitTransactionsAsync` runs. So domain events fired during your handler execute in the *same* DbContext session and (if transactional) the *same* transaction — they can call `Update`/`Insert` and their changes will commit atomically with the originating work.
+
+`UnitOfWork.SaveChangesAsync` (lines 102-116 of `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWork.cs`):
+
+```csharp
+public virtual async Task SaveChangesAsync(CancellationToken cancellationToken = default)
+{
+    if (_isRolledback) return;
+    foreach (var databaseApi in GetAllActiveDatabaseApis())
+    {
+        if (databaseApi is ISupportsSavingChanges supportsSavingChangesDatabaseApi)
+        {
+            await supportsSavingChangesDatabaseApi.SaveChangesAsync(cancellationToken);
+        }
+    }
+}
+```
+
+`ISupportsSavingChanges` (in `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/ISupportsSavingChanges.cs`) is the EF/Mongo opt-in. The MongoDB implementation flushes the session; the EF one calls `DbContext.SaveChangesAsync`.
+
+## Rollback Path
+
+`UnitOfWork.RollbackAsync` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWork.cs`) sets `_isRolledback = true` and calls `RollbackAllAsync`, which iterates `GetAllActiveDatabaseApis()` looking for `ISupportsRollback` (calling `RollbackAsync(cancellationToken)` on each) and then iterates `GetAllActiveTransactionApis()` doing the same. Each call is wrapped in `try {} catch {}` so a partial-rollback failure does not mask the original exception.
+
+`Dispose()` (line 319 of the same file) is the last line of defense:
+
+```csharp
+public virtual void Dispose()
+{
+    if (IsDisposed) return;
+    IsDisposed = true;
+    DisposeTransactions();             // foreach transactionApi: try { transactionApi.Dispose(); } catch {}
+    if (!IsCompleted || _exception != null)
+        OnFailed();                    // raises UnitOfWorkFailedEventArgs
+    OnDisposed();                      // raises UnitOfWorkEventArgs
+}
+```
+
+So even if you forget `CompleteAsync()`, exiting the `using` block disposes transactions (which rolls them back at the DB level) and fires `Failed`. Repositories observing `Failed` can clean up caches.
+
+## Event Publishing Inside UoW
+
+`UnitOfWork.AddOrReplaceLocalEvent` and `AddOrReplaceDistributedEvent` (lines 256-268 of `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWork.cs`) are how `LocalEventBus.PublishAsync(..., onUnitOfWorkComplete: true)` and `DistributedEventBus.PublishAsync` queue events instead of firing them immediately. `EventOrderGenerator` (`framework/src/Volo.Abp.Uow/Volo/Abp/Uow/EventOrderGenerator.cs`) stamps a monotonic `EventOrder` on each record so handlers run in publish order even across nested calls.
+
+`GetEventsRecords` then materializes the list, honoring the optional `replacementSelector` — useful for "update the latest write-event for this aggregate instead of queueing a second one", a pattern domain entities use to dedupe events per aggregate.
+
+<Warning>
+The drain loop in `CompleteAsync` is unbounded. If a handler keeps adding new events that re-add work to the same UoW, you spin forever. Audit your `OnCompleted` callbacks and event handlers for unbounded recursion. Use `requiresNew: true` when spawning a sub-UoW that should not feed back into the outer event queue.
+</Warning>
+
+## Dispose Order
+
+The outer `using` of the middleware/filter triggers `IUnitOfWork.Dispose()`. The dispose order is:
+
+1. `DisposeTransactions()` — disposes each `ITransactionApi`. EF closes the `IDbContextTransaction`.
+2. `OnFailed` if not completed cleanly — listeners see `UnitOfWorkFailedEventArgs(this, _exception, _isRolledback)`.
+3. `OnDisposed` — always fires; consumers use it to free per-UoW caches.
+
+DbContext disposal itself is handled by the DI scope that owns it — the UoW does not call `dbContext.Dispose()` directly. The scope (a `Microsoft.Extensions.DependencyInjection.IServiceScope`) is the one created by `UnitOfWorkInterceptor` via `_serviceScopeFactory.CreateScope()`, or by ASP.NET Core's per-request scope.
+
+## A Concrete EF Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Svc as IBookAppService
+    participant Repo as IRepository<Book>
+    participant DCP as IDbContextProvider<BookDbContext>
+    participant Mgr as IUnitOfWorkManager
+    participant Uow as UnitOfWork
+    participant DbApi as EfCoreDatabaseApi
+    participant Ctx as BookDbContext
+    participant Tx as IDbContextTransaction
+    Svc->>Repo: await InsertAsync(book, autoSave:false)
+    Repo->>DCP: GetDbContextAsync()
+    DCP->>Mgr: Current (ambient)
+    DCP->>Uow: GetOrAddDatabaseApi("EfCore_BookDbContext", factory)
+    Uow->>Ctx: create BookDbContext via scope
+    Uow->>Tx: BeginTransactionAsync (if IsTransactional)
+    Uow->>Uow: AddTransactionApi("EfCore_BookDbContext", EfCoreTransactionApi)
+    Repo->>Ctx: Books.Add(book) (entity tracked)
+    Note over Svc,Ctx: action returns; filter calls SaveChangesAsync
+    Mgr->>Uow: CompleteAsync(ct)
+    Uow->>DbApi: SaveChangesAsync(ct)
+    DbApi->>Ctx: SaveChangesAsync(ct)
+    Ctx-->>DbApi: 1 row
+    Uow->>Uow: drain event boxes; SaveChanges again
+    Uow->>Tx: CommitAsync(ct)
+    Uow->>Uow: IsCompleted = true
+    Uow->>Uow: Dispose (Tx.Dispose, OnDisposed fires)
+```
+
+## What `IsTransactional` Toggles
+
+`AbpUnitOfWorkOptions.IsTransactional` (in `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/AbpUnitOfWorkOptions.cs`) decides whether `UnitOfWork.Initialize` opens a database transaction. When false, each `SaveChangesAsync` auto-commits per call — appropriate for read-mostly endpoints where you don't need ACID over multiple statements. The default behavior provider, `AspNetCoreUnitOfWorkTransactionBehaviourProvider` (in `framework/src/Volo.Abp.AspNetCore/Volo/Abp/AspNetCore/Uow/AspNetCoreUnitOfWorkTransactionBehaviourProvider.cs`), reads the current HTTP method: GET → non-transactional, everything else → transactional.
+
+For non-MVC entry points the fallback `IsTransactional` value derives from the method-name heuristic in `UnitOfWorkInterceptor.CreateOptions`: `!invocation.Method.Name.StartsWith("Get", StringComparison.InvariantCultureIgnoreCase)`.
+
+<Tip>
+Override `IUnitOfWorkTransactionBehaviourProvider` to encode your own policy (e.g. "always transactional for service `OrderAppService`"). The interceptor will pick it up because it is resolved per-scope.
+</Tip>
+
+## Failure Modes
+
+<AccordionGroup>
+  <Accordion title="AbpException 'Completion has already been requested for this unit of work.'">
+    Thrown by `PreventMultipleComplete()` (line 350 area of `framework/src/Volo.Abp.Uow/Volo/Abp/Uow/UnitOfWork.cs`). Usually means both the middleware and the filter tried to `CompleteAsync` independently — typically because the reservation handshake failed and the filter began its own UoW. Audit the request's path.
+  </Accordion>
+  <Accordion title="AbpException 'This unit of work already contains a database API for the given key.'">
+    Thrown by `AddDatabaseApi` when a custom integration calls `AddDatabaseApi` twice for the same key. Use `GetOrAddDatabaseApi(key, factory)` instead.
+  </Accordion>
+  <Accordion title="Repository returns stale data after a write in the same request">
+    Likely you read *before* `SaveChangesAsync` flushed (e.g. queried via a different DbContext key). Call `await CurrentUnitOfWork.SaveChangesAsync()` between the write and the dependent read, or ensure both repositories resolve to the same `IDbContext`.
+  </Accordion>
+  <Accordion title="Event handler changes not persisted">
+    Make sure the event was queued with `onUnitOfWorkComplete: true` (default). Direct `await PublishAsync(..., onUnitOfWorkComplete: false)` runs the handler outside the drain loop — its DbContext changes are flushed but the *outer* transaction may not yet have committed when an external observer reads.
+  </Accordion>
+</AccordionGroup>
+
+UoW in ABP Framework is best understood as a *queue of intents* (entity tracker + event records) drained at completion time. The middleware reserves the queue, action filters bind to it, repositories write to it, event handlers add to it, and the final `CompleteAsync` walks the drain loop, commits transactions, and disposes resources.

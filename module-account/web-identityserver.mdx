@@ -1,0 +1,316 @@
+---
+title: "Account Web for IdentityServer4: Login, Logout & Consent"
+sidebarTitle: "IdentityServer Host"
+description: "Inside Volo.Abp.Account.Web.IdentityServer: IdentityServerSupportedLoginModel, IdentityServerSupportedLogoutModel, the Consent page, the Error controller."
+---
+
+`modules/account/src/Volo.Abp.Account.Web.IdentityServer/` is the host package that adapts the shared Razor Pages from `Volo.Abp.Account.Web` to an IdentityServer4-based authority. It is the older sibling of `Volo.Abp.Account.Web.OpenIddict` and ships a slightly richer surface because IdentityServer4 requires hosts to render their own consent UI and provide an error page that uses `IIdentityServerInteractionService.GetErrorContextAsync`.
+
+## Module wiring
+
+`Volo.Abp.Account.Web.IdentityServer/AbpAccountWebIdentityServerModule.cs`:
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountWebModule),
+    typeof(AbpIdentityServerDomainModule)
+    )]
+public class AbpAccountWebIdentityServerModule : AbpModule
+{
+    public override void PreConfigureServices(ServiceConfigurationContext context)
+    {
+        context.Services.PreConfigure<AbpIdentityAspNetCoreOptions>(options =>
+        {
+            options.ConfigureAuthentication = false;
+        });
+
+        PreConfigure<IMvcBuilder>(mvcBuilder =>
+        {
+            mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpAccountWebIdentityServerModule).Assembly);
+        });
+    }
+
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpVirtualFileSystemOptions>(options =>
+        {
+            options.FileSets.AddEmbedded<AbpAccountWebIdentityServerModule>();
+        });
+
+        Configure<IdentityServerOptions>(options =>
+        {
+            options.UserInteraction.ConsentUrl = "/Consent";
+            options.UserInteraction.ErrorUrl = "/Account/Error";
+        });
+
+        //TODO: Try to reuse from AbpIdentityAspNetCoreModule
+        context.Services
+            .AddAuthentication(o =>
+            {
+                o.DefaultScheme = IdentityConstants.ApplicationScheme;
+                o.DefaultSignInScheme = IdentityConstants.ExternalScheme;
+            })
+            .AddIdentityCookies();
+    }
+}
+```
+
+Two crucial differences from the OpenIddict host:
+
+1. **`ConfigureAuthentication = false`** disables the default authentication wiring from `AbpIdentityAspNetCoreModule`. The IdentityServer host needs full control over the cookie schemes because `AddIdentityCookies()` from `Microsoft.AspNetCore.Identity` is the right primitive when IdentityServer4 is in front.
+2. **`IdentityServerOptions.UserInteraction`** points consent and error redirects at `/Consent` and `/Account/Error` — the two URLs implemented by this package.
+
+The module depends on `AbpIdentityServerDomainModule` (which lives in `framework/src/Volo.Abp.IdentityServer.Domain/`) — that module is what brings in IdentityServer4 itself.
+
+## `IdentityServerSupportedLoginModel`
+
+`Volo.Abp.Account.Web.IdentityServer/Pages/Account/IdentityServerSupportedLoginModel.cs` replaces the shared `LoginModel`:
+
+```csharp
+[ExposeServices(typeof(LoginModel))]
+public class IdentityServerSupportedLoginModel : LoginModel
+{
+    protected IIdentityServerInteractionService Interaction { get; }
+    protected IClientStore ClientStore { get; }
+    protected IEventService IdentityServerEvents { get; }
+
+    public IdentityServerSupportedLoginModel(
+        IAuthenticationSchemeProvider schemeProvider,
+        IOptions<AbpAccountOptions> accountOptions,
+        IOptions<IdentityOptions> identityOptions,
+        IdentityDynamicClaimsPrincipalContributorCache identityDynamicClaimsPrincipalContributorCache,
+        IIdentityServerInteractionService interaction,
+        IClientStore clientStore,
+        IEventService identityServerEvents,
+        IWebHostEnvironment webHostEnvironment)
+        : base(schemeProvider, accountOptions, identityOptions,
+               identityDynamicClaimsPrincipalContributorCache, webHostEnvironment)
+    {
+        Interaction = interaction;
+        ClientStore = clientStore;
+        IdentityServerEvents = identityServerEvents;
+    }
+    // ...
+}
+```
+
+### `OnGetAsync`
+
+The override mirrors the OpenIddict host but uses IdentityServer's interaction service:
+
+```csharp
+public override async Task<IActionResult> OnGetAsync()
+{
+    LoginInput = new LoginInputModel();
+
+    var context = await Interaction.GetAuthorizationContextAsync(ReturnUrl);
+
+    if (context != null)
+    {
+        LoginInput.UserNameOrEmailAddress = context.LoginHint;
+
+        var tenant = context.Parameters[TenantResolverConsts.DefaultTenantKey];
+        if (!string.IsNullOrEmpty(tenant))
+        {
+            CurrentTenant.Change(Guid.Parse(tenant));
+            Response.Cookies.Append(TenantResolverConsts.DefaultTenantKey, tenant);
+        }
+    }
+    // ... base.OnGetAsync()
+}
+```
+
+`Interaction.GetAuthorizationContextAsync(ReturnUrl)` is the IdentityServer4 helper that parses the `ReturnUrl` of an unauthenticated request and returns the original authorize request along with the matched client. If `context` is null, the page was hit directly (not through the OIDC flow), and the rest of the page renders normally.
+
+### `OnPostAsync`
+
+The post handler adds the IdentityServer client-id to the security log and raises a `UserLoginSuccessEvent` on the IdentityServer event bus so analytics tools that subscribe to IdentityServer events see the login:
+
+```csharp
+await IdentitySecurityLogManager.SaveAsync(new IdentitySecurityLogContext()
+{
+    Identity = IdentitySecurityLogIdentityConsts.Identity,
+    Action = result.ToIdentitySecurityLogAction(),
+    UserName = LoginInput.UserNameOrEmailAddress,
+    ClientId = context?.Client?.ClientId
+});
+
+// ... after a successful sign-in:
+await IdentityServerEvents.RaiseAsync(new UserLoginSuccessEvent(
+    user.UserName, user.Id.ToString(), user.UserName));
+
+await IdentityDynamicClaimsPrincipalContributorCache.ClearAsync(user.Id, user.TenantId);
+return await RedirectSafelyAsync(ReturnUrl, ReturnUrlHash);
+```
+
+Everything else — the alerts for `IsLockedOut`/`IsNotAllowed`, the `InvalidUserNameOrPassword` fallback — comes from the base class.
+
+### Windows authentication
+
+The IdentityServer host carries the **same** `ProcessWindowsLoginAsync` implementation as the OpenIddict host. Both override `OnPostExternalLogin` to branch on `AccountOptions.WindowsAuthenticationSchemeName`. The duplication is intentional: the two host packages must not depend on each other.
+
+## `IdentityServerSupportedLogoutModel`
+
+`Volo.Abp.Account.Web.IdentityServer/Pages/Account/IdentityServerSupportedLogoutModel.cs` replaces `LogoutModel` and handles IdentityServer's federated-sign-out flow:
+
+```csharp
+[ExposeServices(typeof(LogoutModel))]
+public class IdentityServerSupportedLogoutModel : LogoutModel
+{
+    protected IIdentityServerInteractionService Interaction { get; }
+
+    public async override Task<IActionResult> OnGetAsync()
+    {
+        await SignInManager.SignOutAsync();
+
+        var logoutId = Request.Query["logoutId"].ToString();
+
+        if (!string.IsNullOrEmpty(logoutId))
+        {
+            var logoutContext = await Interaction.GetLogoutContextAsync(logoutId);
+
+            await SaveSecurityLogAsync(logoutContext?.ClientId);
+
+            await SignInManager.SignOutAsync();
+
+            HttpContext.User = new ClaimsPrincipal(new ClaimsIdentity());
+
+            var vm = new LoggedOutModel()
+            {
+                PostLogoutRedirectUri = logoutContext?.PostLogoutRedirectUri,
+                ClientName = logoutContext?.ClientName,
+                SignOutIframeUrl = logoutContext?.SignOutIFrameUrl
+            };
+
+            Logger.LogInformation($"Redirecting to LoggedOut Page...");
+
+            return RedirectToPage("./LoggedOut", vm);
+        }
+
+        await SaveSecurityLogAsync();
+
+        if (ReturnUrl != null)
+        {
+            return LocalRedirect(ReturnUrl);
+        }
+
+        return RedirectToPage("/Account/Login");
+    }
+
+    protected virtual async Task SaveSecurityLogAsync(string clientId = null)
+    {
+        if (CurrentUser.IsAuthenticated)
+        {
+            await IdentitySecurityLogManager.SaveAsync(new IdentitySecurityLogContext()
+            {
+                Identity = IdentitySecurityLogIdentityConsts.Identity,
+                Action = IdentitySecurityLogActionConsts.Logout,
+                ClientId = clientId
+            });
+        }
+    }
+}
+```
+
+The dance is:
+
+1. Sign out of the local cookie scheme via `SignInManager.SignOutAsync()`.
+2. If a `logoutId` was carried (this happens when a client app initiates federated sign-out by hitting `/connect/endsession`), look up the matching `LogoutContext` via IdentityServer's interaction service.
+3. Sign out *again* — the second call clears the ApplicationScheme cookie after the externally-issued claims principal is gone.
+4. Reset `HttpContext.User` to an unauthenticated principal so any downstream middleware sees the user as logged out.
+5. Forward the `PostLogoutRedirectUri`, `ClientName`, and `SignOutIFrameUrl` to `LoggedOut.cshtml`, which renders the iframe-based back-channel signout pixels for federated clients.
+
+## `Consent.cshtml`
+
+`Volo.Abp.Account.Web.IdentityServer/Pages/Consent.cshtml.cs` is the consent UI that IdentityServer4 redirects to whenever a client requests a scope the user has not yet allowed. The model carries:
+
+- `ReturnUrl` — the original authorize URL.
+- `ConsentInputModel` — with `IdentityScopes`, `ApiScopes`, `UserDecision`, and `RememberConsent`.
+- `ClientInfoModel` — derived from the matched `Client` (`ClientName`, `ClientLogoUrl`, `ClientUrl`).
+
+`OnGet` walks the validated resources via `_interaction.GetAuthorizationContextAsync(ReturnUrl)`, looks up the `Client` and the requested `IdentityResource`/`ApiResource`/`ApiScope` instances from the `IClientStore` and `IResourceStore`, and translates them into a flat list of `ScopeViewModel` rows:
+
+```csharp
+var request = await _interaction.GetAuthorizationContextAsync(ReturnUrl);
+if (request == null)
+    throw new ApplicationException($"No consent request matching request: {ReturnUrl}");
+
+var client = await _clientStore.FindEnabledClientByIdAsync(request.Client.ClientId);
+var resources = await _resourceStore.FindEnabledResourcesByScopeAsync(request.ValidatedResources.RawScopeValues);
+// ...
+ConsentInput = new ConsentInputModel
+{
+    RememberConsent = true,
+    IdentityScopes = resources.IdentityResources.Select(x => CreateScopeViewModel(x, true)).ToList(),
+};
+```
+
+API scopes from `request.ValidatedResources.ParsedScopes` are mapped through `FindApiScope(parsedScope.ParsedName)` so the UI shows the right display name for parameterized scopes. If the requested scopes include `offline_access`, an extra "remember me / refresh token" row is appended via `GetOfflineAccessScope(true)`.
+
+`OnPost` accepts the user's decision (`"yes"` / `"no"`) and posts back a `ConsentResponse`:
+
+```csharp
+ConsentResponse grantedConsent;
+if (ConsentInput.UserDecision == "no")
+{
+    grantedConsent = new ConsentResponse { Error = AuthorizationError.AccessDenied };
+}
+else
+{
+    grantedConsent = new ConsentResponse
+    {
+        RememberConsent = ConsentInput.RememberConsent,
+        ScopesValuesConsented = ConsentInput.GetAllowedScopeNames()
+    };
+}
+
+await _interaction.GrantConsentAsync(request, grantedConsent);
+```
+
+After the grant, `result.IsRedirect` will be true and the page returns `Redirect(result.RedirectUri)` to bounce the user back into the authorize endpoint, which now completes with the (possibly newly-consented) scopes. The file carries a `//TODO: Move this into the Account folder!!!` comment — the page currently lives at `Pages/Consent.cshtml` instead of `Pages/Account/Consent.cshtml`, matching the `ConsentUrl = "/Consent"` configuration.
+
+## `ErrorController`
+
+`Volo.Abp.Account.Web.IdentityServer/Areas/Account/Controllers/ErrorController.cs` is registered at `/Account/Error` (because of `IdentityServerOptions.UserInteraction.ErrorUrl = "/Account/Error"`). Its job is to translate an IdentityServer `errorId` into a user-friendly page:
+
+```csharp
+public virtual async Task<IActionResult> Index(string errorId)
+{
+    var errorMessage = await _interaction.GetErrorContextAsync(errorId) ?? new ErrorMessage
+    {
+        Error = L["Error"]
+    };
+
+    if (!_environment.IsDevelopment())
+    {
+        errorMessage.ErrorDescription = null;
+    }
+
+    const int statusCode = (int)HttpStatusCode.InternalServerError;
+
+    return View(GetErrorPageUrl(statusCode), new AbpErrorViewModel
+    {
+        ErrorInfo = new RemoteServiceErrorInfo(errorMessage.Error, errorMessage.ErrorDescription),
+        HttpStatusCode = statusCode
+    });
+}
+```
+
+`GetErrorPageUrl(500)` looks up the page from `AbpErrorPageOptions.ErrorViewUrls["500"]`; if nothing is configured, the fallback is `~/Views/Error/Default.cshtml` (a view that the theme-shared module always provides). `errorMessage.ErrorDescription` is hidden outside `IsDevelopment()` to avoid leaking IdentityServer internals.
+
+## `AbpIdentityServerAuthorizeInteractionResponseGenerator` and `AbpClaimsService`
+
+The two classes mentioned in some older ABP guides — `AbpIdentityServerAuthorizeInteractionResponseGenerator` and `AbpClaimsService` — do **not** live in this Account package. Both are part of `framework/src/Volo.Abp.IdentityServer/` and are wired in by `AbpIdentityServerDomainModule`, which `AbpAccountWebIdentityServerModule` depends on. They are mentioned here because they cooperate with this package's login flow:
+
+- `AbpIdentityServerAuthorizeInteractionResponseGenerator` decides whether the user must consent or can be silently signed in.
+- `AbpClaimsService` is what IdentityServer4 calls when building the access/identity token; it bridges to ABP's `AbpClaimsPrincipalFactory` so dynamic ABP claims are included.
+
+The Account host package itself does not redefine them — it only contributes the page-model layer.
+
+## What this package does *not* ship
+
+There is no `AccountControllerIdentityServer` in this package. The cookie-based `AccountController` used by AJAX logins lives in `Volo.Abp.Account.Web/Areas/Account/Controllers/AccountController.cs` and is shared. The IdentityServer host adds only the consent page, the error controller, the two replaced page models, and an empty `_ViewImports.cshtml` under `Pages/` (used purely to set the namespace for compiled pages).
+
+<Warning>
+The IdentityServer4 stack is in long-term-support mode. ABP's templates default to OpenIddict for new projects since v6.0. This package remains supported, but its `Consent.cshtml` and `ErrorController` are functionally tied to IdentityServer4 — they cannot be used with OpenIddict and vice versa.
+</Warning>

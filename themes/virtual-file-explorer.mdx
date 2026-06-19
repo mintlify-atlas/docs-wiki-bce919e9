@@ -1,0 +1,323 @@
+---
+title: "Virtual File Explorer: Browsing Embedded Module Assets"
+sidebarTitle: "Virtual File Explorer"
+description: "ABP Framework Virtual File Explorer module: the Razor Pages UI that walks IVirtualFileProvider trees and renders embedded resources with permission gating."
+---
+
+The Virtual File Explorer is an ABP Framework administrative tool that surfaces the contents of `IVirtualFileProvider` — the layered embedded-resource filesystem that every ABP module contributes to. Without it, debugging "which module shipped this CSS file?" or "is my embedded view actually in the bundle?" requires opening assemblies in a decompiler. With it, you navigate the merged virtual tree from a Razor page at `/VirtualFileExplorer`.
+
+The module lives under `modules/virtual-file-explorer/src/` and ships as three projects: `Volo.Abp.VirtualFileExplorer.Contracts` (permissions + localization), `Volo.Abp.VirtualFileExplorer.Web` (the actual Razor Pages UI and options), and `Volo.Abp.VirtualFileExplorer.Installer` (an empty installer marker).
+
+## Project layout
+
+<CardGroup cols={3}>
+  <Card title="Contracts" icon="file-contract">
+    `modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Contracts/` — permission definitions and the `VirtualFileExplorerResource` localization key.
+  </Card>
+  <Card title="Web" icon="globe">
+    `modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/` — `AbpVirtualFileExplorerWebModule`, the `/VirtualFileExplorer` Razor Pages, view models, bundle extensions, menu contributor.
+  </Card>
+  <Card title="Installer" icon="box">
+    `modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Installer/` — empty installer used by ABP Suite.
+  </Card>
+</CardGroup>
+
+## `AbpVirtualFileExplorerWebModule`
+
+The entry point lives at `modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/AbpVirtualFileExplorerWebModule.cs`. It declares three module dependencies — `AbpAspNetCoreMvcUiBootstrapModule`, `AbpAspNetCoreMvcUiThemeSharedModule`, `AbpVirtualFileExplorerContractsModule` — and registers itself as an MVC application part in `PreConfigureServices`:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/AbpVirtualFileExplorerWebModule.cs
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    PreConfigure<IMvcBuilder>(mvcBuilder =>
+    {
+        mvcBuilder.AddApplicationPartIfNotExists(typeof(AbpVirtualFileExplorerWebModule).Assembly);
+    });
+}
+```
+
+The interesting part is the `ConfigureServices` body. The module short-circuits its entire registration when `AbpVirtualFileExplorerOptions.IsEnabled` is false — a deliberate kill switch so production hosts can keep the package referenced (for transitive dependencies) without exposing the explorer UI:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/AbpVirtualFileExplorerWebModule.cs
+var virtualFileExplorerOptions = context.Services
+    .ExecutePreConfiguredActions<AbpVirtualFileExplorerOptions>();
+
+if (virtualFileExplorerOptions.IsEnabled)
+{
+    Configure<AbpNavigationOptions>(options =>
+    {
+        options.MenuContributors.Add(new VirtualFileExplorerMenuContributor());
+    });
+
+    Configure<AbpVirtualFileSystemOptions>(options =>
+    {
+        options.FileSets.AddEmbedded<AbpVirtualFileExplorerWebModule>(
+            "Volo.Abp.VirtualFileExplorer.Web");
+    });
+
+    Configure<AbpBundleContributorOptions>(options =>
+    {
+        options.Extensions<PrismjsStyleBundleContributor>()
+               .Add<PrismjsStyleBundleContributorDocsExtension>();
+        options.Extensions<PrismjsScriptBundleContributor>()
+               .Add<PrismjsScriptBundleContributorDocsExtension>();
+    });
+}
+```
+
+Three things land here when the explorer is enabled:
+
+1. **Menu contributor** — `VirtualFileExplorerMenuContributor` is added so the side menu picks up a "Virtual File Explorer" entry.
+2. **Virtual files** — the module's own Razor Pages, CSS, and JS get embedded under the logical name `Volo.Abp.VirtualFileExplorer.Web`, which is exactly what the explorer itself will be able to enumerate when you browse `/Volo.Abp.VirtualFileExplorer.Web`.
+3. **Prism.js bundle extensions** — `PrismjsStyleBundleContributorDocsExtension` and `PrismjsScriptBundleContributorDocsExtension` (under `Volo.Abp.VirtualFileExplorer.Web/Bundling/`) add the docs-language definitions needed to syntax-highlight the file content modal.
+
+## `AbpVirtualFileExplorerOptions`
+
+The options class at `modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/AbpVirtualFileExplorerOptions.cs` is intentionally tiny:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/AbpVirtualFileExplorerOptions.cs
+public class AbpVirtualFileExplorerOptions
+{
+    /// <summary>
+    /// Default: true.
+    /// </summary>
+    public bool IsEnabled { get; set; } = true;
+}
+```
+
+Because the module reads it via `ExecutePreConfiguredActions<AbpVirtualFileExplorerOptions>()`, the only valid place to flip the switch is `PreConfigureServices` in a host or another depending module:
+
+```csharp
+public override void PreConfigureServices(ServiceConfigurationContext context)
+{
+    PreConfigure<AbpVirtualFileExplorerOptions>(options =>
+    {
+        options.IsEnabled = false; // keep package referenced, hide the UI
+    });
+}
+```
+
+<Warning>
+`ExecutePreConfiguredActions` runs the pre-configure delegates *eagerly* and once. Setting `IsEnabled = false` in a regular `ConfigureServices` callback is too late — the module's own `ConfigureServices` has already decided to skip registration based on the value read from `ExecutePreConfiguredActions`.
+</Warning>
+
+## Permissions: `VirtualFileExplorerPermissions`
+
+The explorer is admin-only. Permissions live in `modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Contracts/Volo/Abp/VirtualFileExplorer/VirtualFileExplorerPermissions.cs`:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Contracts/Volo/Abp/VirtualFileExplorer/VirtualFileExplorerPermissions.cs
+public static class VirtualFileExplorerPermissions
+{
+    public const string GroupName = "AbpVirtualFileExplorer";
+    public const string View = GroupName + ".View";
+
+    public static string[] GetAll()
+        => ReflectionHelper.GetPublicConstantsRecursively(typeof(VirtualFileExplorerPermissions));
+}
+```
+
+The single permission `AbpVirtualFileExplorer.View` is registered by `AbpVirtualFileExplorerPermissionDefinitionProvider` (same folder) and is enforced at three places: the menu contributor (so users without it never see the menu link), the `IndexModel` page model, and the `FileContentModal` page model.
+
+## Menu contribution
+
+`modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/Navigation/VirtualFileExplorerMenuContributor.cs` only contributes to the standard main menu and is permission-gated:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/Navigation/VirtualFileExplorerMenuContributor.cs
+if (context.Menu.Name != StandardMenus.Main) return Task.CompletedTask;
+
+context.Menu.Items.Add(new ApplicationMenuItem(
+        VirtualFileExplorerMenuNames.Index,
+        l["Menu:VirtualFileExplorer"],
+        icon: "fa fa-file",
+        url: "~/VirtualFileExplorer")
+    .RequirePermissions(VirtualFileExplorerPermissions.View));
+```
+
+`VirtualFileExplorerMenuNames` (sibling file) is the constants holder for the menu item name; the URL `~/VirtualFileExplorer` is the implicit Razor Pages route for `/Pages/VirtualFileExplorer/Index.cshtml`.
+
+## The `/VirtualFileExplorer` endpoint
+
+There is no controller in this module — the explorer is a pair of Razor Pages. The endpoint is `Pages/VirtualFileExplorer/Index.cshtml`, backed by `Pages/VirtualFileExplorer/Index.cshtml.cs`. The page model derives from `VirtualFileExplorerPageModel` (a thin base at `Pages/VirtualFileExplorer/VirtualFileExplorerPageModel.cs` that wires the `VirtualFileExplorerResource` localization and the `AbpVirtualFileExplorerWebModule` object-mapper context), and is decorated with `[Authorize(VirtualFileExplorerPermissions.View)]`.
+
+### `IndexModel.OnGet`
+
+The `OnGet` handler accepts three bound query-string properties — `Path`, `CurrentPage`, `PageSize` — defaulting to `/`, `1`, and `10`. It walks the virtual filesystem via the injected `IVirtualFileProvider`:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/Pages/VirtualFileExplorer/Index.cshtml.cs
+var query = VirtualFileProvider.GetDirectoryContents(Path)
+    .Where(d => VirtualFileExplorerConsts.AllowFileInfoTypes.Contains(d.GetType().Name))
+    .OrderByDescending(f => f.IsDirectory).ToList();
+
+PagerModel = new PagerModel(query.Count, PageSize, CurrentPage, PageSize,
+    $"{Url.Content("~/")}VirtualFileExplorer?Path={Path}&PageSize={PageSize}");
+
+SetViewModel(query.Skip((CurrentPage - 1) * PageSize).Take(PageSize));
+SetPathNavigation();
+
+return Page();
+```
+
+### `VirtualFileExplorerConsts.AllowFileInfoTypes`
+
+The filter on `query` is the key safety hatch — only file-info types whose `Type.Name` appears in `VirtualFileExplorerConsts.AllowFileInfoTypes` are surfaced:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/VirtualFileExplorerConsts.cs
+public static readonly string[] AllowFileInfoTypes = {
+    "VirtualDirectoryFileInfo",
+    "EmbeddedResourceFileInfo",
+    "ManifestDirectoryInfo",
+    "ManifestFileInfo"
+};
+```
+
+This whitelist prevents the explorer from accidentally rendering `PhysicalFileInfo` results — which in development would expose the entire host filesystem (every file under `wwwroot`, every appsettings file, etc.). Only ABP-virtual and .NET-embedded entries are walked.
+
+## View-model projection
+
+`Index.cshtml.cs`'s private `SetViewModel(...)` projects each `IFileInfo` to a `FileInfoViewModel` (`modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/Models/FileInfoViewModel.cs`). The view model is the contract the Razor template consumes:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/Models/FileInfoViewModel.cs
+public class FileInfoViewModel
+{
+    public string FilePath { get; set; }
+    public string Icon { get; set; }
+    public string FileType { get; set; }
+    public string Length { get; set; }
+    public string FileName { get; set; }
+    public DateTime LastUpdateTime { get; set; }
+    public bool IsDirectory { get; set; }
+}
+```
+
+Directories get `Icon = "fas fa-folder"`, a synthetic anchor in `FileName` that pre-builds the `?path=` link for navigation, and `Length = "/"`. Files get `Icon = "fas fa-file"`, the raw `Length + " bytes"`, and a `FilePath` that respects `EmbeddedResourceFileInfo.VirtualPath` when available — which is important because embedded resources have a *virtual* path that is shorter than `PhysicalPath` (which is usually null for them).
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/Pages/VirtualFileExplorer/Index.cshtml.cs
+if (fileInfo is EmbeddedResourceFileInfo embeddedResourceFileInfo)
+{
+    fileInfoViewModel.FilePath = embeddedResourceFileInfo.VirtualPath;
+}
+else
+{
+    fileInfoViewModel.FilePath = filePath;
+}
+```
+
+## Breadcrumb path navigation
+
+`SetPathNavigation()` (also in `Pages/VirtualFileExplorer/Index.cshtml.cs`) hand-builds a Bootstrap breadcrumb out of the `/`-split `Path` query parameter — each segment becomes a hyperlink back to its prefix:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/Pages/VirtualFileExplorer/Index.cshtml.cs
+var pathArray = Path.Split('/').Where(p => !p.IsNullOrWhiteSpace());
+var href = $"{Url.Content("~/")}VirtualFileExplorer?path=";
+
+navigationBuild.Append($"<nav aria-label='breadcrumb'>" +
+                       $"<ol class='breadcrumb'>" +
+                       $"<li class='breadcrumb-item'><a href='{href}/'>{L[\"BackToRoot\"]}</a></li>");
+
+foreach (var item in pathArray)
+{
+    href += "/" + item;
+    navigationBuild.Append($"<li class='breadcrumb-item'><a href='{href}'>{item}</a></li>");
+}
+
+navigationBuild.Append("</ol></nav>");
+PathNavigation = navigationBuild.ToString();
+```
+
+The `L["BackToRoot"]` localization key is defined under the `Volo.Abp.VirtualFileExplorer.Localization` resource declared by `modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Contracts/Volo/Abp/VirtualFileExplorer/Localization/VirtualFileExplorerResource.cs`.
+
+## File content modal
+
+Clicking a file in the table opens `Pages/VirtualFileExplorer/FileContentModal.cshtml`, backed by `Pages/VirtualFileExplorer/FileContentModal.cshtml.cs`. The modal also enforces `[Authorize(VirtualFileExplorerPermissions.View)]`:
+
+```csharp
+// modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Web/Pages/VirtualFileExplorer/FileContentModal.cshtml.cs
+[Authorize(VirtualFileExplorerPermissions.View)]
+public class FileContentModal : PageModel
+{
+    [Required, BindProperty(SupportsGet = true)]
+    public string FilePath { get; set; }
+
+    public string Content { get; set; }
+
+    public virtual async Task<IActionResult> OnGetAsync()
+    {
+        var fileInfo = VirtualFileProvider.GetFileInfo(FilePath);
+        if (fileInfo == null || fileInfo.IsDirectory) return NotFound();
+
+        Content = await fileInfo.ReadAsStringAsync();
+        return Page();
+    }
+}
+```
+
+Note the model does *not* validate that `FilePath` is non-null or contains no traversal sequences — that's safe here precisely because `IVirtualFileProvider.GetFileInfo(FilePath)` normalizes the lookup against the virtual filesystem, not the OS disk; the `VirtualFileExplorerConsts.AllowFileInfoTypes` whitelist applied in `IndexModel.OnGet` also gates which paths the user can see in the first place.
+
+The rendered modal pipes `Content` into a `<pre class="line-numbers"><code>` block. The Prism.js bundle extensions registered in `AbpVirtualFileExplorerWebModule.ConfigureServices` (`PrismjsStyleBundleContributorDocsExtension.cs` and `PrismjsScriptBundleContributorDocsExtension.cs` under `Volo.Abp.VirtualFileExplorer.Web/Bundling/`) layer in support for the docs languages (csharp, html, razor, javascript, css, json, xml) that the explorer is most likely to display.
+
+## End-to-end flow
+
+<Steps>
+  <Step title="Menu link">
+    `VirtualFileExplorerMenuContributor` adds the entry `~/VirtualFileExplorer` to `StandardMenus.Main`, but only when `AbpVirtualFileExplorer.View` is granted.
+  </Step>
+  <Step title="GET /VirtualFileExplorer?Path=/">
+    Routes to `IndexModel.OnGet`. The `[Authorize]` attribute re-checks the permission server-side.
+  </Step>
+  <Step title="Directory listing">
+    `VirtualFileProvider.GetDirectoryContents(Path)` is called and filtered by `VirtualFileExplorerConsts.AllowFileInfoTypes`. Folders are ordered first via `OrderByDescending(IsDirectory)`.
+  </Step>
+  <Step title="Pagination">
+    A `Volo.Abp.AspNetCore.Mvc.UI.Bootstrap.TagHelpers.Pagination.PagerModel` is built with `(query.Count, PageSize, CurrentPage, PageSize, baseUrl)` and the page slice is projected into `FileInfoViewModel`s.
+  </Step>
+  <Step title="Click a file">
+    Opens `FileContentModal` as a child page. `IVirtualFileProvider.GetFileInfo(FilePath)` resolves it; `ReadAsStringAsync()` returns its text; Prism.js highlights it client-side.
+  </Step>
+  <Step title="Click a folder">
+    The synthetic `<a href='...VirtualFileExplorer?path={filePath}'>` in `FileName` reloads `Index` with the deeper `Path` query.
+  </Step>
+</Steps>
+
+## How module contributions appear
+
+Because the explorer mounts the same `IVirtualFileProvider` that every other module registers files into via `AbpVirtualFileSystemOptions.FileSets.AddEmbedded<TModule>(prefix)`, the root listing actually shows *every embedded prefix in the running host*. For example, the explorer's own files appear at the prefix `Volo.Abp.VirtualFileExplorer.Web` because of the call in `AbpVirtualFileExplorerWebModule.ConfigureServices`:
+
+```csharp
+options.FileSets.AddEmbedded<AbpVirtualFileExplorerWebModule>(
+    "Volo.Abp.VirtualFileExplorer.Web");
+```
+
+The Account module appears under `Volo.Abp.Account.Web`, the LeptonX theme appears under `Volo.Abp.AspNetCore.Mvc.UI.Theme.LeptonX`, etc. This makes the explorer the cheapest way to verify which embedded files are actually present at runtime — useful when debugging missing partials or stale layout overrides in a multi-module host.
+
+## When to ship it disabled
+
+The recommended posture for production is:
+
+<CardGroup cols={2}>
+  <Card title="Development" icon="hammer">
+    Keep the module referenced and `IsEnabled = true` so engineers can verify which modules contributed which embedded files.
+  </Card>
+  <Card title="Production" icon="lock">
+    Flip `AbpVirtualFileExplorerOptions.IsEnabled = false` in `PreConfigureServices` of the host module, or gate the `AbpVirtualFileExplorer.View` permission to a tiny operator role.
+  </Card>
+</CardGroup>
+
+Disabling via `IsEnabled` is preferable to revoking the permission because it also avoids registering the menu contributor and the bundle contributor extensions — the host module's `ConfigureServices` body is entirely skipped, so there is no surface area to exploit.
+
+## Localization resource
+
+`modules/virtual-file-explorer/src/Volo.Abp.VirtualFileExplorer.Contracts/Volo/Abp/VirtualFileExplorer/Localization/VirtualFileExplorerResource.cs` defines `[LocalizationResourceName("VirtualFileExplorer")]` for the module. Both `IndexModel` (through its `VirtualFileExplorerPageModel` base) and `VirtualFileExplorerMenuContributor` resolve their strings against this resource. The JSON dictionaries themselves live under the Contracts project's `Localization/VirtualFileExplorer/` folder as `en.json`, `tr.json`, and friends, and are embedded by `AbpVirtualFileExplorerContractsModule` (sibling file `AbpVirtualFileExplorerContractsModule.cs`).
+
+## Related: the underlying virtual file system
+
+The explorer is purely a *consumer* of `IVirtualFileProvider`. The provider itself is defined in the framework's `Volo.Abp.VirtualFileSystem` package — *outside* this module. The two file-info subtypes the explorer cares about — `VirtualDirectoryFileInfo` and `EmbeddedResourceFileInfo` — are from the framework's `Volo.Abp.VirtualFileSystem` and `Volo.Abp.VirtualFileSystem.Embedded` namespaces, both `using`-imported at the top of `Index.cshtml.cs`. The two `Manifest*` types come from `Microsoft.Extensions.FileProviders.Embedded` and let the explorer browse files contributed by raw .NET embedded-file providers, not just ABP virtual ones.

@@ -1,0 +1,314 @@
+---
+title: "In-Memory BLOB Provider for Tests and In-Process Caches"
+sidebarTitle: "In-Memory"
+description: "Use the ABP Framework MemoryBlobProvider — a ConcurrentDictionary-backed BLOB store for unit tests, integration tests, and ephemeral caches."
+---
+
+The `Volo.Abp.BlobStoring.Memory` package implements `IBlobProvider` against an in-process `ConcurrentDictionary<string, byte[]>`. There is no disk, no network, no SDK — just a thread-safe dictionary keyed by tenant id, blob name, and container name. The package is intentionally tiny and exists to make integration tests fast and self-contained. Source: `framework/src/Volo.Abp.BlobStoring.Memory/Volo/Abp/BlobStoring/Memory/`.
+
+## Package layout
+
+```
+framework/src/Volo.Abp.BlobStoring.Memory/Volo/Abp/BlobStoring/Memory/
+├── AbpBlobStoringMemoryModule.cs
+├── MemoryBlobContainerConfigurationExtensions.cs
+└── MemoryBlobProvider.cs
+```
+
+That's the entire package — three files. There is no configuration class because there is nothing to configure.
+
+## Module
+
+`AbpBlobStoringMemoryModule.cs` depends on `AbpBlobStoringModule`. The class body is empty; service registration happens automatically through `ITransientDependency` on `MemoryBlobProvider`.
+
+## MemoryBlobProvider
+
+`MemoryBlobProvider.cs` is the implementation:
+
+```csharp
+public class MemoryBlobProvider : BlobProviderBase, ITransientDependency
+{
+    protected ConcurrentDictionary<string, byte[]> MemoryStore { get; }
+
+    protected ICurrentTenant CurrentTenant  { get; }
+
+    public MemoryBlobProvider(ICurrentTenant currentTenant)
+    {
+        MemoryStore = new ConcurrentDictionary<string, byte[]>();
+        CurrentTenant = currentTenant;
+    }
+    ...
+}
+```
+
+The provider is registered as `ITransientDependency`, which is unusual for a service backed by mutable state. The transient lifestyle works here because the `ConcurrentDictionary` is initialized in the constructor and therefore each instance has its own store — so two different test fixtures get independent stores even when they share a `ServiceProvider` scope.
+
+If you want a *shared* in-memory store across the application, replace the registration with a singleton:
+
+```csharp
+context.Services.Replace(ServiceDescriptor.Singleton<MemoryBlobProvider>());
+```
+
+### SaveAsync
+
+```csharp
+public override async Task SaveAsync(BlobProviderSaveArgs args)
+{
+    var cacheKey = GetCacheKey(args);
+
+    using var buffer = new MemoryStream();
+    await args.BlobStream.CopyToAsync(buffer);
+    var bytes = buffer.ToArray();
+
+    if (!args.OverrideExisting)
+    {
+        if (!MemoryStore.TryAdd(cacheKey, bytes))
+        {
+            throw new BlobAlreadyExistsException(
+                $"Saving BLOB '{args.BlobName}' does already exists in the container '{args.ContainerName}'! Set {nameof(args.OverrideExisting)} if it should be overwritten.");
+        }
+    }
+    else
+    {
+        MemoryStore.AddOrUpdate(cacheKey, bytes, (_, __) => bytes);
+    }
+}
+```
+
+Two paths:
+
+- `OverrideExisting == false`: `ConcurrentDictionary.TryAdd` returns `false` if the key was already present; the provider mirrors the contract of the other providers by throwing `BlobAlreadyExistsException`.
+- `OverrideExisting == true`: `AddOrUpdate` replaces the existing entry with the new bytes.
+
+Either way, the input stream is copied into a `MemoryStream` and the resulting byte array stored. The caller's stream is never retained, so disposing it after `SaveAsync` returns is safe.
+
+### Other operations
+
+```csharp
+public override Task<bool> DeleteAsync(BlobProviderDeleteArgs args)
+    => Task.FromResult(MemoryStore.TryRemove(GetCacheKey(args), out _));
+
+public override Task<bool> ExistsAsync(BlobProviderExistsArgs args)
+    => Task.FromResult(MemoryStore.ContainsKey(GetCacheKey(args)));
+
+public override Task<Stream?> GetOrNullAsync(BlobProviderGetArgs args)
+{
+    return MemoryStore.TryGetValue(GetCacheKey(args), out var bytes)
+        ? Task.FromResult<Stream?>(new MemoryStream(bytes, writable: false))
+        : Task.FromResult<Stream?>(null);
+}
+```
+
+`GetOrNullAsync` constructs a read-only `MemoryStream` over the stored byte array — `writable: false` prevents the caller from mutating the canonical bytes through the stream. The same array is reused on every read so successive reads of the same blob don't allocate new byte arrays.
+
+### GetCacheKey
+
+```csharp
+protected virtual string GetCacheKey(BlobProviderArgs args)
+    => $"{CurrentTenant.Id}_{args.BlobName}_{args.ContainerName}";
+```
+
+The composite key encodes:
+
+- `CurrentTenant.Id` — distinct keys per tenant so the multi-tenant contract is honored even in tests.
+- `args.BlobName` — the blob name after naming normalization.
+- `args.ContainerName` — the container name.
+
+The `null` tenant id renders as an empty string between underscores, which is fine because the dictionary uses `string.Equals(StringComparison.Ordinal)` and never mistakes that for a real tenant id.
+
+## MemoryBlobContainerConfigurationExtensions
+
+`MemoryBlobContainerConfigurationExtensions.cs` provides just the fluent `UseMemory` extension:
+
+```csharp
+public static BlobContainerConfiguration UseMemory(this BlobContainerConfiguration containerConfiguration)
+{
+    containerConfiguration.ProviderType = typeof(MemoryBlobProvider);
+    return containerConfiguration;
+}
+```
+
+Note what's missing compared with the other providers:
+
+- No configuration class — there's nothing to configure.
+- No naming normalizer registration — the memory store accepts any string key, so normalization is unnecessary.
+
+## Typical configuration
+
+In a test project:
+
+```csharp
+[DependsOn(
+    typeof(AbpBlobStoringMemoryModule),
+    typeof(MyAppApplicationModule))]
+public class MyAppApplicationTestModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBlobStoringOptions>(options =>
+        {
+            options.Containers.ConfigureAll((containerName, c) => c.UseMemory());
+        });
+    }
+}
+```
+
+The `ConfigureAll` helper (in `framework/src/Volo.Abp.BlobStoring/.../BlobContainerConfigurations.cs`) wires every container — including ones not yet defined — to the memory provider. This makes integration tests immune to "you forgot to configure provider X" failures when modules add new containers.
+
+For a hand-rolled unit test without ABP test infrastructure:
+
+```csharp
+var provider = new MemoryBlobProvider(new MockCurrentTenant());
+await provider.SaveAsync(new BlobProviderSaveArgs("c", new BlobContainerConfiguration(), "k", stream));
+Assert.True((await provider.ExistsAsync(new BlobProviderExistsArgs("c", config, "k"))));
+```
+
+## Flow
+
+```mermaid
+flowchart TD
+    App[Test code] --> Container[BlobContainer<T>]
+    Container --> Norm[BlobNormalizeNamingService]
+    Norm -- "no normalizers registered" --> Pass[passthrough]
+    Pass --> Provider[MemoryBlobProvider]
+    Provider --> Key[GetCacheKey: tid_blob_container]
+    Key --> Store[ConcurrentDictionary]
+    Store --> Bytes[(byte[])]
+```
+
+## Operational notes
+
+<AccordionGroup>
+  <Accordion title="Suitable for tests, unsuitable for prod" icon="flask">
+    The store is wiped when the process restarts and never spans more than one process. Production traffic that needs persistence or cross-instance visibility must use one of the persistent providers — File System, Azure, AWS, etc.
+  </Accordion>
+  <Accordion title="Transient vs singleton" icon="box">
+    The default `ITransientDependency` registration gives each `IBlobProvider` resolution its own dictionary. If you want a shared store across the application (e.g. for short-lived caching), register the provider as a singleton via `Services.Replace`.
+  </Accordion>
+  <Accordion title="Memory pressure" icon="weight-hanging">
+    Every blob is stored as a `byte[]` in the managed heap. Large blobs (multi-megabyte) place them on the Large Object Heap and can cause LOH fragmentation. Avoid storing big blobs in the memory provider even in tests — use small fixtures and verify behavior with the real providers in integration tests instead.
+  </Accordion>
+  <Accordion title="Thread safety" icon="lock">
+    `ConcurrentDictionary` makes all operations thread-safe. Concurrent saves to the same key are serialized; concurrent reads share the same `byte[]` because the returned `MemoryStream` is constructed read-only.
+  </Accordion>
+  <Accordion title="No multi-tenant fence" icon="users">
+    Although the cache key contains the tenant id, there is no enforcement against a misconfigured tenant accessor. As with the other providers, tenant isolation is structural — set `IsMultiTenant = false` only when you understand the consequences.
+  </Accordion>
+</AccordionGroup>
+
+## A walkthrough of the test pattern
+
+When integration tests use the memory provider, the typical fixture initialization looks like:
+
+```csharp
+public class BlobTestFixture : MyAppApplicationTestBase
+{
+    private readonly IBlobContainer _container;
+    public BlobTestFixture() => _container = GetRequiredService<IBlobContainer>();
+
+    [Fact]
+    public async Task Should_Save_And_Read_Back()
+    {
+        await _container.SaveAsync("hello.txt", new MemoryStream(Encoding.UTF8.GetBytes("hi")));
+        var stream = await _container.GetAsync("hello.txt");
+        using var reader = new StreamReader(stream);
+        Assert.Equal("hi", await reader.ReadToEndAsync());
+    }
+}
+```
+
+Because the test module configured `UseMemory()` on every container, no further wiring is needed — `IBlobContainer` resolves to the default container which delegates to `MemoryBlobProvider`. The test runs end-to-end through `BlobContainer`, `BlobNormalizeNamingService`, and `DefaultBlobProviderSelector` without hitting any external resource.
+
+The test pattern naturally exercises the multi-tenant scoping too:
+
+```csharp
+[Fact]
+public async Task Should_Isolate_Tenants()
+{
+    using (CurrentTenant.Change(_tenant1Id))
+        await _container.SaveAsync("a.txt", new MemoryStream(new byte[] { 1 }));
+
+    using (CurrentTenant.Change(_tenant2Id))
+    {
+        Assert.False(await _container.ExistsAsync("a.txt"));
+    }
+}
+```
+
+The two `Change` blocks scope the calls under different tenant ids; the memory provider's `GetCacheKey` composes those into distinct keys, so the second tenant cannot see the first tenant's blob.
+
+## Why not a singleton by default?
+
+The choice to register `MemoryBlobProvider` as transient is deliberate. In integration tests, each `xUnit` test class instance gets its own ABP test host with its own scope; the transient registration ensures one fresh `MemoryStore` per host. If the registration were a singleton, two test classes that happened to share a DI root would see each other's blobs.
+
+The same reasoning applies to running tests in parallel: transient instances stay isolated when the framework spins up multiple hosts in the same process.
+
+For a production-grade "shared in-memory cache" use case — for example, a write-once-read-many session attachment cache that should be visible across requests in a single process — replace the registration explicitly with a singleton:
+
+```csharp
+context.Services.Replace(ServiceDescriptor.Singleton<MemoryBlobProvider>());
+```
+
+The instance is reused for every resolution and the dictionary holds the shared state.
+
+## When the memory provider is unexpectedly useful in production
+
+A small set of production scenarios genuinely benefit from `MemoryBlobProvider`:
+
+<AccordionGroup>
+  <Accordion title="Short-lived request artifacts" icon="hourglass">
+    A web app generates a temporary preview image during a long-running request and reads it back later in the same request. The memory provider avoids touching disk or the network.
+  </Accordion>
+  <Accordion title="Idempotency cache for retried operations" icon="rotate">
+    A worker stores small artifacts under a deterministic key (e.g. `"request-{requestId}-result"`) and discards them after the operation completes successfully. The dictionary's TTL is the process lifetime, which is fine for short-lived workers.
+  </Accordion>
+  <Accordion title="Test-double in dev environments" icon="user-shield">
+    When the real cloud provider is unavailable (no internet, air-gapped dev VM), set `Storage:Provider = "Memory"` in `appsettings.Development.json` and the app starts without any external dependency.
+  </Accordion>
+</AccordionGroup>
+
+For anything where survival across restarts matters, the memory provider is the wrong choice.
+
+## Composing with other providers
+
+In a real ABP application you can configure different containers with different providers. A common shape:
+
+```csharp
+options.Containers.Configure<ReportContainer>(c => c.UseAzure(...));
+options.Containers.Configure<TempContainer>(c => c.UseMemory());
+options.Containers.Configure<AvatarContainer>(c => c.UseFileSystem(fs => fs.BasePath = "/data"));
+```
+
+`IBlobContainer<TempContainer>` resolves through the memory provider, `IBlobContainer<ReportContainer>` through Azure, and `IBlobContainer<AvatarContainer>` through the file system. The dispatch happens inside `DefaultBlobProviderSelector` based on each container's `ProviderType`.
+
+## Avoiding memory leaks
+
+A subtle leak can creep in if you use the memory provider in long-running processes (background daemons, web hosts that never restart). Every `SaveAsync` adds an entry that is only removed by an explicit `DeleteAsync` — there is no automatic eviction. If your code calls `SaveAsync` with monotonically-increasing keys (e.g. `"req-{Guid.NewGuid()}.json"`) without ever deleting, the dictionary grows unbounded.
+
+Mitigations:
+
+- Wrap saves in a `using` that calls `DeleteAsync` on disposal.
+- Periodically iterate `MemoryStore.Keys` from a hosted background service and evict stale entries based on some side-channel metadata.
+- Use a dedicated subclass that wraps `MemoryStore` in a size-bounded LRU cache (e.g. via `Microsoft.Extensions.Caching.Memory.MemoryCache`).
+
+For tests, leaks are irrelevant because the dictionary dies with the test host. For production singleton use, leak-avoidance is a real concern.
+
+## Comparison with IDistributedCache
+
+The memory provider superficially overlaps with `IDistributedCache` (or `IMemoryCache`) — both offer in-process keyed storage. The differences:
+
+| Aspect | `MemoryBlobProvider` | `IMemoryCache` / `IDistributedCache` |
+|---|---|---|
+| Surface | `IBlobContainer` (stream-based) | `Get/Set/Remove` (byte-array-based) |
+| TTL | none | configurable per entry |
+| Tenant scoping | built-in via `GetCacheKey` | manual |
+| Replacement | `byte[]` reference | `byte[]` copy (in-process) |
+| Eviction | none | LRU + TTL |
+
+If you need TTL or LRU eviction, the cache abstractions are a better fit. If you need the `IBlobContainer` API specifically (because the calling code already targets it), the memory provider is the right choice.
+
+## Cross references
+
+- The persistent siblings are documented in [File System](/blob/file-system), [Azure](/blob/azure), [AWS S3](/blob/aws-s3), [Google Cloud](/blob/google-cloud), [Aliyun OSS](/blob/aliyun-oss), [MinIO](/blob/minio), and [Bunny](/blob/bunny).
+- For the abstraction shared by every provider, see [BLOB Core](/blob/core).
+- For a database-backed alternative when running tests against a real DB, see [BLOB Database](/blob/database-module).

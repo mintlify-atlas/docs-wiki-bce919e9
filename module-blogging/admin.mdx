@@ -1,0 +1,245 @@
+---
+title: "Blogging Admin Application: Blog Container Management API"
+sidebarTitle: "Admin"
+description: "Reference for the legacy ABP Framework Blogging admin tier exposing IBlogManagementAppService and the back-office Razor pages for blog containers."
+---
+
+# Blogging Admin Application
+
+The admin tier of the legacy ABP Framework Blogging module is narrow on purpose: it manages **blog containers** (creating, renaming, deleting blogs) and nothing more. Posts inside those blogs are authored and edited by their authors directly through the non-admin `IPostAppService` reachable from the public Razor pages. Source is split across:
+
+<Card title="Blogging admin tier projects" icon="folder">
+- `Volo.Blogging.Admin.Application.Contracts` — `IBlogManagementAppService`, `CreateBlogDto`, `UpdateBlogDto`
+- `Volo.Blogging.Admin.Application` — `BlogManagementAppService` implementation
+- `Volo.Blogging.Admin.HttpApi` / `.HttpApi.Client` — auto-controllers + typed proxies
+- `Volo.Blogging.Admin.Web` — Razor Pages + `BloggingAdminMenuContributor`
+</Card>
+
+<Note>This module is legacy. CMS Kit Blogs offers a much richer admin surface — see [CMS Kit → Admin](/module-cms-kit/admin) for the recommended path.</Note>
+
+```mermaid
+flowchart LR
+    AdminUI[/Blogging/Admin/Blogs] --> HttpApi[Volo.Blogging.Admin.HttpApi]
+    HttpApi --> Svc[BlogManagementAppService]
+    Svc --> BlogRepo[(IBlogRepository)]
+    Svc --> PostsCache[(IDistributedCache<List<PostCacheItem>>)]
+```
+
+## IBlogManagementAppService
+
+`IBlogManagementAppService` (`modules/blogging/src/Volo.Blogging.Admin.Application.Contracts/Volo/Blogging/Admin/Blogs/IBlogManagementAppService.cs`):
+
+```csharp
+public interface IBlogManagementAppService : IApplicationService
+{
+    Task<ListResultDto<BlogDto>> GetListAsync();
+    Task<BlogDto> GetAsync(Guid id);
+    Task<BlogDto> CreateAsync(CreateBlogDto input);
+    Task<BlogDto> UpdateAsync(Guid id, UpdateBlogDto input);
+    Task DeleteAsync(Guid id);
+    Task ClearCacheAsync(Guid id);
+}
+```
+
+`BlogDto` is shared with the reader API and is declared in `Volo.Blogging.Application.Contracts/Volo/Blogging/Blogs/Dtos/BlogDto.cs`. `CreateBlogDto` carries `Name`, `ShortName`, and optional `Description`; `UpdateBlogDto` adds `ConcurrencyStamp` and implements `IHasConcurrencyStamp` so concurrent updates are detected by the persistence layer.
+
+## BlogManagementAppService
+
+`BlogManagementAppService` (`modules/blogging/src/Volo.Blogging.Admin.Application/Volo/Blogging/Admin/Blogs/BlogManagementAppService.cs`) extends `BloggingAdminAppServiceBase`:
+
+```csharp
+public class BlogManagementAppService : BloggingAdminAppServiceBase, IBlogManagementAppService
+{
+    private readonly IBlogRepository _blogRepository;
+    private readonly IDistributedCache<List<PostCacheItem>> _postsCache;
+
+    public BlogManagementAppService(IBlogRepository blogRepository,
+        IDistributedCache<List<PostCacheItem>> postsCache)
+    {
+        _blogRepository = blogRepository;
+        _postsCache = postsCache;
+    }
+
+    public virtual async Task<ListResultDto<BlogDto>> GetListAsync() { /* ... */ }
+
+    [Authorize(BloggingPermissions.Blogs.Create)]
+    public virtual async Task<BlogDto> CreateAsync(CreateBlogDto input)
+    {
+        var newBlog = new Blog(GuidGenerator.Create(), input.Name, input.ShortName)
+        {
+            Description = input.Description
+        };
+        newBlog = await _blogRepository.InsertAsync(newBlog);
+        return ObjectMapper.Map<Blog, BlogDto>(newBlog);
+    }
+    // UpdateAsync, DeleteAsync, ClearCacheAsync ...
+}
+```
+
+Each write endpoint is decorated with the matching ABP permission: `[Authorize(BloggingPermissions.Blogs.Create)]`, `[Authorize(BloggingPermissions.Blogs.Update)]`, `[Authorize(BloggingPermissions.Blogs.Delete)]`. The constants live in `Volo.Blogging.Application.Contracts/Volo/Blogging/BloggingPermissions.cs`.
+
+`ClearCacheAsync(Guid id)` purges the `IDistributedCache<List<PostCacheItem>>` entries scoped to a blog. The same cache is invalidated automatically by `PostCacheInvalidator` (in the Domain layer) on every `PostChangedEvent`, but `ClearCacheAsync` is the manual escape hatch the admin can hit when a deployment goes wrong and a stale cache lingers.
+
+## Permissions
+
+`BloggingPermissions` (`Volo.Blogging.Application.Contracts/Volo/Blogging/BloggingPermissions.cs`):
+
+```csharp
+public class BloggingPermissions
+{
+    public const string GroupName = "Blogging";
+    public static class Blogs
+    {
+        public const string Default    = GroupName + ".Blogs";
+        public const string Management = Default + ".Management";
+        public const string Create     = Default + ".Create";
+        public const string Update     = Default + ".Update";
+        public const string Delete     = Default + ".Delete";
+    }
+    public static class Posts {
+        public const string Default = GroupName + ".Posts";
+        public const string Update  = Default + ".Update";
+        public const string Delete  = Default + ".Delete";
+    }
+    public static class Comments {
+        public const string Default = GroupName + ".Comments";
+        public const string Delete  = Default + ".Delete";
+    }
+}
+```
+
+The `Blogs.Management` permission is the gate for the top-level menu entry; the more specific `Create/Update/Delete` permissions are checked individually inside `BlogManagementAppService`. `BloggingPermissionDefinitionProvider` registers them with the ABP permission system.
+
+## Razor admin pages
+
+`modules/blogging/src/Volo.Blogging.Admin.Web/Pages/Blogging/Admin/Blogs/`:
+
+<Card title="Admin Razor inventory" icon="window-restore">
+- `Index.cshtml(.cs)` — list of blogs with edit / delete buttons
+- `Create.cshtml(.cs)` — create form binding to `CreateBlogDto`
+- `Edit.cshtml(.cs)` — update form binding to `UpdateBlogDto` with the concurrency check
+</Card>
+
+The page models all derive from a base type defined in `Volo.Blogging.Web/Pages/Blogs/BloggingPageModel.cs` (shared with the reader pages) so localization and current-user wiring stays consistent across the surface.
+
+## BloggingAdminMenuContributor
+
+`BloggingAdminMenuContributor` (`modules/blogging/src/Volo.Blogging.Admin.Web/Navigation/BloggingAdminMenuContributor.cs`):
+
+```csharp
+public class BloggingAdminMenuContributor : IMenuContributor
+{
+    public async Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name == StandardMenus.Main)
+            await ConfigureMainMenuAsync(context);
+    }
+
+    private Task ConfigureMainMenuAsync(MenuConfigurationContext context)
+    {
+        var l = context.GetLocalizer<BloggingResource>();
+        var managementRootMenuItem = new ApplicationMenuItem(BloggingAdminMenuNames.GroupName, l["Menu:BlogManagement"])
+            .RequirePermissions(BloggingPermissions.Blogs.Management);
+        managementRootMenuItem.AddItem(new ApplicationMenuItem(BloggingAdminMenuNames.Blogs, l["Menu:Blogs"],
+            "~/Blogging/Admin/Blogs").RequirePermissions(BloggingPermissions.Blogs.Management));
+        context.Menu.GetAdministration().AddItem(managementRootMenuItem);
+        return Task.CompletedTask;
+    }
+}
+```
+
+The contributor adds a single "Blog Management" entry under the standard `Administration` menu group, gated by `BloggingPermissions.Blogs.Management`. `BloggingAdminMenuNames` (`Navigation/BloggingAdminMenuNames.cs`) holds the menu item ids.
+
+## Auto-generated HTTP API
+
+`Volo.Blogging.Admin.HttpApi` does not declare controllers manually — `BloggingAdminHttpApiModule.ConfigureServices` calls ABP's `ConventionalControllers.Create(typeof(BloggingAdminApplicationContractsModule).Assembly)`. The single `IBlogManagementAppService` becomes `/api/blogging-admin/blogs/...`. `Volo.Blogging.Admin.HttpApi.Client` provides typed proxies for Blazor / MVC / Razor clients to call those endpoints without hand-writing HTTP code.
+
+## What is *not* in this admin tier
+
+Notably absent (and intentionally so): post management, comment moderation, tag management. Those flow through the regular `IPostAppService`, `ICommentAppService`, and `ITagAppService` in `Volo.Blogging.Application` because the original design treats authors — not administrators — as the owners of post lifecycles. If you need administrator-level moderation, look at the Blogging permissions on those services or migrate to CMS Kit's admin tier.
+
+## Where to next
+
+<CardGroup cols={2}>
+<Card title="Domain" icon="cube" href="/module-blogging/domain">
+The `Blog`, `Post`, `Tag`, `Comment`, and `BlogUser` aggregates this admin operates on.
+</Card>
+<Card title="Web UI" icon="window" href="/module-blogging/web">
+The reader, author, and admin Razor pages that compose the public Blogging UX.
+</Card>
+</CardGroup>
+
+## BloggingAdminAppServiceBase
+
+Every admin service derives from `BloggingAdminAppServiceBase` (`modules/blogging/src/Volo.Blogging.Admin.Application/Volo/Blogging/Admin/BloggingAdminAppServiceBase.cs`). The base sets `ObjectMapperContext = typeof(BloggingAdminApplicationModule)` and `LocalizationResource = typeof(BloggingResource)` so error messages and DTO mappings always resolve from the admin tier's profile. The wiring module:
+
+```csharp
+[DependsOn(
+    typeof(BloggingAdminApplicationContractsModule),
+    typeof(BloggingApplicationModule),
+    typeof(AbpMapperlyModule)
+)]
+public class BloggingAdminApplicationModule : AbpModule
+```
+
+It registers Mapperly-generated mappers via `context.Services.AddMapperlyObjectMapper<BloggingAdminApplicationModule>()`. The mapping definitions live next to the DTOs.
+
+## Sample request: create a blog
+
+```http
+POST /api/blogging-admin/blogs
+Authorization: Bearer ...
+Content-Type: application/json
+
+{
+  "name": "Engineering Blog",
+  "shortName": "engineering",
+  "description": "Internals, architecture decisions, and post-mortems"
+}
+```
+
+Routes to `IBlogManagementAppService.CreateAsync(CreateBlogDto)`. The auto-controller pipeline runs `[Authorize(BloggingPermissions.Blogs.Create)]` first, then the implementation creates a new `Blog(GuidGenerator.Create(), input.Name, input.ShortName)` and inserts it via `IBlogRepository`. The returned `BlogDto` (shared with the non-admin tier) is what the Razor page reloads to display the new row in the list.
+
+## Update flow with concurrency
+
+`UpdateAsync(Guid id, UpdateBlogDto input)`:
+
+```csharp
+[Authorize(BloggingPermissions.Blogs.Update)]
+public virtual async Task<BlogDto> UpdateAsync(Guid id, UpdateBlogDto input)
+{
+    var blog = await _blogRepository.GetAsync(id);
+    blog.SetConcurrencyStampIfNotNull(input.ConcurrencyStamp);
+    blog.SetName(input.Name);
+    blog.SetShortName(input.ShortName);
+    blog.Description = input.Description;
+    blog = await _blogRepository.UpdateAsync(blog);
+    return ObjectMapper.Map<Blog, BlogDto>(blog);
+}
+```
+
+`SetConcurrencyStampIfNotNull` is the ABP helper that throws `AbpDbConcurrencyException` when the stamp the client submitted doesn't match what's currently in the row. The `Edit.cshtml.cs` page model reads the stamp on `OnGetAsync` and round-trips it through a hidden input.
+
+## Delete and cache invalidation
+
+```csharp
+[Authorize(BloggingPermissions.Blogs.Delete)]
+public virtual async Task DeleteAsync(Guid id)
+{
+    await _blogRepository.DeleteAsync(id);
+    await ClearCacheAsync(id);
+}
+```
+
+`ClearCacheAsync(Guid id)` removes the per-blog list-of-posts cache entry from `IDistributedCache<List<PostCacheItem>>`. The same path is exposed as a standalone `ClearCacheAsync` endpoint so operators can blow away the cache manually when something is wrong. The cache itself is normally invalidated on every `PostChangedEvent` by `PostCacheInvalidator` (in the domain layer), so manual clears are rarely needed.
+
+## What the admin tier deliberately does NOT do
+
+By design, this tier omits:
+
+- **Post moderation** — `IPostAppService.DeleteAsync` and `UpdateAsync` are how administrators remove or edit other people's posts, gated by `BloggingPermissions.Posts.Update` / `Delete`.
+- **Comment moderation** — `ICommentAppService.DeleteAsync` deletes a comment; `BloggingPermissions.Comments.Delete` is the admin gate.
+- **Tag management** — `ITagAppService` is the read/write surface (tags are auto-created when a post is saved with a new tag name).
+- **Member management** — `IMemberAppService` covers the per-user profile, but the underlying identity user is managed in the Identity module.
+
+If your scenario needs a one-pane back-office for *everything* — posts, comments, tags, users, plus blogs — that's a strong signal to migrate to CMS Kit Blogs, where `Volo.CmsKit.Admin.Application` has explicit admin services for every aggregate.

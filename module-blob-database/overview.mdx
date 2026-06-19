@@ -1,0 +1,284 @@
+---
+title: "Blob Storing Database Module: Database-Backed Provider"
+sidebarTitle: "Overview"
+description: "Overview of the ABP Framework BlobStoring.Database module: storing files as rows in your relational or MongoDB database via DatabaseBlobProvider."
+---
+
+## What This Module Adds
+
+The ABP Framework's `Volo.Abp.BlobStoring` package defines `IBlobContainer`, `IBlobProvider`, and a configuration system in which every named container is bound to one provider. The base package ships no concrete provider — those are separate packages. The module under `modules/blob-storing-database/src/` is one of those provider packages: it persists blob bytes as rows in your relational or document database, with no external object store required.
+
+The module is split into the standard five-package layout: `Volo.Abp.BlobStoring.Database.Domain.Shared` (constants and error codes), `Volo.Abp.BlobStoring.Database.Domain` (entities, repository contracts, provider implementation), `Volo.Abp.BlobStoring.Database.EntityFrameworkCore` (EF Core adapter), `Volo.Abp.BlobStoring.Database.MongoDB` (MongoDB adapter), and `Volo.Abp.BlobStoring.Database.Installer` (CLI tooling). All five live under `modules/blob-storing-database/src/`.
+
+<Info>
+The persistence layer is intentionally simple: two aggregates — `DatabaseBlobContainer` and `DatabaseBlob` — plus two repository contracts. There is no streaming chunking, no multipart upload, and no out-of-band metadata table. Each blob is one row.
+</Info>
+
+## The Provider Contract
+
+The class that plugs this module into the framework is `DatabaseBlobProvider`, defined in `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobProvider.cs`. It derives from `BlobProviderBase` (from the core blob package) and is registered as `ITransientDependency`. Every method ABP's blob system calls — `SaveAsync`, `DeleteAsync`, `ExistsAsync`, `GetOrNullAsync` — is implemented in terms of the two repositories:
+
+```csharp module-blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobProvider.cs
+public class DatabaseBlobProvider : BlobProviderBase, ITransientDependency
+{
+    protected IDatabaseBlobRepository DatabaseBlobRepository { get; }
+    protected IDatabaseBlobContainerRepository DatabaseBlobContainerRepository { get; }
+    protected IGuidGenerator GuidGenerator { get; }
+    protected ICurrentTenant CurrentTenant { get; }
+    // ...
+}
+```
+
+The presence of `ICurrentTenant` is significant: unlike the background-jobs module, this one is fully multi-tenant. Each blob and each container carries a `TenantId`, and ABP's standard data filter applies. A blob written in tenant A's scope is invisible to tenant B even when the container name is the same.
+
+## When to Use the Database Provider
+
+<Tip>
+Pick the database provider when you want zero external infrastructure for file storage, when blobs are small (typically < 1 MiB), and when you want files to participate in the same backup, replication, and transactional boundary as your relational data.
+</Tip>
+
+The classic use cases are user-uploaded avatars, tenant-specific logos, generated PDFs that should disappear with the tenant database in a tenant-deletion workflow, and small encrypted attachments where you want the same encryption-at-rest guarantees as your row data. The module is also useful in air-gapped or compliance-restricted environments where running an S3-compatible or Azure Blob endpoint is operationally prohibitive.
+
+When **not** to use it: anything bulky, anything that needs CDN edge delivery, anything where a single file might exceed a few megabytes. SQL Server and PostgreSQL can hold large `varbinary(max)` / `bytea` values, but loading them through EF Core materialises the entire byte array in memory, and the `DatabaseBlob` aggregate uses `byte[]` everywhere — there is no streaming path. The same caveat applies to MongoDB, where the 16 MB BSON document limit is a hard ceiling.
+
+## Module Composition
+
+`BlobStoringDatabaseDomainModule`, in `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/BlobStoringDatabaseDomainModule.cs`, is the heart of the wiring:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/BlobStoringDatabaseDomainModule.cs
+[DependsOn(
+    typeof(AbpDddDomainModule),
+    typeof(AbpBlobStoringModule),
+    typeof(BlobStoringDatabaseDomainSharedModule)
+)]
+public class BlobStoringDatabaseDomainModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        Configure<AbpBlobStoringOptions>(options =>
+        {
+            options.Containers.ConfigureDefault(container =>
+            {
+                if (container.ProviderType == null)
+                {
+                    container.UseDatabase();
+                }
+            });
+        });
+    }
+}
+```
+
+Notice what this does. It configures the **default** blob container so that, **if no provider has been chosen**, the database provider is selected. This means that adding this module to your dependency graph is enough to make every `IBlobContainer` that has not been explicitly bound to S3 / Azure / FileSystem start writing to the database. Containers that already have a provider configured are left alone.
+
+## Choosing Per-Container
+
+If you only want one container to use the database, configure it explicitly with `UseDatabase()`. The extension is in `DatabaseBlobContainerConfigurationExtensions`:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobContainerConfigurationExtensions.cs
+public static class DatabaseBlobContainerConfigurationExtensions
+{
+    public static BlobContainerConfiguration UseDatabase(
+        this BlobContainerConfiguration containerConfiguration)
+    {
+        containerConfiguration.ProviderType = typeof(DatabaseBlobProvider);
+        return containerConfiguration;
+    }
+}
+```
+
+In your host module's `ConfigureServices`, you would write:
+
+```csharp Host.cs
+Configure<AbpBlobStoringOptions>(options =>
+{
+    options.Containers.Configure<MyAvatarContainer>(c => c.UseDatabase());
+});
+```
+
+That makes the `MyAvatarContainer`-typed container persist through `DatabaseBlobProvider`, while other containers continue to use whatever provider you configured for them.
+
+## The Entity Model
+
+The persistence model has exactly two aggregates: `DatabaseBlobContainer` and `DatabaseBlob`. The container aggregate is a thin record of a container name; the blob aggregate holds the actual byte content.
+
+### `DatabaseBlobContainer`
+
+Defined in `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobContainer.cs`:
+
+```csharp module-blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobContainer.cs
+public class DatabaseBlobContainer : AggregateRoot<Guid>, IMultiTenant
+{
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string Name { get; protected set; }
+
+    protected DatabaseBlobContainer() { }
+
+    public DatabaseBlobContainer(Guid id, [NotNull] string name, Guid? tenantId = null)
+        : base(id)
+    {
+        Name = Check.NotNullOrWhiteSpace(name, nameof(name), DatabaseContainerConsts.MaxNameLength);
+        TenantId = tenantId;
+    }
+}
+```
+
+Each container row is unique by `(TenantId, Name)` — that index is declared in the EF Core model-creating extension. Containers are created lazily by `DatabaseBlobProvider.GetOrCreateContainerAsync` the first time a blob is written into a name that does not yet exist.
+
+### `DatabaseBlob`
+
+Defined in `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlob.cs`:
+
+```csharp module-blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlob.cs
+public class DatabaseBlob : AggregateRoot<Guid>, IMultiTenant
+{
+    public virtual Guid ContainerId { get; protected set; }
+    public virtual Guid? TenantId { get; protected set; }
+    public virtual string Name { get; protected set; }
+
+    [DisableAuditing]
+    public virtual byte[] Content { get; protected set; }
+    // ...
+}
+```
+
+The `[DisableAuditing]` attribute on `Content` is important: ABP's auditing infrastructure would otherwise capture pre- and post-images of the byte array on every update, which would double or triple the I/O cost. The attribute keeps the byte payload out of audit logs.
+
+The constructor enforces the name and content-size invariants by delegating to `Check.NotNullOrWhiteSpace` and a private `CheckContentLength` helper. The size cap is set by `DatabaseBlobConsts.MaxContentLength`, which defaults to `int.MaxValue` (2 GB) — see the [Persistence](./persistence) page for the schema implications.
+
+## Storage Adapters
+
+The two storage adapters are documented in detail on the next page. At a glance:
+
+<CardGroup cols={2}>
+  <Card title="Entity Framework Core" icon="database">
+    `BlobStoringDatabaseEntityFrameworkCoreModule` registers `BlobStoringDbContext` and both repositories. Source: `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.EntityFrameworkCore/`.
+  </Card>
+  <Card title="MongoDB" icon="leaf">
+    `BlobStoringDatabaseMongoDbModule` registers `BlobStoringMongoDbContext` and both repositories. Source: `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.MongoDB/`.
+  </Card>
+</CardGroup>
+
+## Database Naming
+
+The connection string name, table prefix, and schema live in `AbpBlobStoringDatabaseDbProperties` in `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/AbpBlobStoringDatabaseDbProperties.cs`:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/AbpBlobStoringDatabaseDbProperties.cs
+public static class AbpBlobStoringDatabaseDbProperties
+{
+    public static string DbTablePrefix { get; set; } = AbpCommonDbProperties.DbTablePrefix;
+    public static string DbSchema { get; set; } = AbpCommonDbProperties.DbSchema;
+    public const string ConnectionStringName = "AbpBlobStoring";
+}
+```
+
+The two resulting tables (with ABP's default `Abp` prefix) are `AbpBlobContainers` and `AbpBlobs`. The connection-string name `AbpBlobStoring` is what you put under `ConnectionStrings:AbpBlobStoring` in your configuration to point this module's persistence at a separate database from your main application data. Setting only the default `ConnectionStrings:Default` is enough to keep everything in one database.
+
+## Multi-Tenancy Behaviour
+
+Both entities implement `IMultiTenant` and both DbContexts honour ABP's tenant filter. That means:
+
+1. Container names are scoped per tenant: tenant A can have a container `Avatars` and tenant B can have a container `Avatars`, and they are distinct rows with distinct `Id`s.
+2. Reads through `DatabaseBlobContainerRepository.FindAsync(name)` apply ABP's `MultiTenancyFilter`, so a host-side query that happens to enter a tenant scope will only see that tenant's containers and blobs.
+3. The `DatabaseBlobProvider` reads `ICurrentTenant.Id` at write time and stores it on the row, ensuring the data filter on the next read agrees with the data filter at write time.
+
+This is exactly the opposite of the background-jobs module, where `[IgnoreMultiTenancy]` is applied at the DbContext level. Blobs are tenant data; jobs are host infrastructure. The two modules sit on opposite sides of that line by design.
+
+## The Read Path
+
+`DatabaseBlobProvider.GetOrNullAsync` is straightforward but worth tracing because it is the hot path for downloads:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobProvider.cs
+public async override Task<Stream> GetOrNullAsync(BlobProviderGetArgs args)
+{
+    var container = await DatabaseBlobContainerRepository.FindAsync(
+        args.ContainerName, args.CancellationToken);
+
+    if (container == null) return null;
+
+    var blob = await DatabaseBlobRepository.FindAsync(
+        container.Id, args.BlobName, args.CancellationToken);
+
+    if (blob == null) return null;
+
+    return new MemoryStream(blob.Content);
+}
+```
+
+Two characteristics jump out. First, every download is two round-trips: one to locate the container by name, one to locate the blob within that container. There is no `JOIN`; the provider is structured around the repository abstractions. Second, the entire `Content` byte array is materialised into a `MemoryStream` before being returned — there is no streaming hand-off. That is the single most important caveat for large files and is covered in detail on the [Persistence](./persistence) page.
+
+## The Write Path
+
+`SaveAsync` is the other side:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain/Volo/Abp/BlobStoring/Database/DatabaseBlobProvider.cs
+public async override Task SaveAsync(BlobProviderSaveArgs args)
+{
+    var container = await GetOrCreateContainerAsync(args.ContainerName, args.CancellationToken);
+
+    var blob = await DatabaseBlobRepository.FindAsync(
+        container.Id, args.BlobName, args.CancellationToken);
+
+    var content = await args.BlobStream.GetAllBytesAsync(args.CancellationToken);
+
+    if (blob != null)
+    {
+        if (!args.OverrideExisting)
+        {
+            throw new BlobAlreadyExistsException(/* ... */);
+        }
+        blob.SetContent(content);
+        await DatabaseBlobRepository.UpdateAsync(blob, autoSave: true);
+    }
+    else
+    {
+        blob = new DatabaseBlob(GuidGenerator.Create(), container.Id, args.BlobName,
+                               content, CurrentTenant.Id);
+        await DatabaseBlobRepository.InsertAsync(blob, autoSave: true);
+    }
+}
+```
+
+Each save also fully buffers via `args.BlobStream.GetAllBytesAsync` — the same memory characteristic as reads. The `OverrideExisting` check is the standard ABP semantics: by default a second `SaveAsync` to the same blob name throws `BlobAlreadyExistsException`; pass `overrideExisting: true` (via the container's `SaveAsync` overload) to update in place.
+
+The provider also calls `autoSave: true` on both insert and update. This is intentional: blob writes are large enough that you generally do not want them deferred to a unit-of-work `SaveChangesAsync` that might be sharing a transaction with smaller updates. `autoSave: true` flushes the change immediately.
+
+## The Installer Package
+
+Like the background-jobs module, this module's installer assembly is tooling-only. `AbpBlobStoringDatabaseInstallerModule` in `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Installer/` exists so the ABP CLI can copy bootstrap files into a target solution. Application code should depend on the Domain, EF Core, or MongoDB packages directly, never on the Installer.
+
+## Domain.Shared Constants
+
+The shared package contains length limits and error codes only. `DatabaseBlobConsts` and `DatabaseContainerConsts` (both in `modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain.Shared/Volo/Abp/BlobStoring/Database/`) hold the values used by both the entities and the EF Core model:
+
+```csharp modules/blob-storing-database/src/Volo.Abp.BlobStoring.Database.Domain.Shared/Volo/Abp/BlobStoring/Database/DatabaseBlobConsts.cs
+public static class DatabaseBlobConsts
+{
+    public static int MaxNameLength { get; set; } = 256;
+    public static int MaxContentLength { get; set; } = int.MaxValue;
+}
+
+public static class DatabaseContainerConsts
+{
+    public static int MaxNameLength { get; set; } = 128;
+}
+```
+
+Both are mutable statics, so you can lower the blob-name limit or the content-size cap before host startup. The `int.MaxValue` ceiling is also what gets passed to EF Core's `HasMaxLength` for the `Content` column, which on SQL Server translates to `varbinary(max)`.
+
+The error-codes class `BlobStoringDatabaseErrorCodes` is currently empty — it exists as a convention placeholder for downstream modules to extend.
+
+## Where to Go Next
+
+<CardGroup cols={2}>
+  <Card title="Persistence Reference" icon="hard-drive" href="./persistence">
+    The full repository, schema, and adapter walk-through with the large-file caveats spelled out.
+  </Card>
+  <Card title="Background Jobs Persistence" icon="clock-rotate-left" href="../module-background-jobs/overview">
+    The sibling persistence module — same pattern, different aggregate.
+  </Card>
+</CardGroup>
+
+## Summary
+
+The blob-storing-database module turns ABP's `IBlobProvider` abstraction into a database-backed file store. `DatabaseBlobProvider` does the work, two aggregates carry the state, and two repository contracts isolate the adapter choice. The next page covers every class in the persistence chain in detail, including the schema layout, the multi-tenant indexes, and the practical limits on how big a "blob" can actually be.

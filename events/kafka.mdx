@@ -1,0 +1,353 @@
+---
+title: "Apache Kafka Distributed Event Bus for ABP Framework"
+sidebarTitle: "Kafka"
+description: "AbpEventBusKafkaModule, KafkaDistributedEventBus, the Kafka:EventBus configuration section, and how event names map to message keys and topics."
+---
+
+`Volo.Abp.EventBus.Kafka` connects ABP Framework's distributed event bus
+to Apache Kafka via the `Confluent.Kafka` client. The integration code is
+in
+`framework/src/Volo.Abp.EventBus.Kafka/Volo/Abp/EventBus/Kafka/`. The
+underlying connection pool, producer pool, and consumer factory come
+from `framework/src/Volo.Abp.Kafka/Volo/Abp/Kafka/`.
+
+## Module composition
+
+```csharp
+// AbpEventBusKafkaModule.cs
+[DependsOn(
+    typeof(AbpEventBusModule),
+    typeof(AbpKafkaModule))]
+public class AbpEventBusKafkaModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpKafkaEventBusOptions>(configuration.GetSection("Kafka:EventBus"));
+    }
+
+    public override void OnApplicationInitialization(ApplicationInitializationContext context)
+    {
+        context.ServiceProvider
+            .GetRequiredService<KafkaDistributedEventBus>()
+            .Initialize();
+    }
+}
+```
+
+`AbpKafkaModule` (in `Volo.Abp.Kafka`) supplies the bootstrap for
+`AbpKafkaOptions`, the producer/consumer pools, and the default JSON
+serializer:
+
+```csharp
+// AbpKafkaOptions.cs
+public class AbpKafkaOptions
+{
+    public KafkaConnections Connections { get; }
+    public Action<ProducerConfig>? ConfigureProducer { get; set; }
+    public Action<ConsumerConfig>? ConfigureConsumer { get; set; }
+    public Action<TopicSpecification>? ConfigureTopic { get; set; }
+}
+```
+
+## Configuration
+
+`appsettings.json`:
+
+```json
+{
+  "Kafka": {
+    "Connections": {
+      "Default": {
+        "BootstrapServers": "localhost:9092"
+      }
+    },
+    "EventBus": {
+      "ConnectionName": "Default",
+      "TopicName": "Acme.Shop",
+      "GroupId": "OrdersService"
+    }
+  }
+}
+```
+
+The matching options class is intentionally minimal:
+
+```csharp
+// AbpKafkaEventBusOptions.cs
+public class AbpKafkaEventBusOptions
+{
+    public string? ConnectionName { get; set; }
+    public string TopicName { get; set; } = default!;
+    public string GroupId { get; set; } = default!;
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `ConnectionName` | Key into `AbpKafkaOptions.Connections`; defaults to `Default`. |
+| `TopicName` | Single shared topic for the bounded context. Every event flows here. |
+| `GroupId` | Consumer group id. Every replica of one service shares the same group id (competing-consumer); different services use different group ids (fan-out). |
+
+For finer tuning use the action hooks on `AbpKafkaOptions`:
+
+```csharp
+Configure<AbpKafkaOptions>(o =>
+{
+    o.ConfigureProducer = p => p.LingerMs = 5;
+    o.ConfigureConsumer = c =>
+    {
+        c.AutoOffsetReset = AutoOffsetReset.Earliest;
+        c.EnableAutoCommit = false;
+    };
+    o.ConfigureTopic = t =>
+    {
+        t.NumPartitions = 6;
+        t.ReplicationFactor = 3;
+    };
+});
+```
+
+## `KafkaDistributedEventBus`
+
+```csharp
+// KafkaDistributedEventBus.cs
+[Dependency(ReplaceServices = true)]
+[ExposeServices(typeof(IDistributedEventBus), typeof(KafkaDistributedEventBus))]
+public class KafkaDistributedEventBus : DistributedEventBusBase, ISingletonDependency
+{
+    protected AbpKafkaEventBusOptions AbpKafkaEventBusOptions { get; }
+    protected IKafkaMessageConsumerFactory MessageConsumerFactory { get; }
+    protected IKafkaSerializer Serializer { get; }
+    protected IProducerPool ProducerPool { get; }
+    protected IKafkaMessageConsumer Consumer { get; private set; } = default!;
+}
+```
+
+### Initialization
+
+```csharp
+public void Initialize()
+{
+    Consumer = MessageConsumerFactory.Create(
+        AbpKafkaEventBusOptions.TopicName,
+        AbpKafkaEventBusOptions.GroupId,
+        AbpKafkaEventBusOptions.ConnectionName);
+
+    Consumer.OnMessageReceived(ProcessEventAsync);
+
+    SubscribeHandlers(AbpDistributedEventBusOptions.Handlers);
+}
+```
+
+`IKafkaMessageConsumerFactory.Create` (from `Volo.Abp.Kafka`) returns a
+long-lived consumer scoped to one `(topic, groupId, connectionName)`
+triple. The bus only ever creates one consumer per host — fan-out
+across services is done through different group ids, not through
+multiple consumers.
+
+## Publish path
+
+```csharp
+protected override async Task PublishToEventBusAsync(Type eventType, object eventData)
+{
+    var headers = new Headers
+    {
+        { "messageId",
+            System.Text.Encoding.UTF8.GetBytes(Guid.NewGuid().ToString("N")) }
+    };
+
+    if (CorrelationIdProvider.Get() != null)
+    {
+        headers.Add(EventBusConsts.CorrelationIdHeaderName,
+            System.Text.Encoding.UTF8.GetBytes(CorrelationIdProvider.Get()!));
+    }
+
+    await PublishAsync(
+        AbpKafkaEventBusOptions.TopicName,
+        eventType,
+        eventData,
+        headers);
+}
+```
+
+The interesting bit is how the Kafka message is shaped:
+
+| Kafka field | ABP value |
+| --- | --- |
+| `Topic` | `AbpKafkaEventBusOptions.TopicName` (always the same) |
+| `Key` (string) | `EventNameAttribute.GetNameOrDefault(eventType)` |
+| `Value` (byte[]) | `IKafkaSerializer.Serialize(eventData)` |
+| Header `messageId` | New GUID — or `OutgoingEventInfo.Id` from the outbox |
+| Header `X-Correlation-Id` | Value from `ICorrelationIdProvider` |
+
+Because the message key is the event name, partitioning is **per event
+type**, not per aggregate. If you need per-aggregate ordering, override
+`PublishToEventBusAsync` in a subclass and use an aggregate id as the
+key.
+
+### Outbox publish
+
+```csharp
+public override async Task PublishFromOutboxAsync(
+    OutgoingEventInfo outgoingEvent, OutboxConfig outboxConfig)
+{
+    var headers = new Headers
+    {
+        { "messageId",
+            System.Text.Encoding.UTF8.GetBytes(outgoingEvent.Id.ToString("N")) }
+    };
+    if (outgoingEvent.GetCorrelationId() != null)
+    {
+        headers.Add(EventBusConsts.CorrelationIdHeaderName,
+            System.Text.Encoding.UTF8.GetBytes(outgoingEvent.GetCorrelationId()!));
+    }
+    ...
+}
+```
+
+The `messageId` header is populated from `OutgoingEventInfo.Id`, giving
+each outbox row a stable identity all the way through to the broker and
+the consumer inbox.
+
+## Receive path
+
+```csharp
+private async Task ProcessEventAsync(Message<string, byte[]> message)
+{
+    var eventName = message.Key;
+    var eventType = EventTypes.GetOrDefault(eventName);
+
+    var messageId = message.GetMessageId();
+    var correlationId = message.GetCorrelationId();
+    object eventData;
+
+    if (eventType != null)
+    {
+        eventData = Serializer.Deserialize(message.Value, eventType);
+    }
+    else if (DynamicHandlerFactories.ContainsKey(eventName))
+    {
+        eventData = new DynamicEventData(eventName,
+            Serializer.Deserialize<object>(message.Value));
+        eventType = typeof(DynamicEventData);
+    }
+    else
+    {
+        return;
+    }
+
+    if (await AddToInboxAsync(messageId, eventName, eventType, eventData, correlationId))
+        return;
+
+    using (CorrelationIdProvider.Change(correlationId))
+    {
+        await TriggerHandlersDirectAsync(eventType, eventData);
+    }
+}
+```
+
+`MessageExtensions` parses the ABP headers from Kafka:
+
+```csharp
+// MessageExtensions.cs
+public static string? GetMessageId<TKey, TValue>(this Message<TKey, TValue> message)
+{
+    if (message.Headers.TryGetLastBytes("messageId", out var bytes))
+        return System.Text.Encoding.UTF8.GetString(bytes);
+    return null;
+}
+
+public static string? GetCorrelationId<TKey, TValue>(this Message<TKey, TValue> message)
+{
+    if (message.Headers.TryGetLastBytes(
+            EventBusConsts.CorrelationIdHeaderName, out var bytes))
+        return System.Text.Encoding.UTF8.GetString(bytes);
+    return null;
+}
+```
+
+`EventBusConsts.CorrelationIdHeaderName` is the string
+`"X-Correlation-Id"` (defined in
+`framework/src/Volo.Abp.EventBus.Abstractions/Volo/Abp/EventBus/EventBusConsts.cs`).
+
+## End-to-end flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant App
+    participant Bus as KafkaDistributedEventBus
+    participant Pool as IProducerPool
+    participant Topic as Kafka topic
+    participant Cons as IKafkaMessageConsumer
+    participant Handler as IDistributedEventHandler
+
+    App->>Bus: PublishAsync(eventData)
+    Bus->>Pool: Get(connectionName)
+    Pool-->>Bus: IProducer&lt;string,byte[]&gt;
+    Bus->>Topic: ProduceAsync(key = eventName, value = bytes, headers)
+    Topic-->>Cons: poll loop delivers Message
+    Cons->>Bus: ProcessEventAsync(message)
+    Bus->>Bus: deserialize via EventTypes[message.Key]
+    Bus->>Bus: AddToInboxAsync(messageId, …)
+    Bus->>Handler: HandleEventAsync(eventData)
+```
+
+## Underlying Kafka infrastructure
+
+| Service | Source | Role |
+| --- | --- | --- |
+| `IConsumerPool` | `framework/src/Volo.Abp.Kafka/Volo/Abp/Kafka/ConsumerPool.cs` | Caches `IConsumer<string, byte[]>` per connection. |
+| `IProducerPool` | `framework/src/Volo.Abp.Kafka/Volo/Abp/Kafka/IProducerPool.cs` | Caches `IProducer<string, byte[]>` per connection. |
+| `IKafkaMessageConsumerFactory` | `framework/src/Volo.Abp.Kafka/Volo/Abp/Kafka/IKafkaMessageConsumerFactory.cs` | Builds long-lived consumers. |
+| `IKafkaSerializer` | `framework/src/Volo.Abp.Kafka/Volo/Abp/Kafka/IKafkaSerializer.cs` | Default JSON serializer; override for protobuf/avro. |
+
+`KafkaConnections` is a `Dictionary<string, ConnectionInfo>` similar to
+`RabbitMqConnections` — the `"Default"` entry is required and holds the
+`BootstrapServers` and security settings.
+
+## Consumer-group strategy
+
+<Info>
+  Two services that need to **both** receive the same event use
+  **different** `GroupId` values — each group commits its own offsets,
+  producing fan-out.
+
+  Multiple replicas of the **same** service share one `GroupId`, so
+  Kafka load-balances partitions across them — producing
+  competing-consumer behaviour.
+</Info>
+
+That makes the choice of `GroupId` the single most important
+deployment knob. A common convention is `"<bounded-context>.<service>"`
+(for example `"shop.orders"` and `"shop.invoices"`).
+
+## Pairing with the outbox
+
+The KafkaDistributedEventBus does **not** support
+`PublishManyFromOutboxAsync` batching out of the box — every outbox
+event is sent individually via `PublishFromOutboxAsync`. Set
+`AbpEventBusBoxesOptions.BatchPublishOutboxEvents = false` if you want
+explicit single-message semantics; otherwise the default behaviour
+calls `PublishFromOutboxAsync` per row anyway:
+
+```csharp
+Configure<AbpDistributedEventBusOptions>(o =>
+{
+    o.Outboxes.Configure("Default", c => c.UseDbContext<OrdersDbContext>());
+    o.Inboxes.Configure("Default", c => c.UseDbContext<OrdersDbContext>());
+});
+
+Configure<AbpEventBusBoxesOptions>(o =>
+{
+    o.PeriodTimeSpan = TimeSpan.FromSeconds(1);
+});
+```
+
+<Tip>
+  Because `messageId` is carried in the Kafka headers, the inbox can
+  detect duplicates even when consumer rebalance causes Kafka to
+  redeliver. `ExistsByMessageIdAsync(messageId)` is the
+  `IEventInbox` method that performs the check.
+</Tip>

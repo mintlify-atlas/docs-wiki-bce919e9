@@ -1,72 +1,73 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mintlify Starter Kit",
+  "name": "ABP Framework",
+  "theme": "maple",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#ba4395",
+    "light": "#ffffff",
+    "dark": "#7a2c61"
   },
-  "favicon": "/favicon.svg",
-  "navigation": {
-    "pages": [
-      {
-        "group": "Getting Started",
-        "pages": [
-          "index",
-          "quickstart"
-        ]
-      }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
+  "favicon": "https://media.brand.dev/861559e5-617f-43f0-a53d-ded6f1e1fc91.png",
   "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
+    "light": "https://media.brand.dev/2662d8ba-e84e-4dd7-a4d1-0228c7be0941.svg",
+    "dark": "https://media.brand.dev/2662d8ba-e84e-4dd7-a4d1-0228c7be0941.svg"
   },
   "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
     "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://app.mintlify.com"
+      "type": "github",
+      "href": "https://github.com/abpframework/abp"
     }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
+      "github": "https://github.com/abpframework/abp"
     }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Wiki",
+        "groups": [
+          { "group": "Overview", "pages": ["index", "overview/architecture", "overview/repository-layout", "overview/solution-structure", "overview/build-and-tooling", "overview/glossary"] },
+          { "group": "Core Runtime", "pages": ["core/overview", "core/volo-abp-core", "core/volo-abp-package", "core/modularity", "core/dependency-injection", "core/options-and-configuration", "core/exception-handling", "core/aspects-and-dynamic-proxy", "core/threading", "core/timing", "core/serialization", "core/reflection-and-internal", "core/virtual-file-system", "core/text-templating"] },
+          { "group": "Cross-Cutting Concerns", "pages": ["concerns/overview", "concerns/auditing", "concerns/authorization", "concerns/features", "concerns/global-features", "concerns/settings", "concerns/security", "concerns/validation", "concerns/fluent-validation", "concerns/object-mapping", "concerns/automapper", "concerns/mapperly", "concerns/object-extending", "concerns/specifications", "concerns/multi-lingual-objects", "concerns/gdpr"] },
+          { "group": "DDD Building Blocks", "pages": ["ddd/overview", "ddd/domain-shared", "ddd/domain-layer", "ddd/entities-and-aggregate-roots", "ddd/repositories", "ddd/domain-services", "ddd/value-objects", "ddd/change-tracking", "ddd/application-layer", "ddd/application-contracts", "ddd/unit-of-work"] },
+          { "group": "Data Access", "pages": ["data/overview", "data/volo-abp-data", "data/entity-framework-core", "data/efcore-providers", "data/efcore-sqlserver", "data/efcore-postgresql", "data/efcore-mysql", "data/efcore-oracle", "data/efcore-sqlite", "data/mongodb", "data/dapper", "data/memorydb", "data/data-seeding-and-filtering"] },
+          { "group": "Multi-Tenancy", "pages": ["tenancy/overview", "tenancy/abstractions", "tenancy/multi-tenancy-core", "tenancy/aspnetcore-multi-tenancy", "tenancy/mvc-ui-multi-tenancy", "tenancy/tenant-management-module"] },
+          { "group": "Caching & Distributed Locking", "pages": ["caching/overview", "caching/volo-abp-caching", "caching/stackexchange-redis", "caching/distributed-locking"] },
+          { "group": "Event Bus & Messaging", "pages": ["events/overview", "events/volo-abp-eventbus", "events/local-event-bus", "events/distributed-event-bus", "events/rabbitmq", "events/kafka", "events/azure-service-bus", "events/dapr-event-bus", "events/rebus"] },
+          { "group": "Background Jobs & Workers", "pages": ["jobs/overview", "jobs/background-jobs-core", "jobs/background-jobs-module", "jobs/hangfire", "jobs/quartz", "jobs/rabbitmq-jobs", "jobs/tickerq", "jobs/background-workers"] },
+          { "group": "HTTP & API Layer", "pages": ["http/overview", "http/volo-abp-http", "http/http-client", "http/identity-model-client", "http/remote-services", "http/aspnetcore-core", "http/aspnetcore-mvc", "http/mvc-contracts", "http/mvc-conventions", "http/mvc-api-exploring", "http/dynamic-c-sharp-client-proxies", "http/dynamic-js-client-proxies", "http/proxy-scripting", "http/swashbuckle", "http/api-versioning", "http/jwt-bearer", "http/oauth", "http/openid-connect", "http/signalr", "http/serilog"] },
+          { "group": "UI: MVC / Razor Pages", "pages": ["mvc-ui/overview", "mvc-ui/volo-abp-aspnetcore-mvc-ui", "mvc-ui/bootstrap-theming", "mvc-ui/theme-shared", "mvc-ui/bundling", "mvc-ui/widgets", "mvc-ui/navigation-and-menus"] },
+          { "group": "UI: Blazor", "pages": ["blazor/overview", "blazor/components-core", "blazor/components-web", "blazor/server", "blazor/web-assembly", "blazor/maui-blazor", "blazor/theming", "blazor/mudblazor-ui", "blazor/blazorise-ui", "blazor/bundling"] },
+          { "group": "UI: Angular", "pages": ["angular/overview", "angular/core", "angular/oauth", "angular/components", "angular/theme-shared", "angular/theme-basic", "angular/identity", "angular/account", "angular/permission-management", "angular/feature-management", "angular/setting-management", "angular/tenant-management", "angular/cms-kit", "angular/schematics-and-generators"] },
+          { "group": "UI: MAUI & WPF", "pages": ["ui-clients/maui-client", "ui-clients/wpf-template"] },
+          { "group": "Localization & Globalization", "pages": ["localization/overview", "localization/abstractions", "localization/localization-core", "localization/timing-and-clocks"] },
+          { "group": "BLOB Storing", "pages": ["blob/overview", "blob/core", "blob/file-system", "blob/azure", "blob/aws-s3", "blob/google-cloud", "blob/aliyun-oss", "blob/minio", "blob/bunny", "blob/in-memory", "blob/database-module"] },
+          { "group": "Emailing & SMS", "pages": ["messaging/emailing", "messaging/mailkit", "messaging/sms-core", "messaging/sms-aliyun", "messaging/sms-tencent"] },
+          { "group": "Imaging", "pages": ["imaging/overview", "imaging/imagesharp", "imaging/skiasharp", "imaging/magicknet", "imaging/aspnetcore-imaging"] },
+          { "group": "AI", "pages": ["ai/overview", "ai/volo-abp-ai-abstractions", "ai/volo-abp-ai"] },
+          { "group": "JSON & Serialization", "pages": ["json/overview", "json/system-text-json", "json/newtonsoft", "json/abstractions"] },
+          { "group": "Auditing Module", "pages": ["module-auditing/overview", "module-auditing/domain", "module-auditing/persistence"] },
+          { "group": "Identity Module", "pages": ["module-identity/overview", "module-identity/domain", "module-identity/application", "module-identity/http-api", "module-identity/efcore", "module-identity/mongodb", "module-identity/aspnetcore", "module-identity/web-ui", "module-identity/blazor-ui", "module-identity/users-subpackage"] },
+          { "group": "Account Module", "pages": ["module-account/overview", "module-account/application", "module-account/http-api", "module-account/web-ui", "module-account/web-openiddict", "module-account/web-identityserver", "module-account/blazor-ui"] },
+          { "group": "OpenIddict Module", "pages": ["module-openiddict/overview", "module-openiddict/domain", "module-openiddict/aspnetcore", "module-openiddict/persistence"] },
+          { "group": "IdentityServer Module", "pages": ["module-identityserver/overview", "module-identityserver/domain", "module-identityserver/persistence"] },
+          { "group": "Permission, Setting & Feature Management", "pages": ["psf/permission-management", "psf/setting-management", "psf/feature-management"] },
+          { "group": "Tenant Management Module", "pages": ["module-tenant-management/overview", "module-tenant-management/domain", "module-tenant-management/application", "module-tenant-management/web"] },
+          { "group": "Background Jobs Module", "pages": ["module-background-jobs/overview", "module-background-jobs/persistence"] },
+          { "group": "BLOB Storing Database Module", "pages": ["module-blob-database/overview", "module-blob-database/persistence"] },
+          { "group": "CMS Kit Module", "pages": ["module-cms-kit/overview", "module-cms-kit/domain", "module-cms-kit/admin", "module-cms-kit/public", "module-cms-kit/persistence", "module-cms-kit/web"] },
+          { "group": "Docs Module", "pages": ["module-docs/overview", "module-docs/domain", "module-docs/admin", "module-docs/web"] },
+          { "group": "Blogging Module", "pages": ["module-blogging/overview", "module-blogging/domain", "module-blogging/admin", "module-blogging/web"] },
+          { "group": "Themes & Virtual File Explorer", "pages": ["themes/basic-theme", "themes/virtual-file-explorer", "themes/client-simulation"] },
+          { "group": "ABP CLI", "pages": ["cli/overview", "cli/program-entry", "cli/command-selector", "cli/new-command", "cli/build-command", "cli/update-command", "cli/install-libs", "cli/generate-proxy", "cli/bundle-command", "cli/login-and-auth", "cli/source-and-modules", "cli/translate-command", "cli/prompt-and-mcp", "cli/project-building", "cli/project-modification", "cli/service-proxying"] },
+          { "group": "Startup Templates", "pages": ["templates/overview", "templates/app-template-aspnetcore", "templates/app-template-angular", "templates/app-nolayers", "templates/console-template", "templates/module-template", "templates/maui-template", "templates/wpf-template"] },
+          { "group": "Testing Infrastructure", "pages": ["testing/overview", "testing/test-base", "testing/aspnetcore-test-base", "testing/framework-tests"] },
+          { "group": "Build, Deploy & Tools", "pages": ["build/overview", "build/build-scripts", "build/deploy-scripts", "build/nuget-tools", "build/localization-key-synchronizer", "build/changelog-generator"] },
+          { "group": "Key Flows", "pages": ["flows/application-startup", "flows/http-request-lifecycle", "flows/dynamic-client-proxy-flow", "flows/uow-and-transaction-flow", "flows/event-bus-publish-flow", "flows/background-job-execution", "flows/authentication-flow", "flows/multi-tenancy-resolution", "flows/cli-project-creation"] }
+        ]
+      }
+    ]
   }
 }

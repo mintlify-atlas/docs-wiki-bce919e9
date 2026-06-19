@@ -1,0 +1,389 @@
+---
+title: "ABP Specifications: Composable Predicates for Repos"
+sidebarTitle: "Specifications"
+description: "Encapsulate query predicates as ISpecification<T> objects, combine them with And, Or, Not, AndNot, and pass them as LINQ expressions to ABP repositories."
+---
+
+## Overview
+
+The specification pattern lets you treat a domain predicate as a first-class
+object: a reusable, named, testable description of "what makes an entity
+match". The ABP Framework's implementation lives in
+`framework/src/Volo.Abp.Specifications/` and is exposed through
+`Volo/Abp/Specifications/AbpSpecificationsModule.cs`. It follows the classic
+Fowler/Evans pattern — an `ISpecification<T>` exposes both an
+`IsSatisfiedBy(T)` predicate and a `ToExpression()` LINQ tree, and composite
+specifications are built by combining smaller ones with boolean operators.
+
+ABP repositories accept `Expression<Func<T, bool>>`, which is the same shape
+`Specification<T>` implicitly converts to — so any specification you write
+can be passed directly to `IRepository<T>.GetListAsync(specification)` or
+`CountAsync(specification)` without bespoke glue code.
+
+## The contract: `ISpecification<T>`
+
+The interface in
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ISpecification.cs`
+captures the dual nature of a specification — runtime predicate and LINQ
+expression — in two members:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ISpecification.cs
+public interface ISpecification<T>
+{
+    bool IsSatisfiedBy(T obj);
+    Expression<Func<T, bool>> ToExpression();
+}
+```
+
+The XML doc on the interface points to Fowler's original paper at
+`http://martinfowler.com/apsupp/spec.pdf`, which is the conceptual reference
+for the implementation.
+
+## The base: `Specification<T>`
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/Specification.cs`
+provides the abstract base most concrete specifications inherit from:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/Specification.cs
+public abstract class Specification<T> : ISpecification<T>
+{
+    public virtual bool IsSatisfiedBy(T obj)
+    {
+        return ToExpression().Compile()(obj);
+    }
+
+    public abstract Expression<Func<T, bool>> ToExpression();
+
+    public static implicit operator Expression<Func<T, bool>>(Specification<T> specification)
+    {
+        return specification.ToExpression();
+    }
+}
+```
+
+Three points worth calling out:
+
+1. Subclasses only implement `ToExpression()`. The default `IsSatisfiedBy`
+   compiles the expression and invokes it — handy for in-memory checks but
+   you typically want to override it with a direct C# expression to avoid the
+   per-call `Compile()` cost in hot paths.
+2. The `implicit operator` conversion to `Expression<Func<T, bool>>` is the
+   reason `repository.GetListAsync(new MySpec())` compiles even though the
+   repository signature asks for an expression — the compiler inserts the call
+   to `ToExpression()` for you.
+3. Because the base is abstract, you do *not* register specifications with DI;
+   they are domain objects that you `new` up from your application services.
+
+## Composite specifications
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ICompositeSpecification.cs`
+extends `ISpecification<T>` with two child accessors:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ICompositeSpecification.cs
+public interface ICompositeSpecification<T> : ISpecification<T>
+{
+    ISpecification<T> Left { get; }
+    ISpecification<T> Right { get; }
+}
+```
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/CompositeSpecification.cs`
+provides the abstract base, which simply stores the left and right operands
+and lets each subclass decide how to combine them in `ToExpression()`.
+
+### `AndSpecification<T>`
+
+The combinator in
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/AndSpecification.cs`
+demands both children be satisfied:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/AndSpecification.cs
+public class AndSpecification<T> : CompositeSpecification<T>
+{
+    public AndSpecification(ISpecification<T> left, ISpecification<T> right)
+        : base(left, right) { }
+
+    public override Expression<Func<T, bool>> ToExpression()
+    {
+        return Left.ToExpression().And(Right.ToExpression());
+    }
+}
+```
+
+The `.And(...)` extension is defined in
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ExpressionFuncExtender.cs`
+and uses `ParameterRebinder` (in the same folder) to rewrite the parameter of
+the right-hand expression so both expressions share a single lambda
+parameter — that is what makes the resulting tree translatable by EF Core
+and other LINQ providers.
+
+### `OrSpecification<T>`
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/OrSpecification.cs`
+mirrors `AndSpecification` but uses `.Or(...)` to combine the children:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/OrSpecification.cs
+public class OrSpecification<T> : CompositeSpecification<T>
+{
+    public OrSpecification(ISpecification<T> left, ISpecification<T> right)
+        : base(left, right) { }
+
+    public override Expression<Func<T, bool>> ToExpression()
+    {
+        return Left.ToExpression().Or(Right.ToExpression());
+    }
+}
+```
+
+### `NotSpecification<T>`
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/NotSpecification.cs`
+wraps a single specification and negates it. Unlike the And/Or pair, it does
+**not** inherit from `CompositeSpecification<T>` because it has only one
+operand:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/NotSpecification.cs
+public class NotSpecification<T> : Specification<T>
+{
+    private readonly ISpecification<T> _specification;
+
+    public NotSpecification(ISpecification<T> specification)
+    {
+        _specification = specification;
+    }
+
+    public override Expression<Func<T, bool>> ToExpression()
+    {
+        var expression = _specification.ToExpression();
+        return Expression.Lambda<Func<T, bool>>(
+            Expression.Not(expression.Body),
+            expression.Parameters);
+    }
+}
+```
+
+Note how it reuses the original `Parameters` collection; this preserves
+expression-tree identity so EF Core can still translate the negated tree to
+SQL.
+
+### `AndNotSpecification<T>`
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/AndNotSpecification.cs`
+is a shortcut for `A AND NOT B`. It builds the negated right-hand lambda
+explicitly rather than chaining `And` with a `NotSpecification`:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/AndNotSpecification.cs
+public class AndNotSpecification<T> : CompositeSpecification<T>
+{
+    public override Expression<Func<T, bool>> ToExpression()
+    {
+        var rightExpression = Right.ToExpression();
+        var bodyNot = Expression.Not(rightExpression.Body);
+        var bodyNotExpression =
+            Expression.Lambda<Func<T, bool>>(bodyNot, rightExpression.Parameters);
+        return Left.ToExpression().And(bodyNotExpression);
+    }
+}
+```
+
+## Terminal specifications: `Any` and `None`
+
+Two sealed terminal specifications complete the algebra:
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/AnySpecification.cs`:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/AnySpecification.cs
+public sealed class AnySpecification<T> : Specification<T>
+{
+    public override Expression<Func<T, bool>> ToExpression()
+        => o => true;
+}
+```
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/NoneSpecification.cs`:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/NoneSpecification.cs
+public sealed class NoneSpecification<T> : Specification<T>
+{
+    public override Expression<Func<T, bool>> ToExpression()
+        => o => false;
+}
+```
+
+These are the identity elements: `AnySpecification` matches every object,
+`NoneSpecification` matches none. They are useful as default seeds when you
+fold a list of optional filters with `Aggregate(new AnySpecification<T>(), (acc, x) => acc.And(x))`.
+
+## Expression-based specifications
+
+You do not always need a dedicated class — for one-off predicates you can
+wrap a lambda using
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ExpressionSpecification.cs`:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ExpressionSpecification.cs
+public class ExpressionSpecification<T> : Specification<T>
+{
+    private readonly Expression<Func<T, bool>> _expression;
+
+    public ExpressionSpecification(Expression<Func<T, bool>> expression)
+    {
+        _expression = expression;
+    }
+
+    public override Expression<Func<T, bool>> ToExpression()
+        => _expression;
+}
+```
+
+This is the bridge from "I have a lambda" to "I have a specification I can
+compose with another specification". It is also what powers the
+`SpecificationExtensions` helpers when you want to negate or combine an
+expression without writing a class for it.
+
+## Fluent composition: `SpecificationExtensions`
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/SpecificationExtensions.cs`
+turns the composite classes into a small fluent API:
+
+```csharp framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/SpecificationExtensions.cs
+public static class SpecificationExtensions
+{
+    public static ISpecification<T> And<T>(
+        this ISpecification<T> specification,
+        ISpecification<T> other);
+
+    public static ISpecification<T> Or<T>(
+        this ISpecification<T> specification,
+        ISpecification<T> other);
+
+    public static ISpecification<T> AndNot<T>(
+        this ISpecification<T> specification,
+        ISpecification<T> other);
+
+    public static ISpecification<T> Not<T>(
+        this ISpecification<T> specification);
+}
+```
+
+Each extension `Check.NotNull(...)`s its arguments and returns a fresh
+composite (`AndSpecification<T>`, `OrSpecification<T>`,
+`AndNotSpecification<T>`, or `NotSpecification<T>` respectively), so the
+existing operands remain immutable. This is what makes it safe to share a
+single specification instance across requests without worrying about mutation.
+
+## Expression algebra under the hood
+
+The composition extensions rely on two private helpers in the same folder:
+
+- `ExpressionFuncExtender.cs` exposes `.And(...)` and `.Or(...)` on
+  `Expression<Func<T, bool>>`. They unify the parameters of the two
+  expressions and combine their bodies with `Expression.AndAlso` / `Expression.OrElse`.
+- `ParameterRebinder.cs` is a small `ExpressionVisitor` subclass that swaps
+  one `ParameterExpression` for another — that swap is the reason the
+  combined trees compile down to a single lambda whose body references a
+  single parameter, which is the shape EF Core can translate.
+
+The parser interface in
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/ISpecificationParser.cs`
+is reserved for higher-level integrations (for example, parsing query strings
+into specifications) and is left as a contract for downstream modules to
+implement.
+
+## Module wiring
+
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/AbpSpecificationsModule.cs`
+itself is intentionally tiny — the pattern relies on plain C# types, not on
+DI, so the module exposes no services. You take a dependency on it from any
+module that wants the algebra to be available, but the heavy lifting is done
+at compile time and at expression-tree construction time.
+
+## Writing a specification
+
+```csharp
+public class BooksInStockSpecification : Specification<Book>
+{
+    public override Expression<Func<Book, bool>> ToExpression()
+    {
+        return book => book.StockCount > 0;
+    }
+}
+
+public class BooksWrittenBySpecification : Specification<Book>
+{
+    private readonly string _author;
+
+    public BooksWrittenBySpecification(string author)
+    {
+        _author = author;
+    }
+
+    public override Expression<Func<Book, bool>> ToExpression()
+    {
+        var author = _author;
+        return book => book.Author == author;
+    }
+}
+```
+
+Then compose them at the call site:
+
+```csharp
+var inStockByAuthor = new BooksInStockSpecification()
+    .And(new BooksWrittenBySpecification("Eric Evans"));
+
+var books = await _bookRepository.GetListAsync(inStockByAuthor);
+```
+
+Because `Specification<T>` defines the implicit conversion to
+`Expression<Func<T, bool>>` (see
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/Specification.cs`),
+the call site does not need an explicit `.ToExpression()` — the compiler
+inserts it. EF Core then translates the unified expression tree into SQL,
+exactly the same way a hand-written `Where(...)` lambda would be translated.
+
+## Choosing the right tool
+
+<CardGroup cols={2}>
+  <Card title="Use Specification<T>" icon="circle-check">
+    When a predicate has a name, a meaning, and is likely to be reused — or
+    when you want it to be unit-testable in isolation via `IsSatisfiedBy(T)`.
+  </Card>
+  <Card title="Use ExpressionSpecification<T>" icon="circle-info">
+    When you need to compose an ad-hoc lambda with named specifications via
+    `And`/`Or`/`Not` from `SpecificationExtensions.cs` without creating a
+    class.
+  </Card>
+</CardGroup>
+
+## In-memory vs. database evaluation
+
+`Specification<T>.IsSatisfiedBy(T)` in
+`framework/src/Volo.Abp.Specifications/Volo/Abp/Specifications/Specification.cs`
+calls `ToExpression().Compile()(obj)`. This works correctly but recompiles the
+delegate on every invocation. For repeated in-memory checks you have two
+options:
+
+1. Override `IsSatisfiedBy` with a direct C# implementation alongside
+   `ToExpression()` — the two should produce identical semantics, but the
+   C# version skips the compilation step.
+2. Cache the compiled delegate on the specification instance and return it
+   from an overridden `IsSatisfiedBy`.
+
+Specifications passed to repositories never hit `IsSatisfiedBy` — they go
+through `ToExpression()` and then into the LINQ provider — so the default
+behaviour is fine for the typical query use case.
+
+## Related concerns
+
+<CardGroup cols={2}>
+  <Card title="Domain repositories" icon="database">
+    `IRepository<T>` overloads from
+    `framework/src/Volo.Abp.Ddd.Domain/` accept either an
+    `ISpecification<T>` (via the implicit conversion) or an
+    `Expression<Func<T, bool>>` directly.
+  </Card>
+  <Card title="Domain services" icon="hexagon-nodes">
+    Specifications are typically constructed inside domain services to keep
+    repository queries declarative and intention-revealing.
+  </Card>
+</CardGroup>

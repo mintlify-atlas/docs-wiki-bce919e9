@@ -1,0 +1,516 @@
+---
+title: "Localization Key Synchronizer: Keep Culture JSON Aligned"
+sidebarTitle: "Localization Sync"
+description: "ABP Framework console tool that finds missing keys and mismatched placeholders across localization JSON files and applies edits back in bulk."
+---
+
+ABP Framework modules ship with one localization JSON file per culture: `en.json`, `tr.json`, `de.json`, and so on. Over time, contributors add new keys to the default culture but forget to mirror them in others, or tweak a `"Hello, {0}!"` template to take two parameters without updating every translation. The console tool in `/home/daytona/repos/abpframework/abp/tools/localization-key-synchronizer/` exists to find those drifts and apply the fixes in batch.
+
+## Layout
+
+```text
+tools/localization-key-synchronizer/
+├── LocalizationKeySynchronizer.exe        # ~35 MB self-contained build
+├── LocalizationKeySynchronizer.slnx       # slnx referencing src/LocalizationKeySynchronizer.csproj
+├── README.md                              # screenshots-and-prose user guide
+└── src/
+    ├── AbpAsyncKey.cs
+    ├── AbpAsyncLocalization.cs
+    ├── AbpAsyncLocalizationViewModel.cs
+    ├── AbpLocalization.cs
+    ├── AbpLocalizationInfo.cs
+    ├── ArgumentCountMismatch.cs
+    ├── JsonHelper.cs
+    ├── LocalizationHelper.cs
+    ├── LocalizationKeySynchronizer.csproj
+    ├── MissingKey.cs
+    ├── Program.cs
+    └── Questions.cs
+```
+
+The committed `.exe` is the convenience binary for operators who don't want to build the source; `dotnet run --project src/LocalizationKeySynchronizer.csproj` does the same thing.
+
+## Project Target
+
+`tools/localization-key-synchronizer/src/LocalizationKeySynchronizer.csproj` is deliberately tiny:
+
+```xml
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageReference Include="Newtonsoft.Json" />
+        <PackageReference Include="Spectre.Console" />
+    </ItemGroup>
+</Project>
+```
+
+`net10.0` matches the framework's main target. Two PackageReferences carry the heavy lifting: `Newtonsoft.Json` for tolerant JSON parsing of localization files that may have trailing commas or property re-ordering, and `Spectre.Console` for the rich interactive prompts the tool builds its UX around. Because central package management is enabled by `Directory.Packages.props` at the repo root, neither reference carries a `Version` attribute — the actual versions are pinned in the central file.
+
+The solution file alongside it is the modern slnx format and contains exactly one project:
+
+```xml
+<Solution>
+  <Project Path="src/LocalizationKeySynchronizer.csproj" />
+</Solution>
+```
+
+## Three Workflows
+
+`tools/localization-key-synchronizer/src/Program.cs` opens with a top-level `SelectionPrompt` offering three choices. The choice labels are defined as string constants in `Questions.cs`:
+
+```csharp
+public static class _1
+{
+    public const string Question =
+        "Do you want to find asynchronous keys, apply changes in the exported file or replace the keys?";
+
+    public static class Options
+    {
+        public const string Find = "Find asynchronous keys";
+        public const string Apply = "Apply changes in the exported file";
+        public const string Replace = "Replace keys";
+    }
+}
+```
+
+<CardGroup cols={3}>
+  <Card title="Find" icon="magnifying-glass">
+    Compare a default culture against any subset of other cultures and emit a JSON report of missing keys and argument-count mismatches.
+  </Card>
+  <Card title="Apply" icon="file-import">
+    Take a previously exported (and hand-edited) JSON report and write the `NewValue` for each key back into the original JSON files.
+  </Card>
+  <Card title="Replace" icon="arrows-rotate">
+    Rename a single key across many cultures at once — useful when a module rebrands `Volo:Hello` to `Volo:Greeting`.
+  </Card>
+</CardGroup>
+
+The dispatching `switch` in `Program.cs` is a straight translation of those three options into separate code paths.
+
+## The Data Model
+
+The classes under `src/` are minimal POCOs. The core file format is loaded into `AbpLocalizationInfo` defined in `AbpLocalizationInfo.cs`:
+
+```csharp
+public class AbpLocalizationInfo
+{
+    public AbpLocalizationInfo(string culture, Dictionary<string, string> texts)
+    {
+        Culture = culture;
+        Texts = texts;
+    }
+
+    public string Culture { get; set; }
+    public Dictionary<string, string> Texts { get; set; }
+
+    public static bool TryDeserialize(string json, out AbpLocalizationInfo? localizationInfo)
+    {
+        return JsonHelper.TryDeserialize(json, out localizationInfo);
+    }
+}
+```
+
+That mirrors the shape every ABP localization JSON file uses: a `culture` string at the top and a `texts` dictionary of key → translation. `AbpLocalization` (in `AbpLocalization.cs`) is a small wrapper that pairs the parsed `AbpLocalizationInfo` with its source `FilePath`, which the tool needs because it re-saves the file back over the original path.
+
+`AbpAsyncKey.cs` defines the base report record:
+
+```csharp
+public class AbpAsyncKey
+{
+    public string NewValue = string.Empty;
+
+    public AbpAsyncKey(string key, string reference)
+    {
+        Key = key;
+        Reference = reference;
+    }
+
+    public virtual string Type => GetType().Name;
+    public string Key { get; set; }
+    public string Reference { get; set; }
+}
+```
+
+`Reference` is the *default-culture* value (so a translator knows what they should be writing), and `NewValue` is the editable field that the Apply step reads. The two concrete subclasses are `MissingKey` (defined in `MissingKey.cs`) which doesn't add any fields, and `ArgumentCountMismatch` (in `ArgumentCountMismatch.cs`):
+
+```csharp
+public class ArgumentCountMismatch : AbpAsyncKey
+{
+    public ArgumentCountMismatch(string key, string reference, int referenceArgumentCount, int argumentCount, string value)
+        : base(key, reference)
+    {
+        ReferenceArgumentCount = referenceArgumentCount;
+        ArgumentCount = argumentCount;
+        Value = value;
+    }
+
+    public int ReferenceArgumentCount { get; }
+    public int ArgumentCount { get;  }
+    public string Value { get; }
+}
+```
+
+Both `ReferenceArgumentCount` and `ArgumentCount` are counts of `{0}`-style placeholders, computed by the regex `MyRegex()` declared at the bottom of `LocalizationHelper.cs`:
+
+```csharp
+[GeneratedRegex("{(\\d+)}")]
+private static partial Regex MyRegex();
+```
+
+A `[GeneratedRegex]` source-generated regex is used because the tool scans hundreds of files and the cold-start cost of `new Regex(...)` adds up.
+
+## Workflow 1: Find
+
+The Find branch is the longest, because it both diffs and exports. The first thing it does is ask for the default culture file:
+
+```csharp
+case _1.Options.Find:
+{
+    // The default language path
+    var path = AnsiConsole.Ask<string>(_3);   // "Enter the default language path:"
+
+    if (!LocalizationHelper.TryGetLocalization(path, out var defaultLocalizationInfo))
+    {
+        AnsiConsole.MarkupLine("[red]The default language path is invalid![/]");
+        Exit();
+    }
+
+    var defaultCulture = new AbpLocalization(path, defaultLocalizationInfo!);
+```
+
+A typical invocation points `path` at a file like `/home/daytona/repos/abpframework/abp/modules/identity/src/Volo.Abp.Identity.Domain.Shared/Localization/AbpIdentity/en.json`. The tool then enumerates the sibling JSON files in the same folder:
+
+```csharp
+var paths = Directory.GetFiles(Path.GetDirectoryName(path)!, "*.json",
+    SearchOption.TopDirectoryOnly);
+
+var otherCulturePaths = paths.Select(Path.GetFileNameWithoutExtension).Where(x=>!string.IsNullOrWhiteSpace(x)).Select(x=>x!).ToList();
+
+paths = AnsiConsole.Prompt(
+        new MultiSelectionPrompt<string>()
+            .Title("Select other cultures")
+            .PageSize(10).AddChoiceGroup("All", otherCulturePaths))
+    .Select(x => Path.Combine(Path.GetDirectoryName(path)!, x + ".json"))
+    .ToArray();
+
+var otherCultures = LocalizationHelper.GetLocalizations(paths);
+var asyncLocalizations = defaultCulture.GetAsynchronousLocalizations(otherCultures);
+```
+
+`MultiSelectionPrompt` with the "All" group means the operator can either tick individual languages or hit the "All" header to select every culture next to `en.json` at once.
+
+### The Diff Algorithm
+
+`LocalizationHelper.GetAsynchronousLocalizations` in `LocalizationHelper.cs` does the actual work — and despite the suggestive name, "asynchronous" here means *out of sync*, not C# `async`:
+
+```csharp
+public static List<AbpAsyncLocalization> GetAsynchronousLocalizations(this AbpLocalization defaultLocalization,
+    IEnumerable<AbpLocalization> otherLocalizations)
+{
+    var results = new List<AbpAsyncLocalization>();
+    var defaultCultureKeysAndArgCount = defaultLocalization.LocalizationInfo.GetKeysAndArgCount();
+    foreach (var localization in otherLocalizations)
+    {
+        var keysAndArgCount = localization.LocalizationInfo.GetKeysAndArgCount();
+        var asynchronousResource =
+            new AbpAsyncLocalization(localization, defaultLocalization, new List<AbpAsyncKey>());
+        foreach (var (key, defaultCultureArgCount) in defaultCultureKeysAndArgCount)
+        {
+            if (keysAndArgCount.TryGetValue(key, out var value))
+            {
+                if (value != defaultCultureArgCount)
+                {
+                    asynchronousResource.AsyncKeys.Add(new ArgumentCountMismatch(key,
+                        defaultLocalization.LocalizationInfo.Texts[key], defaultCultureArgCount, value,
+                        localization.LocalizationInfo.Texts[key]));
+                }
+            }
+            else
+            {
+                asynchronousResource.AsyncKeys.Add(new MissingKey(key,
+                    defaultLocalization.LocalizationInfo.Texts[key]));
+            }
+        }
+
+        if (asynchronousResource.AsyncKeys.Any())
+        {
+            results.Add(asynchronousResource);
+        }
+    }
+    return results;
+}
+```
+
+The algorithm walks every key in the default culture once per other culture. Three outcomes for each key:
+
+1. Key present, same `{0}` count → ignored.
+2. Key present, different `{0}` count → `ArgumentCountMismatch`.
+3. Key missing → `MissingKey`.
+
+Cultures with zero issues are dropped before returning — the report only lists cultures that need attention.
+
+### The Second Prompt
+
+After the diff, the operator picks what to report on:
+
+```csharp
+var options = AnsiConsole.Prompt(
+    new MultiSelectionPrompt<string>()
+        .Title(_4.Question)   // "Find keys that do not match the number of arguments, find missing keys, or both?"
+        .PageSize(10)
+        .AddChoiceGroup("All", _4.Options.ArgumentsCount, _4.Options.MissingKeys));
+```
+
+If "Not matching arguments count" is chosen, a *third* prompt asks whether the bad keys should be deleted, exported, or both:
+
+```csharp
+var options2 = AnsiConsole.Prompt(
+    new MultiSelectionPrompt<string>()
+        .Title(_5.Question)   // "Should the keys that do not match the number of arguments be deleted, exported or both?"
+        ...
+        .AddChoiceGroup("All", _5.Options.Delete, _5.Options.Export));
+
+if (options2.Contains(_5.Options.Delete))
+{
+    LocalizationHelper.DeleteKeysThatDoNotMatchTheNumberOfArguments(asyncLocalizations);
+}
+```
+
+`DeleteKeysThatDoNotMatchTheNumberOfArguments` in `LocalizationHelper.cs` is destructive — it removes the offending keys from each culture's `Texts` dictionary and re-serialises:
+
+```csharp
+public static void DeleteKeysThatDoNotMatchTheNumberOfArguments(
+    IEnumerable<AbpAsyncLocalization> asynchronousResources)
+{
+    foreach (var resource in asynchronousResources)
+    {
+        foreach (var key in resource.AsyncKeys.Select(x => x.Key))
+        {
+            resource.Localization.LocalizationInfo.Texts.Remove(key);
+        }
+
+        File.WriteAllTextAsync(resource.Localization.FilePath,
+            JsonHelper.Serialize(resource.Localization.LocalizationInfo)).GetAwaiter().GetResult();
+    }
+}
+```
+
+<Warning>
+  The Delete option overwrites the localization JSON files in place using `File.WriteAllTextAsync` without prompting for confirmation. Always run inside a clean git checkout so `git diff` can show you what changed.
+</Warning>
+
+### The Export Format
+
+When the operator picks Export, `LocalizationHelper.Export<T>` writes a JSON file shaped by `AbpAsyncLocalizationViewModel`:
+
+```csharp
+public class AbpAsyncLocalizationViewModel
+{
+    public AbpAsyncLocalizationViewModel(string referenceCulture, string culture, string path, List<AbpAsyncKey> asyncKeys)
+    {
+        ReferenceCulture = referenceCulture;
+        Culture = culture;
+        Path = path;
+        AsyncKeys = asyncKeys;
+    }
+
+    public string ReferenceCulture { get; set; }
+    public string Culture { get; set; }
+    public string Path { get; set; }
+    public List<AbpAsyncKey> AsyncKeys { get; set; }
+}
+```
+
+The resulting file lists, for each culture, the *absolute* path back to the source JSON plus the keys that need translator attention. Each `AbpAsyncKey` carries an empty `NewValue` field — the translator's job is to fill those in.
+
+## Workflow 2: Apply
+
+The Apply branch reads the edited report and pushes the `NewValue` back into the source JSON files. The dispatcher:
+
+```csharp
+case _1.Options.Apply:
+{
+    var path = AnsiConsole.Ask<string>(_2);   // "Enter the absolute path to the exported file:"
+
+    if (!File.Exists(path))
+    {
+        AnsiConsole.MarkupLine("[red]The file does not exist![/]");
+        Exit();
+    }
+
+    if (LocalizationHelper.ApplyChanges(path))
+    {
+        AnsiConsole.MarkupLine("[green]The changes have been applied successfully![/]");
+        Exit();
+    }
+    ...
+}
+```
+
+`LocalizationHelper.ApplyChanges` iterates the view models, opens each original culture file, writes the new values, and saves:
+
+```csharp
+public static bool ApplyChanges(string path)
+{
+    var json = File.ReadAllTextAsync(path).GetAwaiter().GetResult();
+
+    if (JsonHelper.TryDeserialize(json, out List<AbpAsyncLocalizationViewModel>? asyncLocalizationViewModels) == false)
+    {
+        return false;
+    }
+
+    foreach (var asyncLocalizationViewModel in asyncLocalizationViewModels!)
+    {
+        if (TryGetLocalization(asyncLocalizationViewModel.Path, out var localizationInfo) == false)
+        {
+            return false;
+        }
+
+        foreach (var asyncKey in asyncLocalizationViewModel.AsyncKeys.Where(asyncKey =>
+                     !string.IsNullOrWhiteSpace(asyncKey.NewValue)))
+        {
+            localizationInfo!.Texts[asyncKey.Key] = asyncKey.NewValue;
+        }
+
+        File.WriteAllTextAsync(asyncLocalizationViewModel.Path,
+            JsonHelper.Serialize(localizationInfo)).GetAwaiter().GetResult();
+    }
+
+    return true;
+}
+```
+
+Notice the `Where(asyncKey => !string.IsNullOrWhiteSpace(asyncKey.NewValue))` guard — keys whose translators left `NewValue` blank are silently skipped, so an incomplete review doesn't wipe existing translations.
+
+## Workflow 3: Replace
+
+Replace is a bulk rename of a single key across a chosen set of cultures:
+
+```csharp
+case _1.Options.Replace:
+{
+    var path = AnsiConsole.Ask<string>(_9);    // "Enter the localization folder path:"
+    var oldKey = AnsiConsole.Ask<string>(_10); // "Enter the old key:"
+    var newKey = AnsiConsole.Ask<string>(_11); // "Enter the new key:"
+
+    var paths = Directory.GetFiles(path, "*.json", SearchOption.TopDirectoryOnly);
+    var localizationPaths = paths.Select(Path.GetFileNameWithoutExtension)...;
+
+    paths = AnsiConsole.Prompt(
+            new MultiSelectionPrompt<string>()
+                .Title("Select localizations")
+                .PageSize(10)
+                .AddChoiceGroup("All", localizationPaths))
+        .Select(x => Path.Combine(path, x + ".json"))
+        .ToArray();
+
+    var cultures = LocalizationHelper.GetLocalizations(paths);
+
+    LocalizationHelper.ReplaceKey(oldKey, newKey, cultures);
+
+    AnsiConsole.MarkupLine("[green]The keys have been replaced successfully![/]");
+    break;
+}
+```
+
+`LocalizationHelper.ReplaceKey` preserves the value, so renaming the key alone doesn't lose any translation work:
+
+```csharp
+public static void ReplaceKey(string oldKey, string newKey, List<AbpLocalization> localizations)
+{
+    foreach (var localization in localizations)
+    {
+        if (!localization.LocalizationInfo.Texts.TryGetValue(oldKey, out var value))
+        {
+            continue;
+        }
+
+        localization.LocalizationInfo.Texts.Remove(oldKey);
+        localization.LocalizationInfo.Texts.Add(newKey, value);
+        File.WriteAllTextAsync(localization.FilePath,
+            JsonHelper.Serialize(localization.LocalizationInfo)).GetAwaiter().GetResult();
+    }
+}
+```
+
+Cultures that don't contain `oldKey` are silently skipped (the `continue` after the `TryGetValue`), so the operator can point Replace at every culture in a module without worrying about partial coverage.
+
+## JSON Serialisation
+
+All file IO routes through `JsonHelper` in `tools/localization-key-synchronizer/src/JsonHelper.cs`, which is intentionally forgiving:
+
+```csharp
+public static class JsonHelper
+{
+    public static bool TryDeserialize<T>(string json, out T? result)
+    {
+        try
+        {
+            result = JsonConvert.DeserializeObject<T>(json);
+            return true;
+        }
+        catch (Exception)
+        {
+            result = default;
+            return false;
+        }
+    }
+
+    public static string Serialize<T>(T value)
+    {
+        return JsonConvert.SerializeObject(value, Formatting.Indented);
+    }
+}
+```
+
+The `Formatting.Indented` output means the rewritten culture files keep ABP's house style of two-space indentation. The `TryDeserialize` swallows exceptions and returns `false` rather than letting `Newtonsoft.Json` throw on a malformed file — which is what allows `Program.cs` to print user-friendly red error messages via Spectre.Console instead of dumping a stack trace.
+
+## Top-Level Error Handler
+
+`Program.cs` wraps the entire dispatch in a single try/catch that mirrors the same Spectre.Console aesthetic:
+
+```csharp
+catch (Exception e)
+{
+    Console.WriteLine(e);
+    AnsiConsole.MarkupLine($"[red]{e.Message}[/]");
+    Exit();
+}
+
+void Exit()
+{
+    AnsiConsole.MarkupLine("[red]Press any key to exit...[/]");
+    Console.ReadKey();
+    Environment.Exit(0);
+}
+```
+
+The `Console.ReadKey()` in `Exit` is what makes the binary usable when launched by double-clicking on Windows — without it, the window would vanish before the operator could read the error.
+
+## Practical Recipe
+
+A common workflow for a module maintainer who has just added 30 English keys to `Volo.Abp.Identity.Domain.Shared`:
+
+1. Run the tool, pick **Find asynchronous keys**.
+2. Point it at `modules/identity/src/Volo.Abp.Identity.Domain.Shared/Localization/AbpIdentity/en.json`.
+3. Select **All** other cultures.
+4. Tick **Missing keys**, enter an export path like `C:\Users\dev\Desktop\AbpIdentity-missing.json`.
+5. Open the exported file, fill in `NewValue` for each row.
+6. Re-run the tool, pick **Apply changes in the exported file**, point it at the same path.
+7. `git diff` the localization folder — only files that received `NewValue`s should have changed.
+
+## Related Pages
+
+<CardGroup cols={2}>
+  <Card title="Changelog Generator" icon="file-lines" href="/build/changelog-generator">
+    The Go-based sibling under `tools/github-changelog-generator/` that turns milestones into Markdown.
+  </Card>
+  <Card title="Overview" icon="map" href="/build/overview">
+    Map of every tool under `tools/`, including the localization synchronizer covered on this page.
+  </Card>
+</CardGroup>

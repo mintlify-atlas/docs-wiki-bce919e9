@@ -1,0 +1,395 @@
+---
+title: "NuGet Tooling: Packing, Pushing and Version Sources"
+sidebarTitle: "NuGet Tools"
+description: "The ABP Framework NuGet story: tools/nuget/nuget.exe, the nupkg/ output folder, NuGet.Config feed list, and the latest-versions.json catalog."
+---
+
+NuGet is the primary distribution channel for the ABP Framework, and the repository's NuGet plumbing is spread across three locations on disk: the ad-hoc `tools/nuget/` folder, the `nupkg/` output-and-orchestration folder, and a small set of metadata files at the repo root. This page covers what's in each, how they cooperate during a release, and how `latest-versions.json` keeps the website honest.
+
+## `tools/nuget/` — the Standalone CLI
+
+The `tools/nuget/` folder under `/home/daytona/repos/abpframework/abp/tools/nuget/` is intentionally bare:
+
+```text
+tools/nuget/
+└── nuget.exe         # PE32 MS Windows 4.00 (console), Intel i386 Mono/.Net assembly
+```
+
+That single file is the classic Microsoft `nuget.exe` CLI — a 32-bit Mono/.NET console executable about 7 MB on disk. It's checked into the repo as a convenience: developers on Windows can call `tools\nuget\nuget.exe locals all -clear` to wipe their NuGet caches without first installing the CLI from `https://www.nuget.org/downloads`. It is *not* called by any script in `build/` or `deploy/` — those use the modern `dotnet nuget` SDK command instead, because `dotnet nuget push` supports `--skip-duplicate` and properly handles `.snupkg` symbol packages.
+
+<Note>
+  The release pipeline uses `dotnet nuget push` (see `nupkg/push_packages.ps1` discussed below), not `tools/nuget/nuget.exe`. The CLI is kept here for one-off operator chores like inspecting a package with `nuget.exe verify` or signing a package outside the standard pipeline.
+</Note>
+
+## The `NuGet.Config` Source List
+
+At the repo root, `/home/daytona/repos/abpframework/abp/NuGet.Config` is the single source of NuGet feeds for the entire build:
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+    <packageSources>
+        <add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+    </packageSources>
+</configuration>
+```
+
+There is exactly one source: `nuget.org` at `https://api.nuget.org/v3/index.json`. Two consequences flow from that.
+
+First, every transitive `<PackageReference>` in any `csproj` under the repo — and there are hundreds — *must* be resolvable from nuget.org. There's no private MyGet, no Azure DevOps feed, and no fallback to a local file share. This is a deliberate constraint that keeps the open-source build reproducible.
+
+Second, the same `https://api.nuget.org/v3/index.json` URL is hard-coded in `nupkg/push_packages.ps1` as the push target:
+
+```powershell
+$nugetUrl = "https://api.nuget.org/v3/index.json"
+...
+$pushOutput = dotnet nuget push $nugetPackageName --skip-duplicate -s $nugetUrl --api-key "$apiKey" 2>&1
+```
+
+So both the *consumption* side (restore) and the *production* side (push) use the same URL, ensuring the package an operator just published will be the one a downstream user restores.
+
+## `Directory.Packages.props` — Central Package Management
+
+The third NuGet-related root file is `Directory.Packages.props`, which switches the whole repo into Central Package Management:
+
+```xml
+<Project>
+  <PropertyGroup>
+    <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
+    <CentralPackageFloatingVersionsEnabled>true</CentralPackageFloatingVersionsEnabled>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageVersion Include="AlibabaCloud.SDK.Dysmsapi20170525" Version="4.0.0" />
+    <PackageVersion Include="Autofac" Version="9.1.0" />
+    <PackageVersion Include="Autofac.Extensions.DependencyInjection" Version="11.0.0" />
+    <PackageVersion Include="AutoMapper" Version="14.0.0" />
+    <PackageVersion Include="AWSSDK.S3" Version="4.0.7.2" />
+    <PackageVersion Include="Azure.Storage.Blobs" Version="12.25.0" />
+    <PackageVersion Include="MudBlazor" Version="8.0.0" />
+    <PackageVersion Include="Confluent.Kafka" Version="2.11.1" />
+    ...
+  </ItemGroup>
+</Project>
+```
+
+`ManagePackageVersionsCentrally=true` tells MSBuild that no `<PackageReference>` anywhere in the tree may carry a `Version` attribute — versions live exclusively in this file. `CentralPackageFloatingVersionsEnabled=true` opts in to floating versions like `[8.*,9.0)` within central management. Concretely: a contributor who wants to bump AutoMapper edits exactly one line in `Directory.Packages.props`, and the new version is pulled into every project on the next `dotnet restore`.
+
+That single-source-of-truth model is why `nupkg/pack.ps1` can confidently shell out to `dotnet pack` ~250 times without worrying about version drift between packages — they all resolve the same `Directory.Packages.props`.
+
+## `nupkg/` — Where Packages Land
+
+The `nupkg/` folder at `/home/daytona/repos/abpframework/abp/nupkg/` is *both* the staging area for `.nupkg` files and the home of the orchestration scripts that produce and push them. Its layout:
+
+```text
+nupkg/
+├── 0                                # placeholder file (a single byte 0a)
+├── common.ps1                       # 530 lines: $solutions, $projects, Write-Info, Get-Current-Version
+├── common.ps1.bak                   # the pre-edit backup, deliberately checked in
+├── pack.ps1                         # dotnet pack loop over $projects
+├── push_packages.ps1                # dotnet nuget push loop with retry
+├── push-nightly-packages-myget.ps1  # alternate push for nightly builds
+└── unit_test.ps1                    # dotnet test loop over $solutions
+```
+
+When the release runs, `dotnet pack -c Release --no-build` deposits one `.nupkg` per project into each project's `bin/Release/`. `pack.ps1` then moves the freshly built packages into the `nupkg/` folder itself with:
+
+```powershell
+$projectName = $project.Substring($project.LastIndexOf("/") + 1)
+$projectPackPath = Join-Path $projectFolder ("/bin/Release/" + $projectName + ".*.nupkg")
+Move-Item -Force $projectPackPath $packFolder
+```
+
+so by the time `push_packages.ps1` runs, the folder contains exactly one file per `$projects` entry, named `<ProjectName>.<Version>.nupkg`. The `Get-ChildItem -Filter *.nupkg | Sort-Object Name` pattern used by `push-nightly-packages-myget.ps1` works against the same layout for nightly publish flows.
+
+### The `$projects` Master List
+
+`nupkg/common.ps1` contains a single ~250-entry array that *is* the contract of what ABP ships as NuGet packages. A representative slice:
+
+```powershell
+$projects = (
+    # framework
+    "framework/src/Volo.Abp.AI.Abstractions",
+    "framework/src/Volo.Abp.AI",
+    "framework/src/Volo.Abp.AspNetCore.Authentication.JwtBearer",
+    "framework/src/Volo.Abp.AspNetCore.Mvc.Dapr",
+    "framework/src/Volo.Abp.AspNetCore.Components.Server",
+    "framework/src/Volo.Abp.AspNetCore.Components.WebAssembly.Theming",
+    ...
+    # modules/cms-kit
+    "modules/cms-kit/src/Volo.CmsKit.Admin.Application",
+    "modules/cms-kit/src/Volo.CmsKit.Domain",
+    "modules/cms-kit/src/Volo.CmsKit.EntityFrameworkCore",
+    "modules/cms-kit/src/Volo.CmsKit.Installer",
+    "source-code/Volo.CmsKit.SourceCode"
+)
+```
+
+Every entry is a path *to a project folder*, not a `.csproj` file. The base name (the part after the final `/`) becomes both the assembly name and the NuGet package id — so `framework/src/Volo.Abp.AI` produces a package called `Volo.Abp.AI`. Adding a new shipping project means a `<PackageVersion>` entry in `Directory.Packages.props` *plus* a new line in this array.
+
+### The Sibling `$solutions` List
+
+A separate array enumerates *solutions* (parent folders that contain a `.sln`) used by `dotnet restore` and `unit_test.ps1`:
+
+```powershell
+$solutions = (
+    "framework",
+    "modules/account",
+    "modules/audit-logging",
+    "modules/background-jobs",
+    "modules/basic-theme",
+    "modules/blogging",
+    ...
+    "modules/blob-storing-database",
+    "modules/cms-kit"
+)
+```
+
+This list is consumed by `pack.ps1` at the top of the script: it runs `dotnet restore` for each solution before any packing, so MSBuild's package graph is fully populated for the subsequent `dotnet pack` calls.
+
+## `pack.ps1` Walkthrough
+
+The complete `nupkg/pack.ps1` is short enough to read top-to-bottom:
+
+```powershell
+. ".\common.ps1"
+# Delete existing nupkg files
+del *.nupkg
+
+# Rebuild all solutions
+foreach($solution in $solutions) {
+    $solutionFolder = Join-Path $rootFolder $solution
+    Set-Location $solutionFolder
+    dotnet restore
+}
+
+# Create all packages
+$i = 0
+$projectsCount = $projects.length
+Write-Info "Running dotnet pack on $projectsCount projects..."
+
+foreach($project in $projects) {
+    $i += 1
+    $projectFolder = Join-Path $rootFolder $project
+    $projectName = ($project -split '/')[-1]
+
+    Write-Info "[$i / $projectsCount] - Packing project: $projectName"
+    Set-Location $projectFolder
+
+    dotnet pack -c Release --no-build -- /maxcpucount
+
+    if (-Not $?) {
+        Write-Error "Packaging failed for the project: $projectName"
+        exit $LASTEXITCODE
+    }
+
+    # Move nuget package
+    $projectName = $project.Substring($project.LastIndexOf("/") + 1)
+    $projectPackPath = Join-Path $projectFolder ("/bin/Release/" + $projectName + ".*.nupkg")
+    Move-Item -Force $projectPackPath $packFolder
+
+    Seperator
+}
+
+# Go back to the pack folder
+Set-Location $packFolder
+```
+
+The `del *.nupkg` on line 3 is the critical hygiene step — without it, a re-run after a partial failure would push *stale* packages built from an older version. The `--no-build` flag works because `deploy/1-fetch-and-build.ps1` already invoked `build-all-release.ps1`. The `--` separator before `/maxcpucount` is required because `/maxcpucount` is an MSBuild switch, not a `dotnet pack` switch — `dotnet` would otherwise reject it.
+
+## `push_packages.ps1` and Retry Logic
+
+The push script reads the version from `common.props`, iterates `$projects`, and uses a retry loop with growing back-offs:
+
+```powershell
+. ".\common.ps1"
+
+$apiKey = $args[0]
+
+# Get the version
+[xml]$commonPropsXml = Get-Content (Join-Path $rootFolder "common.props")
+$version = $commonPropsXml.Project.PropertyGroup.Version
+
+$nugetUrl = "https://api.nuget.org/v3/index.json"
+$maxQuotaRetryCount = 3
+$quotaRetryDelaysInSeconds = @(30, 60, 120)
+$failedPackagesFilePath = Join-Path $packFolder "failed-packages.txt"
+Set-Location $packFolder
+if (Test-Path $failedPackagesFilePath) { Remove-Item $failedPackagesFilePath -Force }
+
+foreach($project in $projects) {
+    $i += 1
+    $projectName = ($project -split '/')[-1]
+    $nugetPackageName = $projectName + "." + $version + ".nupkg"
+    $nugetPackageExists = Test-Path $nugetPackageName -PathType leaf
+
+    Write-Info "[$i / $totalProjectsCount] - Pushing: $nugetPackageName"
+
+    if ($nugetPackageExists)
+    {
+        $attempt = 0
+        $pushSucceeded = $false
+        while ($true)
+        {
+            $attempt += 1
+            $pushOutput = dotnet nuget push $nugetPackageName --skip-duplicate -s $nugetUrl --api-key "$apiKey" 2>&1
+            ...
+        }
+    }
+}
+```
+
+Three retries with 30/60/120-second delays neatly absorb NuGet's per-minute quota window. Failed packages — those that exhausted all retries — are written into `nupkg/failed-packages.txt`, which gives the operator a copy-pasteable retry list.
+
+### The `push-nightly-packages-myget.ps1` Variant
+
+`nupkg/push-nightly-packages-myget.ps1` is the nightly twin: it takes both the source URL and the API key as parameters so it can target a non-prod feed, and it pushes *every* `*.nupkg` in the folder rather than iterating `$projects`:
+
+```powershell
+param(
+  [string]$source,
+  [string]$apikey
+)
+
+if (!$source) { $source = "https://nuget.org/" }
+if (!$apikey)  { $apikey = "dummy" }
+
+$packages = Get-ChildItem -Filter *.nupkg | Sort-Object Name
+
+foreach ($package in $packages)
+{
+    $packageName = $package.Name
+    Write-Host "Pushing nightly package: $packageName"
+    ...
+    $pushOutput = dotnet nuget push $packageName -s $source --skip-duplicate --api-key $apikey 2>&1
+    ...
+}
+```
+
+The script's name preserves the historical context — nightly builds used to go to MyGet — but with `$source` defaulted to `https://nuget.org/` it can now serve any feed. Same retry pattern, same `failed-packages.txt` output.
+
+## `unit_test.ps1` — the Test Harness for Packages
+
+`nupkg/unit_test.ps1` is a minimal smoke harness:
+
+```powershell
+. ".\common.ps1"
+
+# Unit test for all solutions
+foreach($solution in $solutions) {
+    $solutionFolder = Join-Path $rootFolder $solution
+    Set-Location $solutionFolder
+    dotnet test --no-build --logger trx
+}
+```
+
+It exists alongside `pack.ps1` so an operator who's already built in Release can quickly re-run xUnit on the same artefacts before signing off on a push. The `--no-build` flag mirrors `build/test-all.ps1`; the `--logger trx` flag produces Visual Studio-format `.trx` reports under each project's `TestResults/` for easier diff review.
+
+## `common.props` — Package Metadata
+
+The `<Version>` value in `/home/daytona/repos/abpframework/abp/common.props` is what ends up in every `.nupkg` produced by `pack.ps1`. The full file is dense; the metadata-relevant fragment:
+
+```xml
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Version>10.4.0-rc.2</Version>
+    <LeptonXVersion>5.4.0-rc.2</LeptonXVersion>
+    <NoWarn>$(NoWarn);CS1591;CS0436</NoWarn>
+    <PackageIconUrl>https://abp.io/assets/abp_nupkg.png</PackageIconUrl>
+    <PackageProjectUrl>https://abp.io/</PackageProjectUrl>
+    <PackageLicenseExpression>LGPL-3.0-only</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+    <RepositoryUrl>https://github.com/abpframework/abp/</RepositoryUrl>
+    <PackageReadmeFile>NuGet.md</PackageReadmeFile>
+    <PackageTags>aspnetcore boilerplate framework web best-practices angular maui blazor mvc csharp webapp</PackageTags>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <AllowedOutputExtensionsInPackageBuildOutputFolder>$(AllowedOutputExtensionsInPackageBuildOutputFolder);.pdb</AllowedOutputExtensionsInPackageBuildOutputFolder>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\..\NuGet.md" Pack="true" PackagePath="\"/>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+  ...
+</Project>
+```
+
+Worth noting:
+
+- `<PackageReadmeFile>NuGet.md</PackageReadmeFile>` plus the `<None Include="..\..\NuGet.md" Pack="true" />` line pack the root `NuGet.md` into every package, so each one renders a real README on nuget.org rather than the default fallback.
+- `<AllowedOutputExtensionsInPackageBuildOutputFolder>` is extended with `.pdb` so symbol files are bundled inside the main `.nupkg` rather than requiring a separate `.snupkg`.
+- `Microsoft.SourceLink.GitHub` is added as a `<PackageReference>` for every project, enabling source-stepping from the published symbols straight to https://github.com/abpframework/abp/.
+- `<PackageLicenseExpression>LGPL-3.0-only</PackageLicenseExpression>` is what shows the LGPL badge on each nuget.org listing.
+
+There's also a packaging convention for `*.abppkg` and `*.abppkg.analyze.json` content files — these are ABP's own package marker JSON files, included as `content\` so consuming projects can discover module metadata via reflection at runtime.
+
+## `latest-versions.json` — the Catalog
+
+`/home/daytona/repos/abpframework/abp/latest-versions.json` is the human-readable release history. It's an array, newest first, with the structure:
+
+```json
+[
+  {
+    "version": "10.3.0",
+    "releaseDate": "",
+    "type": "stable",
+    "message": "",
+    "leptonx": { "version": "5.3.0" }
+  },
+  {
+    "version": "10.2.1",
+    "releaseDate": "",
+    "type": "stable",
+    "message": "",
+    "leptonx": { "version": "5.2.1" }
+  },
+  ...
+  {
+    "version": "9.0.0",
+    "releaseDate": "",
+    "type": "stable",
+    "message": "",
+    "leptonx": { "version": "4.0.0" }
+  },
+  {
+    "version": "8.3.1",
+    "releaseDate": "",
+    "type": "stable",
+    "message": "",
+    "leptonx": { "version": "3.3.1" }
+  }
+]
+```
+
+Each entry pairs an ABP `version` with the matching LeptonX theme `version`. The `type` field is `stable` for everything in the published file; the schema reserves room for `preview`/`rc` markers. `message` is unused at rest but read by the docs site as a banner when populated.
+
+This file is what the `abp.io` website parses to render the "Latest ABP Framework releases" widget, and what the ABP CLI's update commands compare against to detect newer releases. It is updated by hand as part of a release — typically in the same commit that bumps `common.props`. The `/.github/workflows/update-versions.yml` workflow (`update-versions.yml`) automates that step on a schedule.
+
+<Tip>
+  When you bump `<Version>` in `common.props` for a stable release, prepend a matching entry to `latest-versions.json` so the docs site shows the new version on the next deploy. The current head — `10.3.0` paired with LeptonX `5.3.0` — illustrates the structure.
+</Tip>
+
+## End-to-End: a Single Package
+
+Tracing the package `Volo.Abp.AI` (chosen because it sits at the top of `$projects`) from source to nuget.org:
+
+1. `framework/src/Volo.Abp.AI/Volo.Abp.AI.csproj` imports `Directory.Build.props`, which in turn brings in `common.props` and `Directory.Packages.props`.
+2. `build/build-all-release.ps1` runs `dotnet build -c Release -- /maxcpucount` on the `framework` solution, producing `framework/src/Volo.Abp.AI/bin/Release/net*/Volo.Abp.AI.dll` with `ConfigureAwait.Fody` IL weaving.
+3. `nupkg/pack.ps1` calls `dotnet pack -c Release --no-build`, producing `framework/src/Volo.Abp.AI/bin/Release/Volo.Abp.AI.10.4.0-rc.2.nupkg`, then `Move-Item` to `nupkg/Volo.Abp.AI.10.4.0-rc.2.nupkg`.
+4. `nupkg/push_packages.ps1` invokes `dotnet nuget push Volo.Abp.AI.10.4.0-rc.2.nupkg --skip-duplicate -s https://api.nuget.org/v3/index.json --api-key <key>`.
+5. Once the GitHub release goes out (step 7 of the deploy chain), the entry `10.4.0-rc.2` becomes eligible to be added to `latest-versions.json` and surfaced on `abp.io`.
+
+## Related Pages
+
+<CardGroup cols={2}>
+  <Card title="Deploy Scripts" icon="rocket" href="/build/deploy-scripts">
+    Step 2 (`2-nuget-pack.ps1`) and step 3 (`3-nuget-push.ps1`) are the deploy wrappers that call `pack.ps1` and `push_packages.ps1`.
+  </Card>
+  <Card title="Build Scripts" icon="hammer" href="/build/build-scripts">
+    The `build/build-all-release.ps1` script that runs before packaging, plus the role of `configureawait.props` in Release-mode IL.
+  </Card>
+</CardGroup>

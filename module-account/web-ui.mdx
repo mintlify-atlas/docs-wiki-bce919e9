@@ -1,0 +1,340 @@
+---
+title: "Account Web UI: Shared Razor Pages for Both OIDC Hosts"
+sidebarTitle: "Web UI"
+description: "Inside Volo.Abp.Account.Web: LoginModel, RegisterModel, ResetPasswordModel, ManageModel, the menu contributor, AbpAccountOptions, profile-management hooks."
+---
+
+`modules/account/src/Volo.Abp.Account.Web/` is the home of every Razor Page the ABP Framework Account module displays. It is intentionally agnostic of which OAuth/OIDC server runs underneath — both `Volo.Abp.Account.Web.OpenIddict` and `Volo.Abp.Account.Web.IdentityServer` depend on this package and override individual page models. The package also ships the user-menu contributor and the profile management hub, both of which are reused by every host.
+
+## Module wiring
+
+`Volo.Abp.Account.Web/AbpAccountWebModule.cs` is declared with:
+
+```csharp
+[DependsOn(
+    typeof(AbpAccountApplicationContractsModule),
+    typeof(AbpIdentityAspNetCoreModule),
+    typeof(AbpMapperlyModule),
+    typeof(AbpAspNetCoreMvcUiThemeSharedModule),
+    typeof(AbpExceptionHandlingModule)
+    )]
+public class AbpAccountWebModule : AbpModule { /* ... */ }
+```
+
+`PreConfigureServices` does two things: it adds the contracts and the Web assemblies to `AbpMvcDataAnnotationsLocalizationOptions` (so `[Required]` etc. localize through `AccountResource`), and it registers the assembly as an MVC application part. `ConfigureServices` then:
+
+1. Embeds the views with `options.FileSets.AddEmbedded<AbpAccountWebModule>()`.
+2. Adds `new AbpAccountUserMenuContributor()` to `AbpNavigationOptions.MenuContributors`.
+3. Calls `ConfigureProfileManagementPage()` (see below).
+4. Registers the Mapperly mapper via `AddMapperlyObjectMapper<AbpAccountWebModule>()`.
+5. Disables the dynamic JS proxy for the `account` module:
+   ```csharp
+   Configure<DynamicJavaScriptProxyOptions>(options =>
+   {
+       options.DisableModule(AccountRemoteServiceConsts.ModuleName);
+   });
+   ```
+
+The dynamic-JS-proxy disable is significant: the Razor pages talk to the application services in-process, so emitting a JavaScript proxy for them would waste bytes and create confusing duplicate APIs.
+
+## `AccountPageModel`
+
+Every page in `Volo.Abp.Account.Web/Pages/Account/` inherits `AccountPageModel` (`Pages/Account/AccountPageModel.cs`):
+
+```csharp
+public abstract class AccountPageModel : AbpPageModel
+{
+    public IAccountAppService AccountAppService { get; set; }
+    public SignInManager<IdentityUser> SignInManager { get; set; }
+    public IdentityUserManager UserManager { get; set; }
+    public IdentitySecurityLogManager IdentitySecurityLogManager { get; set; }
+    public IOptions<IdentityOptions> IdentityOptions { get; set; }
+    public IExceptionToErrorInfoConverter ExceptionToErrorInfoConverter { get; set; }
+
+    protected AccountPageModel()
+    {
+        LocalizationResourceType = typeof(AccountResource);
+        ObjectMapperContext = typeof(AbpAccountWebModule);
+    }
+    // ... CheckCurrentTenant, RedirectSafelyAsync, GetLocalizeExceptionMessage
+}
+```
+
+Property injection (the `get; set;` setters) is used so derived host-specific models — `OpenIddictSupportedLoginModel`, `IdentityServerSupportedLoginModel` — can be hand-constructed without re-declaring all the dependencies in their own constructors. The `RedirectSafelyAsync` helper is what every page uses to honor `ReturnUrl`/`ReturnUrlHash` while refusing open-redirects (it ultimately calls `IAppUrlProvider.IsRedirectAllowedUrlAsync`).
+
+## The pages
+
+| File | Page model | What it does |
+| --- | --- | --- |
+| `Pages/Account/Login.cshtml` | `LoginModel` | Local + external login |
+| `Pages/Account/Register.cshtml` | `RegisterModel` | Local + external registration |
+| `Pages/Account/ForgotPassword.cshtml` | `ForgotPasswordModel` | Sends reset email |
+| `Pages/Account/PasswordResetLinkSent.cshtml` | `PasswordResetLinkSentModel` | "Check your inbox" |
+| `Pages/Account/ResetPassword.cshtml` | `ResetPasswordModel` | Sets a new password |
+| `Pages/Account/ResetPasswordConfirmation.cshtml` | `ResetPasswordConfirmationModel` | Success page |
+| `Pages/Account/Logout.cshtml` | `LogoutModel` | Signs out |
+| `Pages/Account/LoggedOut.cshtml` | `LoggedOutModel` | Post-logout landing |
+| `Pages/Account/Manage.cshtml` | `ManageModel` | Profile management hub |
+| `Pages/Account/AccessDenied.cshtml` | `AccessDeniedModel` | 403 page |
+
+Each `.cshtml` file pairs with a `.cshtml.cs` page model in the same folder. The Razor markup imports `AccountResource` and the current `IThemeManager` so the page renders inside the theme-supplied `AccountLayout`:
+
+```cshtml
+@inject IThemeManager ThemeManager
+@{
+    Layout = ThemeManager.CurrentTheme.GetAccountLayout();
+}
+```
+
+That single hook is why the same pages render correctly inside the LeptonX, Basic, and Volo Theme packages without modification.
+
+### `LoginModel`
+
+`Pages/Account/Login.cshtml.cs` is the most complex file in the package. The shape:
+
+- `[BindProperty] public LoginInputModel LoginInput { get; set; }` carries `UserNameOrEmailAddress`, `Password`, `RememberMe`.
+- `[HiddenInput, BindProperty(SupportsGet = true)] public string ReturnUrl { get; set; }` (and `ReturnUrlHash`) are echoed through the OIDC roundtrip.
+- `ExternalProviders` is populated by `GetExternalProviders()` from `IAuthenticationSchemeProvider`. The page filters them: only schemes with a non-null `DisplayName` are shown — unless the scheme name matches `AbpAccountOptions.WindowsAuthenticationSchemeName`, in which case it is included unconditionally.
+- `EnableLocalLogin` reflects `AccountSettingNames.EnableLocalLogin` and gates the local form.
+- `IsExternalLoginOnly` triggers a *direct* challenge to the single external provider during `OnGetAsync` if local login is disabled and only one external provider exists.
+
+`OnPostAsync` calls `SignInManager.PasswordSignInAsync`, then handles each `SignInResult` branch (`RequiresTwoFactor`, `IsLockedOut`, `IsNotAllowed`, `!Succeeded`). Every branch writes an entry to `IdentitySecurityLogManager`. On success, the cache invalidation `IdentityDynamicClaimsPrincipalContributorCache.ClearAsync(user.Id, user.TenantId)` runs before `RedirectSafelyAsync`.
+
+A small but important detail: `ReplaceEmailToUsernameOfInputIfNeeds` rewrites the input from an email address to the corresponding username before calling Identity, because `SignInManager.PasswordSignInAsync` only understands usernames.
+
+### External login callback
+
+`OnGetExternalLoginCallbackAsync` is invoked after the external provider redirects back. It calls `SignInManager.ExternalLoginSignInAsync`. If the result fails because no `IdentityUser` exists for this `loginInfo.LoginProvider + loginInfo.ProviderKey`, the page either:
+
+- finds an existing user by email (extracted via `AbpClaimTypes.Email` or fallback `ClaimTypes.Email`) and adds the external login to them (`UserManager.AddLoginAsync`), then signs them in; or
+- redirects to `./Register` with `IsExternalLogin = true` so the user finishes provisioning.
+
+### `RegisterModel`
+
+`Pages/Account/Register.cshtml.cs` exposes a nested `PostInput` class with `UserName`, `EmailAddress`, and `Password` (the last is `[DisableAuditing]`). The page handles two modes:
+
+- **Local registration** — calls `AccountAppService.RegisterAsync(new RegisterDto { ... })`.
+- **External registration** — calls `RegisterExternalUserAsync(externalLoginInfo, Input.UserName, Input.EmailAddress)`, which creates the `IdentityUser` directly via `UserManager.CreateAsync(user)` (no password), then `UserManager.AddLoginAsync(user, externalLoginInfo)`.
+
+`CheckSelfRegistrationAsync` consults `AccountSettingNames.IsSelfRegistrationEnabled` exactly the same way the application service does. When self-registration is off but an external provider is configured, an `IsExternalLoginOnly` users still get through — that combination matters for B2B portals that disable local registration but require Azure AD login.
+
+### `ResetPasswordModel`
+
+`Pages/Account/ResetPassword.cshtml.cs` carries `UserId`, `ResetToken`, `Password`, and `ConfirmPassword`. Its `OnGetAsync` short-circuits with `InvalidToken = true` if `AccountAppService.VerifyPasswordResetTokenAsync` returns false (typically because the token has expired or has already been redeemed). `OnPostAsync` runs `ValidateModel` — overridden to check `Password == ConfirmPassword` — then calls `AccountAppService.ResetPasswordAsync` and redirects to `./ResetPasswordConfirmation`.
+
+### `ForgotPasswordModel` and confirmation flow
+
+`Pages/Account/ForgotPassword.cshtml.cs` simply calls `AccountAppService.SendPasswordResetCodeAsync` with `AppName = "MVC"` (hard-coded — there is a `//TODO: Const!` note in the source). After a successful send it redirects to `./PasswordResetLinkSent`. The associated `PasswordResetLinkSent.cshtml`/`.cs` pair has no logic beyond accepting `ReturnUrl`/`ReturnUrlHash`.
+
+There is **no email-confirmation page** in this Web package — email confirmation, two-factor enrollment, and confirmation-email handling are part of the Identity module's pages, not Account's. The Account module deliberately stops at password reset and registration.
+
+### `ManageModel` and profile management
+
+`Pages/Account/Manage.cshtml.cs` builds a `ProfileManagementPageCreationContext`, runs every `IProfileManagementPageContributor` registered through `ProfileManagementPageOptions`, then renders the resulting tabs:
+
+```csharp
+public virtual async Task<IActionResult> OnGetAsync()
+{
+    ProfileManagementPageCreationContext = new ProfileManagementPageCreationContext(ServiceProvider);
+
+    foreach (var contributor in Options.Contributors)
+    {
+        await contributor.ConfigureAsync(ProfileManagementPageCreationContext);
+    }
+    // ReturnUrl safety check ...
+    return Page();
+}
+```
+
+The default contributor is registered inside `AbpAccountWebModule.ConfigureProfileManagementPage()`:
+
+```csharp
+Configure<RazorPagesOptions>(options =>
+{
+    options.Conventions.AuthorizePage("/Account/Manage");
+});
+
+Configure<ProfileManagementPageOptions>(options =>
+{
+    options.Contributors.Add(new AccountProfileManagementPageContributor());
+});
+```
+
+`Volo.Abp.Account.Web/ProfileManagement/AccountProfileManagementPageContributor.cs` adds two tabs:
+
+- **Password** — `AccountProfilePasswordManagementGroupViewComponent` (only shown when the user is not external, i.e. has a password to change).
+- **Personal info** — `AccountProfilePersonalInfoManagementGroupViewComponent`.
+
+The view components live under `Pages/Account/Components/ProfileManagementGroup/Password/` and `.../PersonalInfo/`. The bundling registration inside `ConfigureProfileManagementPage` adds three JS files to the page's script bundle:
+
+```csharp
+Configure<AbpBundlingOptions>(options =>
+{
+    options.ScriptBundles
+        .Configure(typeof(ManageModel).FullName,
+            configuration =>
+            {
+                configuration.AddFiles("/client-proxies/account-proxy.js");
+                configuration.AddFiles("/Pages/Account/Components/ProfileManagementGroup/Password/Default.js");
+                configuration.AddFiles("/Pages/Account/Components/ProfileManagementGroup/PersonalInfo/Default.js");
+            });
+});
+```
+
+Hosts can plug in additional tabs by adding their own `IProfileManagementPageContributor` to `ProfileManagementPageOptions.Contributors`. The contracts for that are in `Volo.Abp.Account.Web/ProfileManagement/`:
+
+- `IProfileManagementPageContributor.cs` — the interface.
+- `ProfileManagementPageCreationContext.cs` — exposes `ServiceProvider` and the `List<ProfileManagementPageGroup> Groups`.
+- `ProfileManagementPageGroup.cs` — `Id`, `DisplayName`, `ComponentType`, optional `Parameter`.
+- `ProfileManagementPageOptions.cs` — the options object.
+
+## API-style `AccountController` for SPA pre-flight
+
+`Volo.Abp.Account.Web/Areas/Account/Controllers/AccountController.cs` is *not* the same as the HTTP API controller from the previous page — this one lives in `Areas/Account/Controllers/` and exists to support cookie-based sign-in from JavaScript code on the same host. Its routes:
+
+```csharp
+[Route("api/account")]
+public class AccountController : AbpControllerBase
+{
+    [HttpPost, Route("login")]
+    public virtual async Task<AbpLoginResult> Login(UserLoginInfo login) { /* ... */ }
+
+    [HttpGet, Route("logout")]
+    public virtual async Task Logout() { /* ... */ }
+
+    [HttpPost, Route("checkPassword")]
+    [ApiExplorerSettings(IgnoreApi = true)]
+    public virtual Task<AbpLoginResult> CheckPasswordCompatible(UserLoginInfo login) { /* ... */ }
+
+    [HttpPost, Route("check-password")]
+    public virtual async Task<AbpLoginResult> CheckPassword(UserLoginInfo login) { /* ... */ }
+}
+```
+
+The result type is `Volo.Abp.Account.Web/Areas/Account/Controllers/Models/AbpLoginResult.cs`:
+
+```csharp
+public class AbpLoginResult
+{
+    public AbpLoginResult(LoginResultType result) { Result = result; }
+    public LoginResultType Result { get; }
+    public string Description => Result.ToString();
+}
+```
+
+And `LoginResultType.cs`:
+
+```csharp
+public enum LoginResultType : byte
+{
+    Success = 1,
+    InvalidUserNameOrPassword = 2,
+    NotAllowed = 3,
+    LockedOut = 4,
+    RequiresTwoFactor = 5
+}
+```
+
+`UserLoginInfo` (`Models/UserLoginInfo.cs`) carries `UserNameOrEmailAddress`, `Password`, `RememberMe`. The controller calls `SignInManager.PasswordSignInAsync`, writes an `IdentitySecurityLogContext`, clears the dynamic-claims cache, and returns a populated `AbpLoginResult`. The route exists primarily so the legacy MVC SPA can perform an Ajax login without leaving the page; it is *not* used by the OpenIddict or IdentityServer flow.
+
+## `AbpAccountOptions`
+
+`Volo.Abp.Account.Web/AbpAccountOptions.cs` is the single options class the web package exposes:
+
+```csharp
+public class AbpAccountOptions
+{
+    public string WindowsAuthenticationSchemeName { get; set; }
+
+    public AbpAccountOptions()
+    {
+        WindowsAuthenticationSchemeName = "Windows";
+    }
+}
+```
+
+The value is consulted in two places: `LoginModel.GetExternalProviders` (to include the Windows scheme even when it has no `DisplayName`) and `OpenIddictSupportedLoginModel.OnPostExternalLogin` (to branch to `ProcessWindowsLoginAsync`). Hosts that want a different scheme name override it via the standard `Configure<AbpAccountOptions>(...)` call.
+
+## Menu contributor
+
+`Volo.Abp.Account.Web/AbpAccountUserMenuContributor.cs` populates the `StandardMenus.User` menu:
+
+```csharp
+public class AbpAccountUserMenuContributor : IMenuContributor
+{
+    public virtual Task ConfigureMenuAsync(MenuConfigurationContext context)
+    {
+        if (context.Menu.Name != StandardMenus.User) return Task.CompletedTask;
+
+        var uiResource = context.GetLocalizer<AbpUiResource>();
+        var accountResource = context.GetLocalizer<AccountResource>();
+
+        context.Menu.AddItem(new ApplicationMenuItem("Account.Manage",
+            accountResource["MyAccount"], url: "~/Account/Manage",
+            icon: "fa fa-cog", order: 1000, null));
+
+        context.Menu.AddItem(new ApplicationMenuItem("Account.Logout",
+            uiResource["Logout"], url: "~/Account/Logout",
+            icon: "fa fa-power-off", order: int.MaxValue - 1000));
+
+        return Task.CompletedTask;
+    }
+}
+```
+
+The "My Account" item points at `Manage.cshtml`, and "Logout" hits `Logout.cshtml`. The high `order` value on Logout ensures it stays at the bottom even when other modules contribute their own user-menu items.
+
+## `AccountWebHooks` and host-specific overrides
+
+There is no `AccountWebHooks` class in the source tree. The extension model the Account Web package actually uses is:
+
+1. **Page model substitution** — host packages override an individual page model with `[ExposeServices(typeof(LoginModel))]` on a derived class.
+2. **`ProfileManagementPageOptions.Contributors`** — for adding new tabs to `Manage.cshtml`.
+3. **`AbpNavigationOptions.MenuContributors`** — for changing the user menu.
+
+If you need a hook earlier or later than what those points expose, the recommended path is to subclass the relevant page model and register it as a service replacement.
+
+## Mapper
+
+`Volo.Abp.Account.Web/AbpAccountWebMappers.cs` registers a single Mapperly mapping used by the personal-info view component to translate the `UpdateProfileDto` shape to/from the inline `PersonalInfoModel` defined inside `AccountProfilePersonalInfoManagementGroupViewComponent`. The mapping `RequiredMappingStrategy = RequiredMappingStrategy.Target` + `[MapExtraProperties]` combination is the same pattern used by the Application module's `AbpAccountApplicationMappers.cs`.
+
+## External-login partial
+
+The shared Razor Page surface includes external-provider rendering inline inside `Pages/Account/Login.cshtml` and `Pages/Account/Register.cshtml`, not a separate `_ExternalLoginsPartial.cshtml` file. Each page renders the buttons by iterating `Model.VisibleExternalProviders` (a filtered view over `ExternalProviders` that hides schemes without a `DisplayName`):
+
+```cshtml
+@foreach (var provider in Model.VisibleExternalProviders)
+{
+    <button name="provider" value="@provider.AuthenticationScheme"
+            asp-page-handler="ExternalLogin" type="submit"
+            class="btn btn-secondary m-1">@provider.DisplayName</button>
+}
+```
+
+Hosts that want a different look can either replace the entire `Login.cshtml` view (the Razor-runtime override mechanism wins over the embedded one) or contribute a custom view component and inject it through their theme.
+
+## Page bundles and assets
+
+Each page that ships scripts pairs them in the same folder: `Pages/Account/Login.js`, `Pages/Account/LoggedOut.js`, `Pages/Account/LoggedOut.css`, and `Pages/Account/Manage.css`. The ABP bundling pipeline registers them through `@abp-script-bundle` Razor tag helpers in the `.cshtml` files:
+
+```cshtml
+@section scripts {
+    <abp-script-bundle name="@typeof(LoginModel).FullName">
+        <abp-script src="/Pages/Account/Login.js" />
+    </abp-script-bundle>
+}
+```
+
+The bundle name is the full type name of the page model, which is how `AbpAccountWebModule.ConfigureProfileManagementPage` later registers the manage-page scripts via `options.ScriptBundles.Configure(typeof(ManageModel).FullName, ...)`.
+
+## Behaviour summary
+
+The `Volo.Abp.Account.Web` package is the home of every UI artefact a user sees:
+
+- **Razor Pages** under `Pages/Account/` — `Login`, `Register`, `ForgotPassword`, `ResetPassword`, `Manage`, `Logout`, plus their confirmation/error siblings.
+- **A cookie-login API controller** at `Areas/Account/Controllers/AccountController.cs`.
+- **A user menu** via `AbpAccountUserMenuContributor`.
+- **A profile management hub** with the `IProfileManagementPageContributor` extension model.
+- **A single options class** (`AbpAccountOptions`) carrying the Windows scheme name.
+
+Every host package (`*.Web.OpenIddict`, `*.Web.IdentityServer`) layers exactly one or two derived page models on top and changes nothing else. That tight contract is what lets the Account module survive migrations between OAuth servers with minimal churn.

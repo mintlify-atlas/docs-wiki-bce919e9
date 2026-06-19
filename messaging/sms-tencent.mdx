@@ -1,0 +1,285 @@
+---
+title: "Tencent Cloud SMS Provider for ABP Framework Apps"
+sidebarTitle: "SMS Tencent"
+description: "Route ISmsSender through Tencent Cloud SMS in ABP Framework via AbpSmsTencentCloudModule, TencentCloudSmsSender and AbpTencentCloudSmsOptions."
+---
+
+The ABP Framework `Volo.Abp.Sms.TencentCloud` package wires an `ISmsSender` implementation that calls the Tencent Cloud SMS service (`sms.tencentcloudapi.com`, API version `2021-01-11`). It is the second built-in concrete provider for `Volo.Abp.Sms` — the first being Aliyun — and follows the exact same composition rules: depend on the module, populate the configuration section, inject `ISmsSender` and call `SendAsync`.
+
+The package contains four C# files under `framework/src/Volo.Abp.Sms.TencentCloud/Volo/Abp/Sms/TencentCloud/`:
+
+| File | Purpose |
+| --- | --- |
+| `AbpSmsTencentCloudModule.cs` | Module class; binds the `AbpTencentCloudSms` configuration section |
+| `TencentCloudSmsSender.cs` | `ISmsSender` implementation calling `SmsClient.SendSms` |
+| `AbpTencentCloudSmsOptions.cs` | Strongly typed options (`SecretId`, `SecretKey`, `SmsSdkAppId`, `Endpoint`, `Region`) |
+| `TencentCloudSmsProperties.cs` | String constants `SignName` and `TemplateId` used as `SmsMessage.Properties` keys |
+
+## AbpSmsTencentCloudModule
+
+The module (`framework/src/Volo.Abp.Sms.TencentCloud/Volo/Abp/Sms/TencentCloud/AbpSmsTencentCloudModule.cs`) depends on `AbpSmsModule` and binds the options section:
+
+```csharp
+[DependsOn(typeof(AbpSmsModule))]
+public class AbpSmsTencentCloudModule : AbpModule
+{
+    public override void ConfigureServices(ServiceConfigurationContext context)
+    {
+        var configuration = context.Services.GetConfiguration();
+        Configure<AbpTencentCloudSmsOptions>(
+            configuration.GetSection("AbpTencentCloudSms"));
+    }
+}
+```
+
+The sender itself is registered with `[ITransientDependency]` on the class, so the `NullSmsSender` from `Volo.Abp.Sms` (which uses `[Dependency(TryRegister = true)]`) steps aside automatically.
+
+## AbpTencentCloudSmsOptions
+
+```csharp
+public class AbpTencentCloudSmsOptions
+{
+    public string SmsSdkAppId { get; set; } = default!;
+    public string SecretKey   { get; set; } = default!;
+    public string SecretId    { get; set; } = default!;
+    public string Endpoint    { get; set; } = "sms.tencentcloudapi.com";
+    public string Region      { get; set; } = "ap-guangzhou";
+}
+```
+
+(`framework/src/Volo.Abp.Sms.TencentCloud/Volo/Abp/Sms/TencentCloud/AbpTencentCloudSmsOptions.cs`)
+
+- `SecretId` / `SecretKey` — Tencent Cloud CAM credentials with the `QcloudSMSFullAccess` policy.
+- `SmsSdkAppId` — the numeric SMS SDK App ID created in the SMS console (a string like `"1400000000"`).
+- `Endpoint` — defaults to `sms.tencentcloudapi.com`. Override to use a regional accelerator.
+- `Region` — defaults to `ap-guangzhou`. Other valid values include `ap-beijing`, `ap-singapore`, `ap-mumbai`.
+
+`default!` is the null-forgiving operator: the framework cannot supply real values, so the user must bind them. The class has no `DataAnnotations`, so an empty `SmsSdkAppId` only fails when the first `SendSms` call returns a `ParamError`.
+
+### Binding from appsettings
+
+```json
+{
+  "AbpTencentCloudSms": {
+    "SecretId":    "AKID...",
+    "SecretKey":   "...",
+    "SmsSdkAppId": "1400000000",
+    "Region":      "ap-guangzhou"
+  }
+}
+```
+
+The module calls `configuration.GetSection("AbpTencentCloudSms")` so the section name is fixed.
+
+## TencentCloudSmsProperties
+
+`framework/src/Volo.Abp.Sms.TencentCloud/Volo/Abp/Sms/TencentCloud/TencentCloudSmsProperties.cs` defines the keys used by the `SmsMessage.Properties` dictionary:
+
+```csharp
+public static class TencentCloudSmsProperties
+{
+    public const string SignName   = "SignName";
+    public const string TemplateId = "TemplateId";
+}
+```
+
+Always reference these constants instead of typing raw strings so a renaming in `Volo.Abp.Sms.TencentCloud` is picked up by the compiler.
+
+## TencentCloudSmsSender
+
+The sender (`framework/src/Volo.Abp.Sms.TencentCloud/Volo/Abp/Sms/TencentCloud/TencentCloudSmsSender.cs`) is the heart of the module:
+
+```csharp
+public class TencentCloudSmsSender : ISmsSender, ITransientDependency
+{
+    protected AbpTencentCloudSmsOptions Options { get; }
+
+    public TencentCloudSmsSender(IOptionsMonitor<AbpTencentCloudSmsOptions> options)
+    {
+        Options = options.CurrentValue;
+    }
+
+    public virtual async Task SendAsync(SmsMessage smsMessage)
+    {
+        var client = CreateClient();
+
+        await client.SendSms(new SendSmsRequest()
+        {
+            SmsSdkAppId      = Options.SmsSdkAppId,
+            SignName         = smsMessage.Properties.GetOrDefault(TencentCloudSmsProperties.SignName)   as string,
+            TemplateId       = smsMessage.Properties.GetOrDefault(TencentCloudSmsProperties.TemplateId) as string,
+            TemplateParamSet = smsMessage.Text.Split(','),
+            PhoneNumberSet   = [smsMessage.PhoneNumber]
+        });
+    }
+
+    protected virtual SmsClient CreateClient()
+    {
+        var credential = new Credential
+        {
+            SecretId  = Options.SecretId,
+            SecretKey = Options.SecretKey
+        };
+        var clientProfile = new ClientProfile
+        {
+            HttpProfile = new HttpProfile { Endpoint = Options.Endpoint }
+        };
+        return new SmsClient(credential, Options.Region, clientProfile);
+    }
+}
+```
+
+The relevant SDK types (`Credential`, `ClientProfile`, `HttpProfile`, `SmsClient`, `SendSmsRequest`) come from `TencentCloud.Common`, `TencentCloud.Common.Profile`, `TencentCloud.Sms.V20210111` and `TencentCloud.Sms.V20210111.Models`.
+
+### Field mapping
+
+| `SmsMessage` field | Tencent Cloud field | Note |
+| --- | --- | --- |
+| `PhoneNumber` | `PhoneNumberSet[0]` | The sender wraps the single number into a one-element array. Tencent SMS supports up to 200 numbers per call but this implementation only sends one. |
+| `Properties[TencentCloudSmsProperties.SignName]` | `SignName` | Required. The 已审核 signature string, e.g. `"腾讯云"`. |
+| `Properties[TencentCloudSmsProperties.TemplateId]` | `TemplateId` | Required. Numeric template ID assigned by the SMS console. |
+| `Text` | `TemplateParamSet` (after `Split(',')`) | Comma-separated template parameters. For a template `"Your code is {1}"` with a single placeholder, pass `Text = "1234"`. For `"Code {1}, expires in {2} min"` pass `Text = "1234,5"`. |
+| Options.`SmsSdkAppId` | `SmsSdkAppId` | Constant per app, read from configuration. |
+
+<Warning>
+`smsMessage.Text.Split(',')` does not handle escaping. If a template parameter naturally contains a comma (an address, a sentence), the sender splits it incorrectly. For such payloads subclass `TencentCloudSmsSender` and override `SendAsync` to assign `TemplateParamSet` directly from a pre-built `string[]` you store in `SmsMessage.Properties`.
+</Warning>
+
+### Client lifetime
+
+`CreateClient` builds a fresh `SmsClient` per send. The Tencent SDK's `SmsClient` is essentially a stateless HTTP wrapper; constructing one per request avoids any need to manage lifecycle but does mean a new HTTPS connection per call unless the underlying `HttpClient` pools sockets. Override `CreateClient` to share a single client if you send at high volume:
+
+```csharp
+public class PooledTencentSmsSender : TencentCloudSmsSender
+{
+    private static readonly Lazy<SmsClient> _shared = new(BuildSharedClient);
+
+    public PooledTencentSmsSender(IOptionsMonitor<AbpTencentCloudSmsOptions> o) : base(o) { }
+
+    protected override SmsClient CreateClient() => _shared.Value;
+
+    private static SmsClient BuildSharedClient() { ... }
+}
+```
+
+## Flow
+
+```mermaid
+sequenceDiagram
+    participant App as Application code
+    participant Sender as TencentCloudSmsSender
+    participant Opts as IOptionsMonitor&lt;AbpTencentCloudSmsOptions&gt;
+    participant Sdk as TencentCloud.Sms.V20210111.SmsClient
+    participant Tx as sms.tencentcloudapi.com
+
+    App->>Sender: SendAsync(SmsMessage)
+    Sender->>Opts: CurrentValue (cached at ctor)
+    Sender->>Sdk: new SmsClient(Credential, Region, Profile)
+    Sender->>Sdk: SendSms(SendSmsRequest)
+    Note over Sender: TemplateParamSet = Text.Split(',')<br/>PhoneNumberSet = [PhoneNumber]
+    Sdk->>Tx: HTTPS RPC (TC3-HMAC-SHA256)
+    Tx-->>Sdk: SendSmsResponse
+    Sdk-->>Sender: Task complete
+```
+
+The sender does not parse the SDK response. If the SDK throws a `TencentCloudSDKException`, it propagates to the caller along with the Tencent error code (`InvalidParameterValue.IncorrectPhoneNumber`, `LimitExceeded.PhoneNumberCountLimit`, etc.).
+
+## Setup recipe
+
+1. Reference `Volo.Abp.Sms.TencentCloud`.
+2. Add `[DependsOn(typeof(AbpSmsTencentCloudModule))]` to your application module.
+3. Bind `AbpTencentCloudSms` in `appsettings.json` or environment variables.
+4. Inject `ISmsSender` and call it.
+
+```csharp
+[DependsOn(typeof(AbpSmsTencentCloudModule))]
+public class MySmsModule : AbpModule { }
+```
+
+### Sending a templated OTP
+
+```csharp
+public class TwoFactorService : IDomainService
+{
+    private readonly ISmsSender _smsSender;
+    public TwoFactorService(ISmsSender smsSender) => _smsSender = smsSender;
+
+    public Task SendCodeAsync(string phoneNumber, string code)
+    {
+        var msg = new SmsMessage(phoneNumber, code);
+        msg.Properties[TencentCloudSmsProperties.SignName]   = "Contoso";
+        msg.Properties[TencentCloudSmsProperties.TemplateId] = "1234567";
+        return _smsSender.SendAsync(msg);
+    }
+}
+```
+
+The template stored on the Tencent console would read `"Your code is {1}. It expires in 5 minutes."`.
+
+### Multi-parameter template
+
+```csharp
+var msg = new SmsMessage(
+    "+8613800138000",
+    text: $"{code},5"); // {1} = code, {2} = minutes
+msg.Properties[TencentCloudSmsProperties.SignName]   = "Contoso";
+msg.Properties[TencentCloudSmsProperties.TemplateId] = "9876543";
+await _smsSender.SendAsync(msg);
+```
+
+`SmsSender.Text.Split(',')` produces `["<code>", "5"]`, which is passed as `TemplateParamSet`. Verify your template does not contain commas in the static text; if it does, this comma-encoding strategy is unsafe and a custom sender is required.
+
+## Customization patterns
+
+### Sending to multiple recipients
+
+The default sender only puts a single phone number in `PhoneNumberSet`. To batch-send the same template to multiple numbers in one API call, override `SendAsync` and parse the recipients from a property:
+
+```csharp
+public override async Task SendAsync(SmsMessage smsMessage)
+{
+    var phones = smsMessage.Properties.GetOrDefault("PhoneNumberSet") as string[]
+                 ?? new[] { smsMessage.PhoneNumber };
+    var client = CreateClient();
+    await client.SendSms(new SendSmsRequest
+    {
+        SmsSdkAppId      = Options.SmsSdkAppId,
+        SignName         = smsMessage.Properties.GetOrDefault(TencentCloudSmsProperties.SignName) as string,
+        TemplateId       = smsMessage.Properties.GetOrDefault(TencentCloudSmsProperties.TemplateId) as string,
+        TemplateParamSet = smsMessage.Text.Split(','),
+        PhoneNumberSet   = phones
+    });
+}
+```
+
+### Regional clients
+
+Override `CreateClient` to switch endpoint/region based on phone number prefix:
+
+```csharp
+protected override SmsClient CreateClient()
+{
+    var region = "ap-guangzhou";          // default
+    return new SmsClient(
+        new Credential { SecretId = Options.SecretId, SecretKey = Options.SecretKey },
+        region,
+        new ClientProfile { HttpProfile = new HttpProfile { Endpoint = Options.Endpoint } });
+}
+```
+
+For Hong Kong / Macao / Taiwan numbers Tencent Cloud requires the `ap-hongkong` region; for international (E.164 outside China), use the international SMS product instead.
+
+## Composition pitfalls
+
+- Like `AbpSmsAliyunModule`, this module's sender is registered with `[ITransientDependency]` (not `TryRegister`). Referencing both Aliyun and Tencent providers in the same composition root results in the last registration winning — choose one or route manually.
+- `IOptionsMonitor.CurrentValue` is captured once in the constructor. Tenant-specific credentials require either a custom decorator or a manually-built `SmsClient` per call.
+- Tencent expects E.164 phone numbers with the country code (`+86138...`). The sender does not normalize the input — pass it pre-formatted.
+
+## Reference
+
+| Type | File |
+| --- | --- |
+| `AbpSmsTencentCloudModule` | `framework/src/Volo.Abp.Sms.TencentCloud/Volo/Abp/Sms/TencentCloud/AbpSmsTencentCloudModule.cs` |
+| `TencentCloudSmsSender` | `framework/src/Volo.Abp.Sms.TencentCloud/Volo/Abp/Sms/TencentCloud/TencentCloudSmsSender.cs` |
+| `AbpTencentCloudSmsOptions` | `framework/src/Volo.Abp.Sms.TencentCloud/Volo/Abp/Sms/TencentCloud/AbpTencentCloudSmsOptions.cs` |
+| `TencentCloudSmsProperties` | `framework/src/Volo.Abp.Sms.TencentCloud/Volo/Abp/Sms/TencentCloud/TencentCloudSmsProperties.cs` |

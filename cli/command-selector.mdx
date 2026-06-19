@@ -1,0 +1,353 @@
+---
+title: "ABP CLI Command Selector: Parsing Args and Dispatching Commands"
+sidebarTitle: "Command Selector"
+description: "How ABP Framework CLI maps args into CommandLineArgs and resolves IConsoleCommand: parser, AbpCliOptions, CommandSelector, and HelpCommand."
+---
+
+# Command Selector — From `string[] args` to `IConsoleCommand`
+
+After `Program.Main` hands off to `CliService.RunAsync`, the ABP Framework CLI splits its work between two collaborators: `CommandLineArgumentParser` builds a structured `CommandLineArgs`, and `CommandSelector` picks the right `IConsoleCommand` type from the `AbpCliOptions.Commands` dictionary. Both live in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/` and together account for every routing decision the CLI makes.
+
+## The parsed model — `CommandLineArgs`
+
+`CommandLineArgs`, defined in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Args/CommandLineArgs.cs`, is intentionally minimal. It is a triple of `(Command, Target, Options)` plus a couple of convenience methods:
+
+```csharp
+public class CommandLineArgs
+{
+    [CanBeNull] public string Command { get; }
+    [CanBeNull] public string Target { get; }
+    [NotNull]   public AbpCommandLineOptions Options { get; }
+
+    public CommandLineArgs([CanBeNull] string command = null, [CanBeNull] string target = null) { /*...*/ }
+
+    public static CommandLineArgs Empty() => new CommandLineArgs();
+
+    public bool IsCommand(string command)
+        => string.Equals(Command, command, StringComparison.OrdinalIgnoreCase);
+}
+```
+
+`AbpCommandLineOptions` (`framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Args/AbpCommandLineOptions.cs`) is a `Dictionary<string, string>` with an `OrdinalIgnoreCase` comparer, so `--ui` and `--UI` both reach the same entry. Each command then uses `Options.GetOrNull(short, long)` (an extension over `IDictionary`) to read its short-form (e.g. `t`) and long-form (e.g. `template`) options without caring which alias the user typed.
+
+The `[CanBeNull]` annotations matter for the dispatch logic: an `abp` invocation with no arguments produces `Command == null`, which `CommandSelector.Select` immediately rewrites to `typeof(HelpCommand)`.
+
+## Token shape
+
+`abp` follows a positional shape: `abp <command> [<target>] [-shortOpt value | --longOpt value | --flag]`. The parser, `CommandLineArgumentParser` (in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Args/CommandLineArgumentParser.cs`), implements this in four short stages:
+
+```csharp
+public CommandLineArgs Parse(string[] args)
+{
+    if (args.IsNullOrEmpty())
+        return CommandLineArgs.Empty();
+
+    var argumentList = args.ToList();
+
+    // Command
+    var command = argumentList[0];
+    argumentList.RemoveAt(0);
+    if (!argumentList.Any())
+        return new CommandLineArgs(command);
+
+    // Target (optional — absent if the next token starts with '-')
+    var target = argumentList[0];
+    if (target.StartsWith("-"))
+        target = null;
+    else
+        argumentList.RemoveAt(0);
+    if (!argumentList.Any())
+        return new CommandLineArgs(command, target);
+
+    // Options loop
+    var commandLineArgs = new CommandLineArgs(command, target);
+    while (argumentList.Any()) { /* read name, then peek for value */ }
+    return commandLineArgs;
+}
+```
+
+### Stage 1 — command
+
+The first positional token is always the command name; it can be any non-empty string (the parser does not validate that it exists in `AbpCliOptions.Commands` — that decision is delegated to `CommandSelector`).
+
+### Stage 2 — optional target
+
+The second positional token, if present and not starting with `-`, becomes `Target`. This is what `NewCommand` reads as the project name (`commandLineArgs.Target`) and what `HelpCommand` reads as the command whose usage info to print. If the second token starts with `-`, it is treated as the first option name instead, leaving `Target = null`.
+
+### Stage 3 — options
+
+The options loop pops the option name (stripped of `--` or `-` via `ParseOptionName`), then peeks at the next token. If the next token also looks like an option (`IsOptionName`), the current entry is recorded as a flag with `value = null`. Otherwise the next token is consumed as the value:
+
+```csharp
+while (argumentList.Any())
+{
+    var optionName = ParseOptionName(argumentList[0]);
+    argumentList.RemoveAt(0);
+
+    if (!argumentList.Any())
+    {
+        commandLineArgs.Options[optionName] = null;
+        break;
+    }
+
+    if (IsOptionName(argumentList[0]))
+    {
+        commandLineArgs.Options[optionName] = null;
+        continue;
+    }
+
+    commandLineArgs.Options[optionName] = argumentList[0];
+    argumentList.RemoveAt(0);
+}
+```
+
+`ParseOptionName` enforces that an option starts with `--name` or `-name`, throwing `ArgumentException("Should specify an option name after '--' prefix!")` otherwise. The dash count itself is not tracked — both forms write to the same dictionary, which is how `Options.GetOrNull(Options.Template.Short, Options.Template.Long)` works without per-command logic.
+
+### Stage 4 — quoted strings (overload)
+
+There is a second `Parse(string lineText)` overload used by `prompt` and `batch` modes. It calls `GetArgsArrayFromLine(string)` to split on whitespace while respecting `"…"` quoting:
+
+```csharp
+public CommandLineArgs Parse(string lineText)
+{
+    return Parse(GetArgsArrayFromLine(lineText));
+}
+```
+
+That overload feeds `RunPromptAsync` (interactive REPL) and `RunBatchAsync` (file with one command per line, `#` for comments) — both in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliService.cs`.
+
+## The `Options` constant pattern
+
+Each command exposes a nested `public static class Options` whose inner classes carry `Short` and `Long` constants. The pattern lives in every command file in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/`. For example, in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/ProjectCreationCommandBase.cs`:
+
+```csharp
+public static class Options
+{
+    public static class Template
+    {
+        public const string Short = "t";
+        public const string Long  = "template";
+    }
+
+    public static class DatabaseManagementSystem
+    {
+        public const string Short = "dbms";
+        public const string Long  = "database-management-system";
+    }
+
+    // ...
+}
+```
+
+Commands then read options with `commandLineArgs.Options.GetOrNull(Options.Template.Short, Options.Template.Long)`. The pattern avoids stringly-typed lookups inside the body of `ExecuteAsync` and makes refactors safe; renaming an option means changing one constant and the usage info, not every call site.
+
+## `CommandSelector`
+
+Once `CommandLineArgs` is built, `CliService.RunInternalAsync` asks the selector for a command type. The selector itself, in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/CommandSelector.cs`, is six lines of logic:
+
+```csharp
+public class CommandSelector : ICommandSelector, ITransientDependency
+{
+    protected AbpCliOptions Options { get; }
+
+    public CommandSelector(IOptions<AbpCliOptions> options)
+    {
+        Options = options.Value;
+    }
+
+    public Type Select(CommandLineArgs commandLineArgs)
+    {
+        if (commandLineArgs.Command.IsNullOrWhiteSpace())
+        {
+            return typeof(HelpCommand);
+        }
+
+        return Options.Commands.GetOrDefault(commandLineArgs.Command)
+               ?? typeof(HelpCommand);
+    }
+}
+```
+
+Two invariants fall out:
+
+- **Bare `abp` is help.** With no command argument, the parser returns `CommandLineArgs.Empty()`, whose `Command` is `null`, and the selector returns `HelpCommand`.
+- **Unknown commands are also help.** `Options.Commands.GetOrDefault` returns the value or `null` for missing keys; `??` falls back to `HelpCommand`.
+
+Because `AbpCliOptions.Commands` is built with `StringComparer.OrdinalIgnoreCase`, `abp NEW MyApp` and `abp new MyApp` resolve to the same `NewCommand` type. The interface `ICommandSelector` in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/ICommandSelector.cs` is one method wide:
+
+```csharp
+public interface ICommandSelector
+{
+    Type Select(CommandLineArgs commandLineArgs);
+}
+```
+
+That single-method contract is what lets ABP Studio swap in its own selector when embedding the command library without changing every command.
+
+## Command discovery
+
+The `AbpCliOptions.Commands` dictionary itself is populated by hand in `AbpCliCoreModule.ConfigureServices`. There is no reflection-based scan — every built-in command must be registered explicitly:
+
+```csharp
+// framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/AbpCliCoreModule.cs
+Configure<AbpCliOptions>(options =>
+{
+    options.Commands[HelpCommand.Name]            = typeof(HelpCommand);
+    options.Commands[NewCommand.Name]             = typeof(NewCommand);
+    options.Commands[UpdateCommand.Name]          = typeof(UpdateCommand);
+    options.Commands[AddPackageCommand.Name]      = typeof(AddPackageCommand);
+    options.Commands[AddModuleCommand.Name]       = typeof(AddModuleCommand);
+    options.Commands[ListModulesCommand.Name]     = typeof(ListModulesCommand);
+    options.Commands[ListTemplatesCommand.Name]   = typeof(ListTemplatesCommand);
+    options.Commands[LoginCommand.Name]           = typeof(LoginCommand);
+    options.Commands[LogoutCommand.Name]          = typeof(LogoutCommand);
+    options.Commands[GenerateProxyCommand.Name]   = typeof(GenerateProxyCommand);
+    // ...
+});
+```
+
+The dictionary uses each command's `Name` constant as the key. This explicit list is also what `HelpCommand.GetUsageInfo` iterates when rendering the catalogue — see below.
+
+Hosts that embed `Volo.Abp.Cli.Core` can post-configure `AbpCliOptions` to add or remove entries. ABP Studio uses that hook to hide commands that do not make sense inside its UI, and tests use it to register fake command types.
+
+## `IConsoleCommand`
+
+Every command implements `IConsoleCommand` from `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/IConsoleCommand.cs`:
+
+```csharp
+public interface IConsoleCommand
+{
+    Task ExecuteAsync(CommandLineArgs commandLineArgs);
+    string GetUsageInfo();
+}
+```
+
+Two methods, no static contract. The static `Name` constant and the static `GetShortDescription()` method are conventions enforced only by the help renderer's reflection. Concrete commands also declare `: ITransientDependency` so the DI container can resolve them inside the scope created by `CliService.RunInternalAsync`.
+
+## Command dispatch flow
+
+```mermaid
+flowchart TD
+    Args[Raw string\[\] args] --> Parse["CommandLineArgumentParser.Parse\nArgs/CommandLineArgumentParser.cs"]
+    Parse --> Empty{args empty?}
+    Empty -- yes --> CmdNull["CommandLineArgs.Empty()"]
+    Empty -- no --> CmdToken[Read command token]
+    CmdToken --> TgtCheck{Next starts with '-' ?}
+    TgtCheck -- no --> Target[Read target token]
+    TgtCheck -- yes --> NoTarget[Target = null]
+    Target --> OptLoop[Loop options]
+    NoTarget --> OptLoop
+    OptLoop --> CLArgs[CommandLineArgs]
+    CmdNull --> CLArgs
+    CLArgs --> Select["CommandSelector.Select\nCommands/CommandSelector.cs"]
+    Select --> Has{Name in\nAbpCliOptions.Commands?}
+    Has -- no --> Help["typeof(HelpCommand)"]
+    Has -- yes --> Type[Mapped command Type]
+    Type --> Scope[IServiceScopeFactory.CreateScope]
+    Help --> Scope
+    Scope --> Resolve["scope.ServiceProvider\n.GetRequiredService(commandType)"]
+    Resolve --> Execute[IConsoleCommand.ExecuteAsync]
+    Execute --> Done[Return / set ExitCode]
+```
+
+The selector itself does not create the command instance — that is `RunInternalAsync`'s job in `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/CliService.cs`:
+
+```csharp
+private async Task RunInternalAsync(CommandLineArgs commandLineArgs)
+{
+    var commandType = CommandSelector.Select(commandLineArgs);
+
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var command = (IConsoleCommand)scope.ServiceProvider.GetRequiredService(commandType);
+        await command.ExecuteAsync(commandLineArgs);
+    }
+}
+```
+
+A fresh DI scope per execution is important for the `prompt` and `batch` modes — every dispatched command starts with a clean unit-of-work and gets its own property-injected `ILogger<T>` instance.
+
+## `HelpCommand` — the fallback target
+
+`HelpCommand` (`framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/HelpCommand.cs`) is the only command resolved by the selector when the input is unknown. It is also the only command that calls back into `AbpCliOptions.Commands` to enumerate everything else:
+
+```csharp
+public Task ExecuteAsync(CommandLineArgs commandLineArgs)
+{
+    if (string.IsNullOrWhiteSpace(commandLineArgs.Target))
+    {
+        Logger.LogInformation(GetUsageInfo());
+        return Task.CompletedTask;
+    }
+
+    if (!AbpCliOptions.Commands.ContainsKey(commandLineArgs.Target))
+    {
+        Logger.LogWarning($"There is no command named {commandLineArgs.Target}.");
+        Logger.LogInformation(GetUsageInfo());
+        return Task.CompletedTask;
+    }
+
+    var commandType = AbpCliOptions.Commands[commandLineArgs.Target];
+
+    using (var scope = ServiceScopeFactory.CreateScope())
+    {
+        var command = (IConsoleCommand)scope.ServiceProvider.GetRequiredService(commandType);
+        Logger.LogInformation(command.GetUsageInfo());
+    }
+
+    return Task.CompletedTask;
+}
+```
+
+Two behaviours fall out of that body:
+
+- `abp help` (no target) → the global catalogue (`GetUsageInfo`).
+- `abp help <command>` → the target command is resolved from the scope, and its own `GetUsageInfo()` is printed. This is why every command must implement `GetUsageInfo`: it doubles as the per-command help text.
+
+`GetUsageInfo` then loops over `AbpCliOptions.Commands.Where(NotHiddenFromCommandList).OrderBy(x => x.Key)` and uses `BindingFlags.Static | BindingFlags.Public` reflection to find each command's `GetShortDescription` method. Commands without that method are skipped silently — that is how `internal-only` commands like `RecreateInitialMigrationCommand` (under `framework/src/Volo.Abp.Cli.Core/Volo/Abp/Cli/Commands/Internal/`) can register a `Name` without showing up in the public listing.
+
+## Special modes routed by `CliService`
+
+Not every input goes through `CommandSelector`. `CliService.RunAsync` checks two well-known commands first:
+
+```csharp
+if (commandLineArgs.IsCommand("prompt"))
+{
+    await RunPromptAsync();
+}
+else if (commandLineArgs.IsCommand("batch"))
+{
+    await RunBatchAsync(commandLineArgs);
+}
+else
+{
+    await RunInternalAsync(commandLineArgs);
+}
+```
+
+- `prompt` enters an interactive REPL that reads lines from `Console.ReadLine()`, parses each with `CommandLineArgumentParser.Parse(string)`, and dispatches via `RunInternalAsync` until the user types `exit`.
+- `batch` reads `commandLineArgs.Target` as a file path, skips blank lines and `#` comments, and dispatches each remaining line.
+
+Both modes still rely on `CommandSelector` indirectly: they parse each line into a `CommandLineArgs`, then call `RunInternalAsync`, which in turn calls `CommandSelector.Select`. The early branches only exist so that `prompt` and `batch` are not themselves dispatched through the catalogue.
+
+`PromptCommand` and `BundleCommand` are also registered in `AbpCliOptions.Commands` (with `PromptCommand.Name == "prompt"`), but `RunAsync` short-circuits before reaching the selector for `prompt`. The dictionary entry is only there to satisfy `HelpCommand`'s reflection over the catalogue.
+
+## Extension hooks
+
+Two clean seams let other hosts customise dispatch without touching the CLI sources:
+
+1. **Replace `ICommandSelector`.** Drop in a custom transient service via `services.Replace(ServiceDescriptor.Transient<ICommandSelector, MySelector>())` in a downstream module. The replacement runs after `AbpCliCoreModule` because of module dependency ordering.
+2. **Mutate `AbpCliOptions.Commands`.** Use `services.Configure<AbpCliOptions>(o => { o.Commands.Remove("login"); o.Commands["my-cmd"] = typeof(MyCmd); })` to add, remove, or alias commands. The catalogue is just a dictionary.
+
+Both patterns are how the ABP Suite tooling exposes its own commands while sharing the rest of the CLI library.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="new" icon="folder-plus" href="/cli/new-command">
+    The first command most users hit — full walk-through of `NewCommand`.
+  </Card>
+  <Card title="Program Entry" icon="terminal" href="/cli/program-entry">
+    What runs before the parser: Serilog, Autofac, and the ABP host.
+  </Card>
+</CardGroup>
